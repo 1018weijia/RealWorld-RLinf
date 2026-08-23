@@ -107,6 +107,12 @@ def main(
     config_name: str,
     repo_id: str,
 ):
+    from rlinf.data.datasets.openpi_rlinf.pyav_video_patch import (
+        apply_pyav_video_decode_patch,
+    )
+
+    apply_pyav_video_decode_patch()
+
     dataset_root = resolve_lerobot_dataset_root(repo_id)
     if not (dataset_root / "meta" / "info.json").is_file():
         raise FileNotFoundError(
