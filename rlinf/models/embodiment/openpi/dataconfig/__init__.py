@@ -73,6 +73,9 @@ from rlinf.models.embodiment.openpi.dataconfig.robocasa_dataconfig import (
 from rlinf.models.embodiment.openpi.dataconfig.cobot_dataconfig import (
     LeRobotCobotDataConfig,
 )
+from rlinf.models.embodiment.openpi.dataconfig.dobot_dataconfig import (
+    LeRobotDobotDataConfig,
+)
 from rlinf.models.embodiment.openpi.dataconfig.robotwin_aloha_dataconfig import (
     LeRobotAlohaDataConfig,
 )
@@ -467,6 +470,23 @@ _CONFIGS = [
             assets=AssetsConfig(
                 assets_dir="/data/gxy/realworldRL/checkpoints/assets",
                 asset_id="cobot_magic/cube_into_drawer",
+            ),
+            extra_delta_transform=True,
+        ),
+        pytorch_weight_path="checkpoints/torch/pi05_base",
+        num_train_steps=30_000,
+    ),
+    TrainConfig(
+        name="pi05_dobot",
+        model=pi0_config.Pi0Config(pi05=True, discrete_state_input=True),
+        data=LeRobotDobotDataConfig(
+            repo_id="dobot/cook_vegetable",
+            adapt_to_pi=False,
+            default_prompt="cook vegetable",
+            base_config=DataConfig(prompt_from_task=False),
+            assets=AssetsConfig(
+                assets_dir="/data/gxy/realworldRL/checkpoints/assets",
+                asset_id="dobot/cook_vegetable",
             ),
             extra_delta_transform=True,
         ),

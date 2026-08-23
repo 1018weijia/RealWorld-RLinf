@@ -49,6 +49,7 @@ _SFT_DATALOADER_BUILDERS = {
     "dualfranka": _load_dual_franka_sft_dataloader,
     "robotwin": _load_official_openpi_sft_dataloader,
     "cobot": _load_official_openpi_sft_dataloader,
+    "dobot": _load_official_openpi_sft_dataloader,
 }
 
 

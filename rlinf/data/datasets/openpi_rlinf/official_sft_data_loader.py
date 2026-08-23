@@ -43,9 +43,13 @@ def build_official_openpi_sft_dataloader(
     from rlinf.data.datasets.openpi_rlinf.lerobot_hf_query_patch import (
         apply_lerobot_hf_query_patch,
     )
+    from rlinf.data.datasets.openpi_rlinf.lerobot_list_feature_patch import (
+        apply_lerobot_list_feature_patch,
+    )
 
     apply_pyav_video_decode_patch()
     apply_lerobot_hf_query_patch()
+    apply_lerobot_list_feature_patch()
 
     repo_id = resolve_lerobot_repo_id(data_paths)
     if repo_id is None:
@@ -89,6 +93,13 @@ def build_official_openpi_sft_dataloader(
     if "cobot" in config_name.lower():
         _patch_create_torch_dataset_drop_failures(openpi_data_loader)
 
+    if "dobot" in config_name.lower():
+        from rlinf.data.datasets.openpi_rlinf.dobot_lerobot_dataset_patch import (
+            apply_dobot_lerobot_hf_dataset_patch,
+        )
+
+        apply_dobot_lerobot_hf_dataset_patch()
+
     data_loader = openpi_data_loader.create_data_loader(
         config, framework="pytorch", shuffle=not eval_dataset
     )
@@ -123,6 +134,11 @@ def _openpi_worker_init_fn_with_pyav(worker_id: int) -> None:
     )
 
     apply_lerobot_hf_query_patch()
+    from rlinf.data.datasets.openpi_rlinf.lerobot_list_feature_patch import (
+        apply_lerobot_list_feature_patch,
+    )
+
+    apply_lerobot_list_feature_patch()
     # Match openpi.training.data_loader._worker_init_fn (JAX in workers).
     import os
 
