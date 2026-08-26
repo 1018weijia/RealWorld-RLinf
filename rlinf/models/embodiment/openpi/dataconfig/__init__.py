@@ -76,6 +76,9 @@ from rlinf.models.embodiment.openpi.dataconfig.cobot_dataconfig import (
 from rlinf.models.embodiment.openpi.dataconfig.dobot_dataconfig import (
     LeRobotDobotDataConfig,
 )
+from rlinf.models.embodiment.openpi.dataconfig.xrobot_dataconfig import (
+    LeRobotXRobotDataConfig,
+)
 from rlinf.models.embodiment.openpi.dataconfig.robotwin_aloha_dataconfig import (
     LeRobotAlohaDataConfig,
 )
@@ -487,6 +490,24 @@ _CONFIGS = [
             assets=AssetsConfig(
                 assets_dir="/data/gxy/realworldRL/checkpoints/assets",
                 asset_id="dobot/cook_vegetable",
+            ),
+            extra_delta_transform=True,
+        ),
+        pytorch_weight_path="checkpoints/torch/pi05_base",
+        num_train_steps=30_000,
+    ),
+    TrainConfig(
+        name="pi05_xrobot",
+        model=pi0_config.Pi0Config(pi05=True, discrete_state_input=True),
+        data=LeRobotXRobotDataConfig(
+            repo_id="xrobot/put_ring_on_the_rod",
+            adapt_to_pi=False,
+            # robot_type=x2robot_dual_arm_ee: dual-arm EE pose (xyz+rpy+gripper)x2
+            default_prompt="put ring on the rod",
+            base_config=DataConfig(prompt_from_task=False),
+            assets=AssetsConfig(
+                assets_dir="/data/gxy/realworldRL/checkpoints/assets",
+                asset_id="xrobot/put_ring_on_the_rod",
             ),
             extra_delta_transform=True,
         ),

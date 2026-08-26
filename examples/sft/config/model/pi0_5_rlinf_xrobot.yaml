@@ -1,0 +1,28 @@
+model_type: "openpi_rlinf"
+
+# Pi0.5 JAX-aligned PyTorch model-shape template for XRobot SFT.
+# Robot: x2robot_dual_arm_ee (dual-arm end-effector xyz+rpy+gripper, 14-D).
+# Filesystem paths are supplied by xrobot_sft_openpi_rlinf_pi05_*.yaml.
+precision: fp32
+
+is_lora: False
+lora_rank: 32
+
+# XRobot uses native 14-D EE pose + gripper actions; pad to 32.
+num_action_chunks: 50
+action_dim: 14
+use_proprio: True
+num_steps: 5
+add_value_head: False
+
+openpi:
+  task: sft
+  config_name: "pi05_xrobot"
+  num_images_in_input: 3
+  action_chunk: ${..num_action_chunks}
+  action_env_dim: ${..action_dim}
+  model_action_dim: 32
+  paligemma_variant: "gemma_2b"
+  action_expert_variant: "gemma_300m"
+  max_token_len: 200
+  discrete_state_input: True
