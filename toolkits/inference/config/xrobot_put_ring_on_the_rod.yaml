@@ -1,0 +1,26 @@
+# XRobot dual-arm EE — put_ring_on_the_rod
+robot: xrobot
+default_prompt: "put ring on the rod"
+
+ckpt: /data/gxy/realworldRL/RLinf/logs/20260826-034102-xrobot_sft_openpi_rlinf_pi05_put_ring_on_the_rod-gpu7/xrobot_dual_arm_ee_pi05_put_ring_on_rod_sft/checkpoints/global_step_30000/actor/model_state_dict
+norm_stats: /data/gxy/realworldRL/checkpoints/assets/xrobot/put_ring_on_the_rod/norm_stats.json
+
+precision: bf16
+host: 0.0.0.0
+port: 8020
+
+model:
+  pi05: true
+  num_action_chunks: 50
+  action_dim: 14
+  num_steps: 5
+  add_value_head: false
+  openpi:
+    task: eval
+    config_name: pi05_xrobot
+    num_images_in_input: 3
+    discrete_state_input: true
+    max_token_len: 200
+    model_action_dim: 32
+    paligemma_variant: gemma_2b
+    action_expert_variant: gemma_300m

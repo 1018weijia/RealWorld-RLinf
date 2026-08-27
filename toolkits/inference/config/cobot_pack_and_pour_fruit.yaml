@@ -1,0 +1,26 @@
+# Cobot Magic — pack_and_pour_fruit
+robot: cobot
+default_prompt: "pack fruit into a container and pour it out"
+
+ckpt: /data/gxy/realworldRL/RLinf/logs/20260825-051148-cobot_sft_openpi_rlinf_pi05_pack_and_pour_fruit-gpu7/cobot_pi05_pack_and_pour_fruit_sft/checkpoints/global_step_30000/actor/model_state_dict
+norm_stats: /data/gxy/realworldRL/checkpoints/assets/cobot_magic/pack_and_pour_fruit/norm_stats.json
+
+precision: bf16
+host: 0.0.0.0
+port: 8000
+
+model:
+  pi05: true
+  num_action_chunks: 50
+  action_dim: 14
+  num_steps: 5
+  add_value_head: false
+  openpi:
+    task: eval
+    config_name: pi05_cobot_magic
+    num_images_in_input: 3
+    discrete_state_input: true
+    max_token_len: 200
+    model_action_dim: 32
+    paligemma_variant: gemma_2b
+    action_expert_variant: gemma_300m

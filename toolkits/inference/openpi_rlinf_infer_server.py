@@ -51,7 +51,7 @@ _COBOT_RAW_STATE_DIM = 56
 _JOINT_STATE_DIM = 14
 _COBOT_STATE_POS_INDICES = tuple(range(0, 42, 3))
 
-_SUPPORTED_ROBOTS = ("cobot", "dobot")
+_SUPPORTED_ROBOTS = ("cobot", "dobot", "xrobot")
 
 logger = logging.getLogger(__name__)
 
@@ -124,9 +124,13 @@ def slice_robot_state(state: np.ndarray, robot: str) -> np.ndarray:
             f"cobot state length must be {_JOINT_STATE_DIM} or "
             f"{_COBOT_RAW_STATE_DIM}, got {state.shape[0]}"
         )
-    raise ValueError(
-        f"dobot state length must be {_JOINT_STATE_DIM}, got {state.shape[0]}"
-    )
+    # dobot / xrobot: 14-D joint/EE pose, passed through directly.
+    if robot in ("dobot", "xrobot"):
+        raise ValueError(
+            f"{robot} state length must be {_JOINT_STATE_DIM}, "
+            f"got {state.shape[0]}"
+        )
+    raise ValueError(f"unsupported robot={robot!r}")
 
 
 def decode_image_b64(b64: str) -> np.ndarray:
