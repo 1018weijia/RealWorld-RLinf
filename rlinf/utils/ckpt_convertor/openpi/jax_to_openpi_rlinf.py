@@ -62,8 +62,18 @@ def _load_jax_params(checkpoint_dir: str | pathlib.Path) -> dict:
     # restore-args tree from the checkpoint metadata and explicitly request
     # NumPy leaves, which do not require device sharding.
     metadata = checkpointer.metadata(str(params_dir))
+
+    # Newer Orbax versions wrap PyTree metadata in
+    # StepMetadata.item_metadata.tree, while older versions return the tree
+    # directly. Unwrap both representations before constructing restore args.
+    metadata_tree = metadata
+    if hasattr(metadata_tree, "item_metadata"):
+        metadata_tree = metadata_tree.item_metadata
+    if hasattr(metadata_tree, "tree"):
+        metadata_tree = metadata_tree.tree
+
     restore_args = jax.tree_util.tree_map(
-        lambda _: ocp.RestoreArgs(restore_type=np.ndarray), metadata
+        lambda _: ocp.RestoreArgs(restore_type=np.ndarray), metadata_tree
     )
     restored = checkpointer.restore(str(params_dir), restore_args=restore_args)
     restored = jax.tree_util.tree_map(

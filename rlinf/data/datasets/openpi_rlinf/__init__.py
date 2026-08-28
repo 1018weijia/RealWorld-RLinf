@@ -51,6 +51,7 @@ _SFT_DATALOADER_BUILDERS = {
     "cobot": _load_official_openpi_sft_dataloader,
     "dobot": _load_official_openpi_sft_dataloader,
     "xrobot": _load_official_openpi_sft_dataloader,
+    "franka_shuo": _load_official_openpi_sft_dataloader,
 }
 
 

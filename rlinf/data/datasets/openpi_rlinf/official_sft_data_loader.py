@@ -22,7 +22,7 @@ from typing import Any
 from omegaconf import OmegaConf
 
 from rlinf.config import SupportedModel
-from rlinf.data.storage.lerobot import resolve_lerobot_repo_id
+from rlinf.data.storage.lerobot import resolve_lerobot_repo_ids
 
 
 def build_official_openpi_sft_dataloader(
@@ -51,11 +51,11 @@ def build_official_openpi_sft_dataloader(
     apply_lerobot_hf_query_patch()
     apply_lerobot_list_feature_patch()
 
-    repo_id = resolve_lerobot_repo_id(data_paths)
+    repo_id = resolve_lerobot_repo_ids(data_paths)
     if repo_id is None:
         raise ValueError(
             "OpenPI SFT requires data.train_data_paths to be set to a local "
-            "dataset path or LeRobot repo id."
+            "dataset path, a list of dataset paths, or a LeRobot repo id."
         )
 
     import openpi.training.data_loader as openpi_data_loader

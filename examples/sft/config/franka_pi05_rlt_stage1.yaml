@@ -1,0 +1,123 @@
+defaults:
+  - model/pi0_5_pytorch_franka_shuo@actor.model
+  - hybrid_engines/fsdp@actor.fsdp_config
+  - override hydra/job_logging: stdout
+  - _self_
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  searchpath:
+    - file://${oc.env:EMBODIED_PATH}/config/
+
+# Full RL-Token stage1 on the already-migrated Franka Shuo pi05 SFT path.
+# Joint objective (same as train_rl_token.py with vla_finetune_alpha=1.0):
+#   loss = rlt_loss + rlt_alpha * vla_loss
+#
+# Do NOT reuse realworld_franka_rlt_stage1_sft_openpi_pi05.yaml: that file is
+# pi05_franka_state / 1 camera / horizon 20. This config keeps the working
+# franka_pi05_rlinf data/model and only turns on the RLT head.
+#
+# Launch:
+#   bash examples/sft/run_vla_sft.sh franka_pi05_rlt_stage1
+
+cluster:
+  num_nodes: 1
+  component_placement:
+    actor,env,rollout: all
+
+runner:
+  task_type: sft
+  logger:
+    log_path: "../results"
+    project_name: rlinf-rlt
+    experiment_name: "sft_franka_shuo_pi05_rlt_stage1"
+    logger_backends: ["tensorboard", "wandb"]
+
+  max_epochs: -1
+  max_steps: 30000
+  val_check_interval: -1
+  save_interval: 1000
+  resume_dir: /vast/users/xiaodan/zhangjian/RealRL/rlinf/logs/sft/20260827-073150-franka_pi05_rlt_stage1/sft_franka_shuo_pi05_rlt_stage1/checkpoints/global_step_3000
+
+data:
+  train_data_paths:
+    - /vast/users/xiaodan/zhangjian/RealRL/FR3_A1/stack_bowls_in_size_order_rc
+    - /vast/users/xiaodan/zhangjian/RealRL/FR3_A1/place_ring_on_rod_rc_0810
+    - /vast/users/xiaodan/zhangjian/RealRL/FR3_A1/new_side/place_ring_on_rod_new_side_rc
+    - /vast/users/xiaodan/zhangjian/RealRL/FR3_A1/place_fruits_on_plate_rc
+    - /vast/users/xiaodan/zhangjian/RealRL/FR3_A1/plug_charger_into_socket_rc
+    - /vast/users/xiaodan/zhangjian/RealRL/FR3_A1/new_side/plug_charger_into_socket_new_side_rc
+    - /vast/users/xiaodan/zhangjian/RealRL/FR3_A1/insert_peg_into_hole_rc
+    - /vast/users/xiaodan/zhangjian/RealRL/FR3_A1/new_side/insert_peg_into_hole_new_side_rc
+  num_workers: 8
+
+algorithm:
+  adv_type: gae
+
+actor:
+  group_name: "ActorGroup"
+  training_backend: "fsdp"
+  micro_batch_size: 32 #32  48 
+  eval_batch_size: 1
+  global_batch_size: 256 #256 384
+  seed: 42
+
+  model:
+    model_path: /vast/users/xiaodan/zhangjian/RealRL/pi05_base_openpi_rlinf
+    openpi:
+      assets_dir: /vast/users/xiaodan/zhangjian/RealRL/pi05_base_openpi_rlinf/assets
+      asset_id: "franka_shuo_bowls_ring_fruits_charger_peg"
+      # Joint SFT: RL-token reconstruction + VLA flow-matching.
+      # Original stage1: vla_finetune_alpha=1.0, embedding_dim=2048,
+      # encoder/decoder 2 layers x 8 heads, rl_token_num_tokens=968
+      # (3 * 256 image + 200 language).
+      use_rlt: True
+      rlt_alpha: 1.0
+      rlt_input_dim: 2048
+      rlt_embed_dim: 2048
+      rlt_prefix_seq_len: 968
+      rlt_num_layers: 2
+      rlt_num_heads: 8
+      rlt_mlp_ratio: 4.0
+      rlt_image_only: False
+      rlt_use_mask: True
+      # Original VLA_FINETUNE_SCOPE=action_expert. Prefix embeddings for RLT
+      # are detached anyway; this freezes SigLIP + gemma expert-0.
+      # train_expert_only: True
+    openpi_data:
+      asset_id: "franka_shuo_bowls_ring"
+      norm_stats_path: /vast/users/xiaodan/zhangjian/RealRL/pi05_base_openpi_rlinf/assets/franka_shuo_bowls_ring_fruits_charger_peg/norm_stats.json
+
+  optim:
+    # Original stage1 used 1e-5 for both RL-token and VLA. Keep the lr that
+    # already ran for VLA-only SFT; override to 1e-5 if you want exact parity.
+    lr: 2.5e-5
+    adam_beta1: 0.9
+    adam_beta2: 0.95
+    adam_eps: 1.0e-08
+    weight_decay: 1e-10
+    clip_grad: 1.0
+    total_training_steps: 30000
+    lr_warmup_steps: 1000
+    lr_scheduler: "openpi_cosine"
+    num_cycles: 0.5
+    min_lr: 0.0
+
+  fsdp_config:
+    strategy: "fsdp"
+    sharding_strategy: "full_shard"
+    use_orig_params: True
+    gradient_checkpointing: True
+    gradient_checkpointing_use_reentrant: False
+    mixed_precision:
+      param_dtype: bf16
+      reduce_dtype: fp32
+      buffer_dtype: fp32
+
+reward:
+  use_reward_model: False
+
+critic:
+  use_critic_model: False

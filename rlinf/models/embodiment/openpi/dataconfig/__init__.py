@@ -43,6 +43,9 @@ from rlinf.models.embodiment.openpi.dataconfig.franka_co_training_dataconfig imp
 from rlinf.models.embodiment.openpi.dataconfig.franka_dataconfig import (
     CustomDataConfig,
 )
+from rlinf.models.embodiment.openpi.dataconfig.franka_shuo_dataconfig import (
+    LeRobotFrankaShuoDataConfig,
+)
 from rlinf.models.embodiment.openpi.dataconfig.gsenv_dataconfig import (
     LeRobotGSEnvDataConfig,
 )
@@ -590,6 +593,24 @@ _CONFIGS = [
         pytorch_weight_path="checkpoints/torch/pi0_base",
     ),
     TrainConfig(
+        name="pi05_franka_shuo",
+        # Matches RL-Token ``pi05_stack_bowls_rc_franka_ee_local``:
+        # pi05, 50-step chunk, continuous state, 7D Franka EE, 3 cameras.
+        model=pi0_config.Pi0Config(
+            pi05=True, action_horizon=32, discrete_state_input=False
+        ),
+        data=LeRobotFrankaShuoDataConfig(
+            # Kept as the asset_id fallback when train_data_paths overrides
+            # repo_id with local dataset path(s).
+            repo_id="fr3_a1_three_tasks_franka_ee",
+            base_config=DataConfig(prompt_from_task=True),
+            assets=AssetsConfig(asset_id="fr3_a1_three_tasks_franka_ee"),
+            extra_delta_transform=False,
+            balance_datasets=True,
+        ),
+        pytorch_weight_path="checkpoints/torch/pi05_droid_pytorch",
+    ),
+    TrainConfig(
         name="pi05_isaaclab_stack_cube",
         model=pi0_config.Pi0Config(
             pi05=True, action_horizon=10, discrete_state_input=False
@@ -682,8 +703,24 @@ def _override_with_data_kwargs(config: TrainConfig, data_kwargs) -> TrainConfig:
         data_kwargs = OmegaConf.to_container(data_kwargs, resolve=True)
     data_kwargs = dict(data_kwargs)
     norm_stats_path = data_kwargs.pop("norm_stats_path", None)
-    data_config = dataclasses.replace(config.data, **data_kwargs)
-    config = dataclasses.replace(config, data=data_config)
+    assets_dir = data_kwargs.pop("assets_dir", None)
+    asset_id = data_kwargs.pop("asset_id", None)
+    if "repo_ids" in data_kwargs and isinstance(data_kwargs["repo_ids"], list):
+        data_kwargs["repo_ids"] = tuple(data_kwargs["repo_ids"])
+    if data_kwargs:
+        data_config = dataclasses.replace(config.data, **data_kwargs)
+        config = dataclasses.replace(config, data=data_config)
+    if assets_dir is not None or asset_id is not None:
+        assets_replace: dict = {}
+        if assets_dir is not None:
+            assets_replace["assets_dir"] = str(assets_dir)
+        if asset_id is not None:
+            assets_replace["asset_id"] = str(asset_id)
+        new_data = dataclasses.replace(
+            config.data,
+            assets=dataclasses.replace(config.data.assets, **assets_replace),
+        )
+        config = dataclasses.replace(config, data=new_data)
     if norm_stats_path is not None:
         norm_dir = pathlib.Path(norm_stats_path).expanduser()
         if norm_dir.is_file():
@@ -709,7 +746,7 @@ def get_openpi_config(
     config_name: str,
     model_path: Optional[str] = None,
     batch_size: Optional[int] = None,
-    repo_id: Optional[str] = None,
+    repo_id: Optional[str | tuple[str, ...]] = None,
     data_kwargs: Optional[dict] = None,
 ) -> TrainConfig:
     """Get a config by name.
@@ -718,7 +755,7 @@ def get_openpi_config(
         config_name: Name of the config to load.
         model_path: Optional path to override model weights and assets.
         batch_size: Optional batch size override.
-        repo_id: Optional LeRobot repo_id or local data path to override.
+        repo_id: Optional LeRobot repo_id, local data path, or tuple of paths.
             When using a local path, the original asset_id is preserved so
             that norm_stats can still be loaded from the model checkpoint.
     """
@@ -746,7 +783,14 @@ def get_openpi_config(
     if repo_id is not None:
         original_repo_id = config.data.repo_id
         assets = config.data.assets
-        if norm_stats_path is None:
+        # Keep an explicit asset_id (factory or openpi_data). Only fall back to
+        # the original factory repo_id when it is a string identity, not a
+        # concatenated local-path tuple.
+        if (
+            norm_stats_path is None
+            and assets.asset_id is None
+            and isinstance(original_repo_id, str)
+        ):
             assets = dataclasses.replace(assets, asset_id=original_repo_id)
         new_data = dataclasses.replace(config.data, repo_id=repo_id, assets=assets)
         config = dataclasses.replace(config, data=new_data)

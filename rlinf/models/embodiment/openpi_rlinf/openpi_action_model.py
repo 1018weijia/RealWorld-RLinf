@@ -139,3 +139,45 @@ class OpenPiPytorchActionModel(nn.Module):
         prefix_output = prefix_output.to(device=rlt_param.device, dtype=rlt_param.dtype)
         rlt_mask = prefix_mask if self.rlt_cfg.rlt_use_mask else None
         return self.rlt_module.encode_flat(prefix_output, rlt_mask)
+
+    def freeze_vlm(self) -> int:
+        """Freeze the PaliGemma VLM (vision + expert-0 of the LLM).
+
+        Used by SFT ``train_expert_only`` (action expert only) and PPO.
+        Returns the count of newly-frozen parameter tensors.
+        """
+        frozen = 0
+        for p in self.model.img.parameters():
+            if p.requires_grad:
+                p.requires_grad = False
+                frozen += 1
+        llm = self.model.llm
+        for p in llm.embedder.parameters():
+            if p.requires_grad:
+                p.requires_grad = False
+                frozen += 1
+        for block in llm.layers:
+            for sub in (
+                block.pre_attention_norms[0],
+                block.pre_ffw_norms[0],
+                block.mlps[0],
+            ):
+                for p in sub.parameters():
+                    if p.requires_grad:
+                        p.requires_grad = False
+                        frozen += 1
+            attn = block.attn
+            for proj_list in (attn.q_proj, attn.k_proj, attn.v_proj, attn.o_proj):
+                proj = proj_list[0]
+                if proj is None:
+                    continue
+                for p in proj.parameters():
+                    if p.requires_grad:
+                        p.requires_grad = False
+                        frozen += 1
+        if llm.final_norms[0] is not None:
+            for p in llm.final_norms[0].parameters():
+                if p.requires_grad:
+                    p.requires_grad = False
+                    frozen += 1
+        return frozen

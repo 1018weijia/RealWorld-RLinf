@@ -1,0 +1,33 @@
+model_type: "openpi_rlinf"
+
+# Model-shape template for Shuo's single-arm Franka EE pi05 SFT.
+# Matches RL-Token ``pi05_stack_bowls_rc_franka_ee_local``:
+# 7D EE actions, 50-step chunk, 3 RealSense cameras.
+
+precision: fp32
+
+is_lora: False
+lora_rank: 32
+
+num_action_chunks: 32
+action_dim: 7
+use_proprio: True
+
+num_steps: 5
+
+add_value_head: False
+
+openpi:
+  task: sft
+  config_name: "pi05_franka_shuo"
+  # global_image, wrist_image, right_image — all unmasked.
+  num_images_in_input: 3
+  action_chunk: ${..num_action_chunks}
+  action_env_dim: ${..action_dim}
+  model_action_dim: 32
+  paligemma_variant: "gemma_2b"
+  action_expert_variant: "gemma_300m"
+  max_token_len: 200
+  discrete_state_input: false
+  # Matches stage1 ``VLA_FINETUNE_SCOPE=action_expert``.
+  # train_expert_only: True

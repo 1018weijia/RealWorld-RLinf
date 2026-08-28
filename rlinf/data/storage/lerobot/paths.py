@@ -54,6 +54,28 @@ def resolve_lerobot_repo_id(data_paths: Any) -> str | None:
     return str(data_paths)
 
 
+def resolve_lerobot_repo_ids(data_paths: Any) -> str | tuple[str, ...] | None:
+    """Like :func:`resolve_lerobot_repo_id`, but keep every listed dataset.
+
+    A single path stays a ``str``. Two or more paths become a tuple so OpenPI
+    can concatenate LeRobot datasets (``DataConfig.repo_id``).
+    """
+    if data_paths is None:
+        return None
+    if isinstance(data_paths, (list, tuple, ListConfig)):
+        repo_ids = [
+            repo_id
+            for repo_id in (resolve_lerobot_repo_id(item) for item in data_paths)
+            if repo_id
+        ]
+        if not repo_ids:
+            return None
+        if len(repo_ids) == 1:
+            return repo_ids[0]
+        return tuple(repo_ids)
+    return resolve_lerobot_repo_id(data_paths)
+
+
 def resolve_lerobot_dataset_root(data_path: str) -> Path:
     """Resolve the on-disk LeRobot dataset root for a path or Hugging Face repo id."""
     path = Path(data_path).expanduser()

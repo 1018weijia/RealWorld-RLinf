@@ -22,6 +22,7 @@ from rlinf.data.storage.lerobot.paths import (
     default_hf_lerobot_home,
     resolve_lerobot_dataset_root,
     resolve_lerobot_repo_id,
+    resolve_lerobot_repo_ids,
 )
 from rlinf.data.storage.lerobot.writer import LeRobotDatasetWriter
 
@@ -32,4 +33,5 @@ __all__ = [
     "default_hf_lerobot_home",
     "resolve_lerobot_dataset_root",
     "resolve_lerobot_repo_id",
+    "resolve_lerobot_repo_ids",
 ]
