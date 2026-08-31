@@ -33,8 +33,10 @@ from __future__ import annotations
 import argparse
 import base64
 import io
+import json
 import logging
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -99,9 +101,7 @@ def load_infer_yaml(config_path: Path) -> DictConfig:
         raise ValueError(f"{config_path}: missing required keys {missing}")
     robot = str(cfg.robot).lower()
     if robot not in _SUPPORTED_ROBOTS:
-        raise ValueError(
-            f"{config_path}: robot={robot!r} not in {_SUPPORTED_ROBOTS}"
-        )
+        raise ValueError(f"{config_path}: robot={robot!r} not in {_SUPPORTED_ROBOTS}")
     cfg.robot = robot
     if OmegaConf.select(cfg, "model.openpi.task") is None:
         raise ValueError(f"{config_path}: model.openpi.task is required (use 'eval')")
@@ -127,8 +127,7 @@ def slice_robot_state(state: np.ndarray, robot: str) -> np.ndarray:
     # dobot / xrobot: 14-D joint/EE pose, passed through directly.
     if robot in ("dobot", "xrobot"):
         raise ValueError(
-            f"{robot} state length must be {_JOINT_STATE_DIM}, "
-            f"got {state.shape[0]}"
+            f"{robot} state length must be {_JOINT_STATE_DIM}, got {state.shape[0]}"
         )
     raise ValueError(f"unsupported robot={robot!r}")
 
@@ -144,6 +143,78 @@ def decode_image_b64(b64: str) -> np.ndarray:
     if arr.ndim != 3 or arr.shape[-1] != 3:
         raise ValueError(f"image must be [H,W,3], got {arr.shape}")
     return arr
+
+
+def _channel_means(image: np.ndarray) -> dict[str, float]:
+    means = image.reshape(-1, 3).mean(axis=0)
+    return {
+        "R": float(means[0]),
+        "G": float(means[1]),
+        "B": float(means[2]),
+    }
+
+
+def dump_client_observation(
+    dump_dir: Path,
+    *,
+    request_idx: int,
+    robot: str,
+    prompt: str,
+    state: np.ndarray,
+    high: np.ndarray,
+    left: np.ndarray,
+    right: np.ndarray,
+) -> Path:
+    """Save one decoded client observation for visual debugging."""
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    out = dump_dir / f"req_{request_idx:06d}_{stamp}"
+    out.mkdir(parents=True, exist_ok=True)
+
+    Image.fromarray(high, mode="RGB").save(out / "cam_high_rgb.png")
+    Image.fromarray(left, mode="RGB").save(out / "cam_left_wrist_rgb.png")
+    Image.fromarray(right, mode="RGB").save(out / "cam_right_wrist_rgb.png")
+    # BGR-looking copy helps catch channel-order mistakes by eye.
+    Image.fromarray(high[:, :, ::-1], mode="RGB").save(
+        out / "cam_high_as_bgr_swapped.png"
+    )
+
+    collage = np.concatenate([high, left, right], axis=1)
+    Image.fromarray(collage, mode="RGB").save(out / "collage_high_left_right.png")
+
+    meta = {
+        "request_idx": request_idx,
+        "robot": robot,
+        "prompt": prompt,
+        "state": [float(x) for x in np.asarray(state, dtype=np.float64).reshape(-1)],
+        "shapes": {
+            "cam_high": list(high.shape),
+            "cam_left_wrist": list(left.shape),
+            "cam_right_wrist": list(right.shape),
+        },
+        "dtypes": {
+            "cam_high": str(high.dtype),
+            "cam_left_wrist": str(left.dtype),
+            "cam_right_wrist": str(right.dtype),
+        },
+        "channel_means_rgb": {
+            "cam_high": _channel_means(high),
+            "cam_left_wrist": _channel_means(left),
+            "cam_right_wrist": _channel_means(right),
+        },
+        "value_range": {
+            "cam_high": [int(high.min()), int(high.max())],
+            "cam_left_wrist": [int(left.min()), int(left.max())],
+            "cam_right_wrist": [int(right.min()), int(right.max())],
+        },
+        "note": (
+            "Images are server-decoded RGB (PIL). "
+            "cam_high_as_bgr_swapped.png is R/B swapped for litmus comparison. "
+            "Model later resize_with_pad to 224x224; dump keeps client resolution."
+        ),
+    }
+    (out / "meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    (dump_dir / "LATEST").write_text(str(out), encoding="utf-8")
+    return out
 
 
 def build_model_config(infer_cfg: DictConfig) -> Any:
@@ -165,14 +236,10 @@ def build_model_config(infer_cfg: DictConfig) -> Any:
                 "task": str(openpi.task),
                 "config_name": str(openpi.config_name),
                 "num_images_in_input": int(openpi.get("num_images_in_input", 3)),
-                "discrete_state_input": bool(
-                    openpi.get("discrete_state_input", True)
-                ),
+                "discrete_state_input": bool(openpi.get("discrete_state_input", True)),
                 "max_token_len": int(openpi.get("max_token_len", 200)),
                 "model_action_dim": int(openpi.get("model_action_dim", 32)),
-                "paligemma_variant": str(
-                    openpi.get("paligemma_variant", "gemma_2b")
-                ),
+                "paligemma_variant": str(openpi.get("paligemma_variant", "gemma_2b")),
                 "action_expert_variant": str(
                     openpi.get("action_expert_variant", "gemma_300m")
                 ),
@@ -187,11 +254,21 @@ def build_model_config(infer_cfg: DictConfig) -> Any:
 class OpenPiRlinfInferServer:
     """Wraps openpi_rlinf eval model and robot-specific observation prep."""
 
-    def __init__(self, infer_cfg: DictConfig, device: torch.device) -> None:
+    def __init__(
+        self,
+        infer_cfg: DictConfig,
+        device: torch.device,
+        dump_obs_dir: Path | None = None,
+    ) -> None:
         self.infer_cfg = infer_cfg
         self.device = device
         self.robot = str(infer_cfg.robot)
         self.default_prompt = str(infer_cfg.default_prompt)
+        self.dump_obs_dir = dump_obs_dir
+        self._request_idx = 0
+        if self.dump_obs_dir is not None:
+            self.dump_obs_dir.mkdir(parents=True, exist_ok=True)
+            logger.info("Dumping decoded client observations to %s", self.dump_obs_dir)
         model_cfg = build_model_config(infer_cfg)
         logger.info(
             "Loading openpi_rlinf robot=%s config_name=%s from %s ...",
@@ -213,7 +290,7 @@ class OpenPiRlinfInferServer:
 
     def infer_from_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
         """Run inference from a plain JSON dict (client-compatible schema)."""
-        prompt = str(payload.get("prompt", self.default_prompt))
+        prompt = self.default_prompt
         state_raw = payload.get("state")
         if state_raw is None:
             raise ValueError("missing field: state")
@@ -238,6 +315,26 @@ class OpenPiRlinfInferServer:
             raise ValueError(
                 f"all cameras must share shape; high={high.shape}, "
                 f"left={left.shape}, right={right.shape}"
+            )
+
+        if self.dump_obs_dir is not None:
+            self._request_idx += 1
+            out = dump_client_observation(
+                self.dump_obs_dir,
+                request_idx=self._request_idx,
+                robot=self.robot,
+                prompt=prompt,
+                state=state_np,
+                high=high,
+                left=left,
+                right=right,
+            )
+            logger.info(
+                "dumped client obs #%d shape=%s means_high=%s -> %s",
+                self._request_idx,
+                high.shape,
+                _channel_means(high),
+                out,
             )
 
         wrist = np.stack([left, right], axis=0)
@@ -332,6 +429,14 @@ def parse_args() -> argparse.Namespace:
         choices=["bf16", "fp32"],
         help="Override YAML inference compute precision.",
     )
+    parser.add_argument(
+        "--dump-obs-dir",
+        default=None,
+        help=(
+            "If set, save every decoded client observation (RGB PNGs + meta.json) "
+            "under this directory for camera debugging."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -353,11 +458,7 @@ def main() -> None:
         infer_cfg.precision = args.precision
 
     host = args.host if args.host is not None else str(infer_cfg.get("host", "0.0.0.0"))
-    port = (
-        int(args.port)
-        if args.port is not None
-        else int(infer_cfg.get("port", 8000))
-    )
+    port = int(args.port) if args.port is not None else int(infer_cfg.get("port", 8000))
 
     ckpt = Path(str(infer_cfg.ckpt)).expanduser()
     norm_stats = Path(str(infer_cfg.norm_stats)).expanduser()
@@ -370,8 +471,12 @@ def main() -> None:
     if device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA requested but not available; use --device cpu")
 
+    dump_obs_dir = (
+        Path(args.dump_obs_dir).expanduser().resolve() if args.dump_obs_dir else None
+    )
+
     logger.info("Using inference config %s", config_path)
-    server = OpenPiRlinfInferServer(infer_cfg, device)
+    server = OpenPiRlinfInferServer(infer_cfg, device, dump_obs_dir=dump_obs_dir)
     app = create_app(server)
     app.run(host=host, port=port, threaded=False)
 
