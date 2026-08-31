@@ -2,8 +2,8 @@
 robot: dobot
 default_prompt: "pour water"
 
-ckpt: /data/gxy/realworldRL/RLinf/logs/20260823-051339-dobot_sft_openpi_rlinf_pi05_pour_water-gpu4/dobot_pi05_pour_water_sft/checkpoints/global_step_30000/actor/model_state_dict
-norm_stats: /data/gxy/realworldRL/checkpoints/assets/dobot/pour_water/norm_stats.json
+ckpt: /data/gxy/realworldRL/RLinf/logs/20260828-133705-hf_v21_dobot_sft_openpi_rlinf_pi05_pour_water_hf_v21-gpu2/dobot_pi05_hf_v21_pour_water_sft/checkpoints/global_step_30000/actor/model_state_dict
+norm_stats: /data/gxy/realworldRL/checkpoints/assets/dobot_hf_v21/pour_water/norm_stats.json
 
 precision: bf16
 host: 0.0.0.0

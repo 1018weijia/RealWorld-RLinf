@@ -29,6 +29,19 @@ from rlinf.utils.logging import get_logger
 logger = get_logger()
 
 
+def _resolve_pi0_dtype(cfg: Any, torch_dtype: Any = None) -> tuple[Any, str]:
+    """Resolve the model target dtype and matching Pi0 config dtype."""
+    import torch
+
+    target_dtype = (
+        torch_dtype
+        if torch_dtype is not None
+        else torch_dtype_from_precision(cfg.precision)
+    )
+    pi0_dtype = "float32" if target_dtype == torch.float32 else "bfloat16"
+    return target_dtype, pi0_dtype
+
+
 def get_model(cfg: Any, torch_dtype: Any = None) -> Any:
     """Build an OpenPI PyTorch Pi0/Pi0.5 model from ``actor.model`` config.
 
@@ -54,11 +67,7 @@ def get_model(cfg: Any, torch_dtype: Any = None) -> Any:
     # Existing Pi0.5 templates predate the explicit switch, so preserve their
     # behavior by default. Pi0 templates set this field to False explicitly.
     pi05 = bool(OmegaConf.select(cfg, "pi05", default=True))
-    target_dtype = (
-        torch_dtype
-        if torch_dtype is not None
-        else torch_dtype_from_precision(cfg.precision)
-    )
+    target_dtype, pi0_dtype = _resolve_pi0_dtype(cfg, torch_dtype)
 
     model_path = pathlib.Path(cfg.model_path).expanduser()
     safetensors_path = resolve_model_safetensors(model_path)
@@ -76,7 +85,7 @@ def get_model(cfg: Any, torch_dtype: Any = None) -> Any:
         "action_dim": int(model_cfg.model_action_dim),
         "paligemma_variant": str(model_cfg.paligemma_variant),
         "action_expert_variant": str(model_cfg.action_expert_variant),
-        "dtype": "bfloat16",
+        "dtype": pi0_dtype,
         "pcd": False,
     }
     discrete_state_input = OmegaConf.select(
