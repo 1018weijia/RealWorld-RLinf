@@ -31,9 +31,7 @@ from rlinf.models.embodiment.openpi_rlinf import _resolve_pi0_dtype
         (None, None, None, "bfloat16"),
     ],
 )
-def test_resolve_pi0_dtype(
-    precision, torch_dtype, expected_target, expected_pi0
-):
+def test_resolve_pi0_dtype(precision, torch_dtype, expected_target, expected_pi0):
     cfg = SimpleNamespace(precision=precision)
 
     target_dtype, pi0_dtype = _resolve_pi0_dtype(cfg, torch_dtype)

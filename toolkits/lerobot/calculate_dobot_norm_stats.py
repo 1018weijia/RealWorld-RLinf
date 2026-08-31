@@ -72,12 +72,9 @@ def _delta_actions(state_14: np.ndarray, actions_chunk: np.ndarray) -> np.ndarra
 
 def main(
     dataset_root: str = (
-        "/data/gxy/realworldRL/datasets/Dobot/NormalData/"
-        "dobot_cook_vegetable_fullV30"
+        "/data/gxy/realworldRL/datasets/Dobot/NormalData/dobot_cook_vegetable_fullV30"
     ),
-    output_dir: str = (
-        "/data/gxy/realworldRL/checkpoints/assets/dobot/cook_vegetable"
-    ),
+    output_dir: str = ("/data/gxy/realworldRL/checkpoints/assets/dobot/cook_vegetable"),
     action_horizon: int = 50,
 ) -> None:
     root = pathlib.Path(dataset_root)
@@ -90,7 +87,7 @@ def main(
     tables = list(_iter_parquet_tables(data_root))
     episode_count = 0
     for table in tqdm.tqdm(tables, desc="Dobot parquet files"):
-        for _ep, (states, actions) in _episode_arrays(table).items():
+        for states, actions in _episode_arrays(table).values():
             episode_count += 1
             if states.shape[-1] != _DOBOT_JOINT_ACTION_DIM:
                 raise SystemExit(

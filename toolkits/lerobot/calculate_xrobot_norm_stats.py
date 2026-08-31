@@ -93,7 +93,7 @@ def main(
     for path, table in tqdm.tqdm(
         list(_iter_episode_parquet(data_root)), desc="XRobot parquet files"
     ):
-        for _ep, (states, actions) in _episode_arrays(table).items():
+        for states, actions in _episode_arrays(table).values():
             episode_count += 1
             if states.shape[-1] != _XROBOT_ACTION_DIM:
                 raise SystemExit(
