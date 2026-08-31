@@ -114,7 +114,9 @@ jobs:
               - 'toolkits/replay_buffer/**'
               - 'toolkits/lerobot/**'
               - 'toolkits/dual_franka/**'
+              - 'toolkits/inference/**'
               - 'toolkits/__init__.py'
+              - 'scripts/franka/**'
             agent_reason_filter: &agent
               - *shared
               - 'rlinf/agents/**'
