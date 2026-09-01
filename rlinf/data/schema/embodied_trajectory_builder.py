@@ -68,6 +68,15 @@ class EmbodiedTrajectoryBuilder:
 
     curr_obs: list[dict[str, Any]] = field(default_factory=list)  # trajectory_length
     next_obs: list[dict[str, Any]] = field(default_factory=list)  # trajectory_length
+    # Progress-aware RLT branch metadata (one entry per transition step).
+    bootstrap_mask: list[torch.Tensor] = field(default_factory=list)
+    branch_id: list[torch.Tensor] = field(default_factory=list)
+    terminal_type: list[torch.Tensor] = field(default_factory=list)
+    action_source: list[torch.Tensor] = field(default_factory=list)
+    progress_label: list[torch.Tensor] = field(default_factory=list)
+    progress_mask: list[torch.Tensor] = field(default_factory=list)
+    auto_trigger: list[torch.Tensor] = field(default_factory=list)
+    rollback_confirmed: list[torch.Tensor] = field(default_factory=list)
 
     def append_step_result(self, result: ChunkStepResult):
         if result.actions is not None:
@@ -150,7 +159,7 @@ class EmbodiedTrajectoryBuilder:
                     )
                 last_fi.pop("model_action", None)
 
-    def append_transitions(self, curr_obs=None, next_obs=None):
+    def append_transitions(self, curr_obs=None, next_obs=None, branch_fields=None):
         assert curr_obs is not None and next_obs is not None
         if "task_descriptions" in curr_obs:
             curr_obs.pop("task_descriptions")
@@ -158,6 +167,28 @@ class EmbodiedTrajectoryBuilder:
             next_obs.pop("task_descriptions")
         self.curr_obs.append(curr_obs)
         self.next_obs.append(next_obs)
+        if branch_fields:
+            self.append_branch_fields(branch_fields)
+
+    def append_branch_fields(self, branch_fields: dict[str, Any]) -> None:
+        """Append optional RLT branch tensors aligned with the latest transition."""
+        mapping = {
+            "bootstrap_mask": self.bootstrap_mask,
+            "branch_id": self.branch_id,
+            "terminal_type": self.terminal_type,
+            "action_source": self.action_source,
+            "progress_label": self.progress_label,
+            "progress_mask": self.progress_mask,
+            "auto_trigger": self.auto_trigger,
+            "rollback_confirmed": self.rollback_confirmed,
+        }
+        for key, store in mapping.items():
+            value = branch_fields.get(key)
+            if value is None:
+                continue
+            if not torch.is_tensor(value):
+                value = torch.as_tensor(value)
+            store.append(value)
 
     def clear(self):
         self.actions.clear()
@@ -172,6 +203,14 @@ class EmbodiedTrajectoryBuilder:
         self.forward_inputs.clear()
         self.curr_obs.clear()
         self.next_obs.clear()
+        self.bootstrap_mask.clear()
+        self.branch_id.clear()
+        self.terminal_type.clear()
+        self.action_source.clear()
+        self.progress_label.clear()
+        self.progress_mask.clear()
+        self.auto_trigger.clear()
+        self.rollback_confirmed.clear()
 
     def to_trajectory(self) -> Trajectory:
         trajectory = Trajectory(
@@ -220,6 +259,20 @@ class EmbodiedTrajectoryBuilder:
             trajectory.next_obs = stack_list_of_dict_tensor(self.next_obs)
             for key in trajectory.next_obs.keys():
                 trajectory.next_obs[key] = trajectory.next_obs[key].cpu().contiguous()
+
+        def _stack_optional(store: list[torch.Tensor]) -> torch.Tensor | None:
+            if not store:
+                return None
+            return torch.stack(store, dim=0).cpu().contiguous()
+
+        trajectory.bootstrap_mask = _stack_optional(self.bootstrap_mask)
+        trajectory.branch_id = _stack_optional(self.branch_id)
+        trajectory.terminal_type = _stack_optional(self.terminal_type)
+        trajectory.action_source = _stack_optional(self.action_source)
+        trajectory.progress_label = _stack_optional(self.progress_label)
+        trajectory.progress_mask = _stack_optional(self.progress_mask)
+        trajectory.auto_trigger = _stack_optional(self.auto_trigger)
+        trajectory.rollback_confirmed = _stack_optional(self.rollback_confirmed)
 
         trajectory.model_weights_id = get_model_weights_id(
             trajectory.versions

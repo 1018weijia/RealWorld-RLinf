@@ -2,21 +2,29 @@
 # Generic VLA SFT launcher (cobot / dobot / xrobot / hf_v21 / usb, ...).
 #
 # Usage:
-#   bash toolkits/lerobot/run_sft.sh <config_name> <physical_gpu_id> [resume_dir]
+#   bash toolkits/lerobot/run_sft.sh <config_name> <physical_gpu_id> [resume_dir] [hydra_overrides...]
 #
 # Examples:
-#   bash toolkits/lerobot/run_sft.sh dobot_sft_openpi_rlinf_pi05_cook_vegetable_hf_v21 0
-#   bash toolkits/lerobot/run_sft.sh xrobot_sft_openpi_rlinf_pi05_usb_plug 7
-#   bash toolkits/lerobot/run_sft.sh cobot_sft_openpi_rlinf_pi05_cook_vegetable 2
-#
-# GPU selection uses COBOT_GPU_ID -> cluster.component_placement in YAML.
-# Prefers repo .venv/bin/python so tmux/non-interactive shells work without activate.
+#   bash toolkits/lerobot/run_sft.sh cobot_rlt_stage1_sft_openpi_pi05_cube_into_drawer 6
+#   bash toolkits/lerobot/run_sft.sh cobot_rlt_stage1_sft_openpi_pi05_cube_into_drawer 6 "" \
+#     actor.micro_batch_size=32 actor.global_batch_size=32
 
 set -euo pipefail
 CONFIG_NAME="${1:?config name required}"
 GPU_ID="${2:?physical GPU id required}"
-# Optional: path to checkpoints/global_step_N (must contain actor/)
-RESUME_DIR="${3:-}"
+shift 2
+
+RESUME_DIR=""
+EXTRA_OVERRIDES=()
+if [[ $# -gt 0 ]]; then
+  if [[ "${1}" == *=* ]] || [[ "${1}" == +* ]]; then
+    EXTRA_OVERRIDES=("$@")
+  else
+    RESUME_DIR="${1}"
+    shift
+    EXTRA_OVERRIDES=("$@")
+  fi
+fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_PATH="$(cd "${SCRIPT_DIR}/../.." && pwd)"
@@ -50,8 +58,10 @@ CMD=(
   "runner.logger.log_path=${LOG_DIR}"
 )
 if [[ -n "${RESUME_DIR}" ]]; then
-  # Struct config: resume_dir is optional, so use + to insert the key.
   CMD+=("+runner.resume_dir=${RESUME_DIR}")
+fi
+if [[ ${#EXTRA_OVERRIDES[@]} -gt 0 ]]; then
+  CMD+=("${EXTRA_OVERRIDES[@]}")
 fi
 
 echo "PYTHON_BIN=${PYTHON_BIN}"

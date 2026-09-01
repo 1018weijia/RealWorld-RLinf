@@ -150,10 +150,18 @@ def load_full_wrapper_weights(wrapper, weights_path, *, expect_rlt: bool) -> Non
 
     loaded = torch.load(str(weights_path), map_location="cpu", weights_only=False)
     state_dict = _normalize_wrapper_state_dict(as_state_dict(loaded))
-    if expect_rlt and not any(key.startswith("rlt_module.") for key in state_dict):
+    has_rlt_weights = any(key.startswith("rlt_module.") for key in state_dict)
+    if expect_rlt and not has_rlt_weights:
         raise ValueError(
             "openpi_rlinf RLT checkpoint has no rlt_module.* weights. "
             "Stage2 must consume a Stage1 checkpoint trained with openpi.use_rlt=True."
+        )
+    if not expect_rlt and not has_rlt_weights:
+        logger.warning(
+            "openpi_rlinf: checkpoint %s has no rlt_module.* weights; "
+            "loading base model only (rlt_module stays randomly initialized). "
+            "This is expected for Stage-1 warm-start from non-RLT SFT.",
+            weights_path,
         )
 
     incompatible = wrapper.load_state_dict(state_dict, strict=False)

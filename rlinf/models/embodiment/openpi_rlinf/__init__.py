@@ -151,10 +151,22 @@ def get_model(cfg: Any, torch_dtype: Any = None) -> Any:
         )
 
     if full_weights_path is not None:
+        # Stage-1 SFT with use_rlt=True may warm-start from a plain SFT ckpt
+        # (no rlt_module.*); rlt_module stays randomly initialized. Stage-2 /
+        # RL must load a Stage-1 RLT ckpt — require that by default for task=rl.
+        use_rlt = bool(OmegaConf.select(model_cfg, "use_rlt", default=False))
+        require_rlt_default = use_rlt and task == "rl"
+        expect_rlt = bool(
+            OmegaConf.select(
+                model_cfg,
+                "require_rlt_checkpoint",
+                default=require_rlt_default,
+            )
+        )
         load_full_wrapper_weights(
             wrapper,
             full_weights_path,
-            expect_rlt=bool(OmegaConf.select(model_cfg, "use_rlt", default=False)),
+            expect_rlt=expect_rlt,
         )
 
     source = full_weights_path if full_weights_path is not None else safetensors_path

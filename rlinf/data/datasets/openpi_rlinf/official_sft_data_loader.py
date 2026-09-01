@@ -89,8 +89,12 @@ def build_official_openpi_sft_dataloader(
     # Spawned DataLoader workers: re-apply decode patch + force thread=1.
     _patch_openpi_dataloader_worker_init(openpi_data_loader)
 
-    # Cobot Magic demos include episode_success=failure; drop those episodes.
-    if "cobot" in config_name.lower():
+    # Cobot Magic demos include episode_success=failure; drop those by default.
+    # RLT Stage-1 may set data.include_failure_episodes=true to keep failures.
+    include_failures = bool(
+        OmegaConf.select(cfg, "data.include_failure_episodes", default=False)
+    )
+    if "cobot" in config_name.lower() and not include_failures:
         _patch_create_torch_dataset_drop_failures(openpi_data_loader)
 
     if "dobot" in config_name.lower():

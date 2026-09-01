@@ -15,8 +15,8 @@
 import queue
 
 import torch
-import torch.nn.functional as F
 
+from rlinf.algorithms.rlt import losses as rlt_losses
 from rlinf.algorithms.rlt.transition import use_simulator_transition_replay
 from rlinf.data.schema.embodied_types import Trajectory
 from rlinf.models.embodiment.base_policy import ForwardType
@@ -45,9 +45,7 @@ class RLTACLossMixin:
 
     @staticmethod
     def _flatten_chunk(tensor: torch.Tensor) -> torch.Tensor:
-        if tensor.dim() <= 2:
-            return tensor
-        return tensor.reshape(tensor.shape[0], -1)
+        return rlt_losses.flatten_chunk(tensor)
 
     def _chunk_shape(self) -> tuple[int, int]:
         chunk_len = int(self.cfg.actor.model.num_action_chunks)
@@ -69,29 +67,19 @@ class RLTACLossMixin:
 
     @staticmethod
     def _require_twin_q(all_q_values: torch.Tensor) -> None:
-        if all_q_values.shape[-1] < 2:
-            raise ValueError(
-                "RLT Stage 2 requires at least two Q heads for twin-Q training, "
-                f"got Q shape {tuple(all_q_values.shape)}."
-            )
+        rlt_losses.require_twin_q(all_q_values)
 
     def _min_twin_q(self, all_q_values: torch.Tensor) -> torch.Tensor:
-        self._require_twin_q(all_q_values)
-        return torch.minimum(all_q_values[..., 0:1], all_q_values[..., 1:2])
+        return rlt_losses.min_twin_q(all_q_values)
 
     def _q1(self, all_q_values: torch.Tensor) -> torch.Tensor:
-        self._require_twin_q(all_q_values)
-        return all_q_values[..., 0:1]
+        return rlt_losses.q1(all_q_values)
 
     def _discounted_chunk_rewards(self, rewards: torch.Tensor) -> torch.Tensor:
-        rewards = rewards.reshape(rewards.shape[0], -1)
         rewards = rewards.to(self.torch_dtype)
-        chunk_len = rewards.shape[-1]
-        discounts = torch.pow(
-            torch.as_tensor(self.cfg.algorithm.gamma, device=rewards.device),
-            torch.arange(chunk_len, device=rewards.device, dtype=rewards.dtype),
+        return rlt_losses.discounted_chunk_rewards(
+            rewards, float(self.cfg.algorithm.gamma)
         )
-        return torch.sum(rewards * discounts, dim=-1, keepdim=True)
 
     def _bc_metrics(
         self,
@@ -101,48 +89,14 @@ class RLTACLossMixin:
         intervene_flags: torch.Tensor | None,
     ) -> tuple[torch.Tensor, dict[str, float]]:
         chunk_len, action_dim = self._chunk_shape()
-        pi_chunk = self._flatten_chunk(pi).reshape(-1, chunk_len, action_dim)
-        action_chunk = self._flatten_chunk(actions).reshape(-1, chunk_len, action_dim)
-        bc_ref_chunk = self._flatten_chunk(ref_chunk).reshape(
-            ref_chunk.shape[0], -1, action_dim
-        )[:, :chunk_len]
-
-        if intervene_flags is None:
-            human_mask = torch.zeros(
-                pi_chunk.shape[:2], dtype=torch.bool, device=pi_chunk.device
-            )
-        else:
-            human_mask = (
-                self._flatten_chunk(intervene_flags)
-                .to(device=pi_chunk.device)
-                .bool()
-                .reshape(-1, chunk_len, action_dim)
-                .any(dim=-1)
-            )
-
-        bc_target = torch.where(human_mask[..., None], action_chunk, bc_ref_chunk)
-        bc_error = torch.mean(torch.square(pi_chunk - bc_target), dim=-1)
-        bc_loss = torch.mean(bc_error)
-
-        policy_mask = ~human_mask
-        ref_error = torch.mean(torch.square(pi_chunk - bc_ref_chunk), dim=-1)
-        human_error = torch.mean(torch.square(pi_chunk - action_chunk), dim=-1)
-        bc_ref = torch.sum(ref_error * policy_mask.to(ref_error.dtype)) / torch.clamp(
-            torch.sum(policy_mask.to(ref_error.dtype)), min=1.0
+        return rlt_losses.compute_rlt_bc_loss(
+            pi=pi,
+            actions=actions,
+            ref_chunk=ref_chunk,
+            intervene_flags=intervene_flags,
+            chunk_len=chunk_len,
+            action_dim=action_dim,
         )
-        bc_human = torch.sum(
-            human_error * human_mask.to(human_error.dtype)
-        ) / torch.clamp(torch.sum(human_mask.to(human_error.dtype)), min=1.0)
-
-        human_ratio = torch.mean(human_mask.to(torch.float32)).item()
-        metrics = {
-            "bc_loss": bc_loss.detach().item(),
-            "bc_ref_loss": bc_ref.detach().item(),
-            "bc_human_loss": bc_human.detach().item(),
-            "human_mask_ratio": human_ratio,
-            "policy_mask_ratio": 1.0 - human_ratio,
-        }
-        return bc_loss, metrics
 
     def _actor_objective_weights(self) -> tuple[float, float, dict[str, float]]:
         """Resolve RLT actor-objective BC/Q weights."""
@@ -233,137 +187,42 @@ class RLTACLossMixin:
     def forward_critic(self, batch):
         use_crossq = self.cfg.algorithm.get("q_head_type", "default") == "crossq"
         bootstrap_type = self.cfg.algorithm.get("bootstrap_type", "standard")
-
-        curr_obs = batch["curr_obs"]
-        next_obs = batch["next_obs"]
-        actions = batch["actions"]
-        rewards = batch["rewards"]
-        done_source = batch["terminations"]
-        if use_simulator_transition_replay(self.cfg):
-            done_source = batch["dones"]
-        done_source = done_source.to(self.torch_dtype)
-        not_done = ~done_source.reshape(done_source.shape[0], -1).bool().any(
-            dim=-1, keepdim=True
+        # Ensure reward dtype matches worker training dtype before loss helpers.
+        batch = {
+            **batch,
+            "rewards": batch["rewards"].to(self.torch_dtype),
+        }
+        critic_loss, metrics = rlt_losses.compute_rlt_critic_loss(
+            model=self.model,
+            target_model=self.target_model,
+            batch=batch,
+            gamma=float(self.cfg.algorithm.gamma),
+            bootstrap_type=bootstrap_type,
+            use_crossq=use_crossq,
+            use_done_key=use_simulator_transition_replay(self.cfg),
+            next_actions_fn=self._next_actions_for_critic_target,
         )
-
-        with torch.no_grad():
-            next_actions, _, _ = self._next_actions_for_critic_target(next_obs)
-
-            if not use_crossq:
-                all_qf_next_target = self.target_model(
-                    forward_type=ForwardType.SAC_Q,
-                    obs=next_obs,
-                    actions=next_actions,
-                )
-                q_next = self._min_twin_q(all_qf_next_target)
-            else:
-                _, all_qf_next = self.model(
-                    forward_type=ForwardType.CROSSQ_Q,
-                    obs=curr_obs,
-                    actions=actions,
-                    next_obs=next_obs,
-                    next_actions=next_actions,
-                )
-                q_next = self._min_twin_q(all_qf_next.detach())
-
-            reward_target = self._discounted_chunk_rewards(rewards)
-            reward_horizon = int(rewards.reshape(rewards.shape[0], -1).shape[-1])
-            bootstrap_discount = self.cfg.algorithm.gamma**reward_horizon
-            if bootstrap_type == "always":
-                target_q_values = reward_target + bootstrap_discount * q_next
-            elif bootstrap_type == "standard":
-                target_q_values = reward_target + not_done * bootstrap_discount * q_next
-            else:
-                raise NotImplementedError(f"{bootstrap_type=} is not supported!")
-
-        if not use_crossq:
-            all_data_q_values = self.model(
-                forward_type=ForwardType.SAC_Q,
-                obs=curr_obs,
-                actions=actions,
-            )
-        else:
-            all_data_q_values, _ = self.model(
-                forward_type=ForwardType.CROSSQ_Q,
-                obs=curr_obs,
-                actions=actions,
-                next_obs=next_obs,
-                next_actions=next_actions,
-            )
-
-        target_q_values = target_q_values.to(dtype=all_data_q_values.dtype)
-        critic_loss = F.mse_loss(
-            all_data_q_values, target_q_values.expand_as(all_data_q_values)
-        )
-        return critic_loss, {"q_data": all_data_q_values.mean().item()}
+        return critic_loss, metrics
 
     @Worker.timer("forward_actor")
     def forward_actor(self, batch):
         use_crossq = self.cfg.algorithm.get("q_head_type", "default") == "crossq"
-
-        curr_obs = batch["curr_obs"]
         reference_dropout_prob = float(
             self.cfg.algorithm.get("reference_dropout_prob", 0.0)
         )
-        pi, log_pi, _ = self.model(
-            forward_type=ForwardType.SAC,
-            obs=curr_obs,
-            apply_reference_dropout=True,
-            reference_dropout_prob=reference_dropout_prob,
-        )
-        if log_pi.ndim == 1:
-            log_pi = log_pi.unsqueeze(-1)
-        log_pi = log_pi.sum(dim=-1, keepdim=True)
-
-        if not use_crossq:
-            all_qf_pi = self.model(
-                forward_type=ForwardType.SAC_Q,
-                obs=curr_obs,
-                actions=pi,
-                detach_encoder=True,
-            )
-        else:
-            all_qf_pi, _ = self.model(
-                forward_type=ForwardType.CROSSQ_Q,
-                obs=curr_obs,
-                actions=pi,
-                next_obs=None,
-                next_actions=None,
-                detach_encoder=True,
-            )
-
-        num_q_values = all_qf_pi.shape[-1]
-        metrics = {
-            f"q_value_{q_id}": all_qf_pi[..., q_id].mean().item()
-            for q_id in range(num_q_values)
-        }
-        qf_pi = self._q1(all_qf_pi)
-        metrics["q_pi"] = qf_pi.mean().item()
-
-        ref_chunk = self._ref_chunk(curr_obs)
-        bc_loss, rlt_metrics = self._bc_metrics(
-            pi=pi,
-            actions=batch["actions"],
-            ref_chunk=ref_chunk,
-            intervene_flags=batch.get("intervene_flags", None),
-        )
-        metrics.update(rlt_metrics)
-
-        entropy = -log_pi.mean()
+        chunk_len, action_dim = self._chunk_shape()
         bc_weight, q_weight, weight_metrics = self._actor_objective_weights()
-        actor_loss = -q_weight * qf_pi.mean() + bc_weight * bc_loss
-        metrics.update(weight_metrics)
-        metrics["action_ref_abs_mean"] = (
-            (self._flatten_chunk(pi) - self._flatten_chunk(ref_chunk))
-            .abs()
-            .mean()
-            .detach()
-            .item()
+        actor_loss, entropy, metrics = rlt_losses.compute_rlt_actor_loss(
+            model=self.model,
+            batch=batch,
+            chunk_len=chunk_len,
+            action_dim=action_dim,
+            q_weight=q_weight,
+            bc_weight=bc_weight,
+            reference_dropout_prob=reference_dropout_prob,
+            use_crossq=use_crossq,
         )
-        metrics["weighted_q"] = (q_weight * qf_pi.mean()).detach().item()
-        metrics["weighted_bc"] = (bc_weight * bc_loss).detach().item()
-        metrics["reference_dropout_prob"] = reference_dropout_prob
-
+        metrics.update(weight_metrics)
         return actor_loss, entropy, metrics
 
     @Worker.timer("forward_alpha")

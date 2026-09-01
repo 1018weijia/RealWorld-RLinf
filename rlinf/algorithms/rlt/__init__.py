@@ -13,6 +13,18 @@
 # limitations under the License.
 
 from rlinf.algorithms.expert import build_expert_model_config
+from rlinf.algorithms.rlt.losses import (
+    compute_q_node1_gap,
+    compute_rlt_actor_loss,
+    compute_rlt_critic_loss,
+)
+from rlinf.algorithms.rlt.progress_head import (
+    ProgressHeadEnsemble,
+    progress_d2_ranking_loss,
+    progress_head_loss,
+    progress_voc_loss,
+    voc_progress_labels,
+)
 from rlinf.algorithms.rlt.rollout import predict_rlt_actions
 from rlinf.algorithms.rlt.route import (
     RealworldRLTRoute,
@@ -21,15 +33,27 @@ from rlinf.algorithms.rlt.route import (
     SimulatorRLTRoute,
     build_rlt_route,
 )
-from rlinf.algorithms.rlt.transition import use_simulator_transition_replay
+from rlinf.algorithms.rlt.transition import (
+    annotate_rlt_branch_fields,
+    use_simulator_transition_replay,
+)
 
 __all__ = [
+    "ProgressHeadEnsemble",
     "RLTRoute",
     "RLTRouteContext",
     "RealworldRLTRoute",
     "SimulatorRLTRoute",
+    "annotate_rlt_branch_fields",
     "build_expert_model_config",
     "build_rlt_route",
+    "compute_q_node1_gap",
+    "compute_rlt_actor_loss",
+    "compute_rlt_critic_loss",
     "predict_rlt_actions",
+    "progress_d2_ranking_loss",
+    "progress_head_loss",
+    "progress_voc_loss",
     "use_simulator_transition_replay",
+    "voc_progress_labels",
 ]

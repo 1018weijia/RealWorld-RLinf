@@ -478,7 +478,7 @@ def main() -> None:
     logger.info("Using inference config %s", config_path)
     server = OpenPiRlinfInferServer(infer_cfg, device, dump_obs_dir=dump_obs_dir)
     app = create_app(server)
-    app.run(host=host, port=port, threaded=False)
+    app.run(host=host, port=port, threaded=True)
 
 
 if __name__ == "__main__":

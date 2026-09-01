@@ -396,6 +396,17 @@ class Trajectory:
     forward_inputs: dict[str, Any] = field(default_factory=dict)
     curr_obs: dict[str, Any] = field(default_factory=dict)
     next_obs: dict[str, Any] = field(default_factory=dict)
+    # Progress-aware RLT branch fields (optional; None means unset / default).
+    bootstrap_mask: torch.Tensor | None = None
+    branch_id: torch.Tensor | None = None
+    terminal_type: torch.Tensor | None = None
+    action_source: torch.Tensor | None = None
+    progress_label: torch.Tensor | None = None
+    progress_mask: torch.Tensor | None = None
+    auto_trigger: torch.Tensor | None = None
+    # String / object metadata is stored outside Trajectory tensors when needed.
+    anchor_id: Any | None = None
+    rollback_confirmed: torch.Tensor | None = None
 
     @staticmethod
     def _generate_field_mask(
@@ -492,6 +503,14 @@ class Trajectory:
                     forward_inputs=forward_inputs,
                     curr_obs=curr_obs,
                     next_obs=next_obs,
+                    bootstrap_mask=apply_mask(self.bootstrap_mask, i),
+                    branch_id=apply_mask(self.branch_id, i),
+                    terminal_type=apply_mask(self.terminal_type, i),
+                    action_source=apply_mask(self.action_source, i),
+                    progress_label=apply_mask(self.progress_label, i),
+                    progress_mask=apply_mask(self.progress_mask, i),
+                    auto_trigger=apply_mask(self.auto_trigger, i),
+                    rollback_confirmed=apply_mask(self.rollback_confirmed, i),
                 )
             )
         return filtered_trajectories if filtered_trajectories else None
