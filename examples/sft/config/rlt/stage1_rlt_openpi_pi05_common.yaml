@@ -1,0 +1,13 @@
+# @package _global_
+# Shared OpenPI RLT Stage-1 flags. Task YAMLs include this via defaults.
+
+actor:
+  model:
+    openpi:
+      # Joint SFT objective: loss = rlt_loss + rlt_alpha * vla_loss.
+      use_rlt: True
+      rlt_alpha: 1.0
+      # 3 cameras * 256 + language budget; override per-task if prefix length differs.
+      rlt_prefix_seq_len: 968
+      rlt_image_only: False
+      rlt_use_mask: True
