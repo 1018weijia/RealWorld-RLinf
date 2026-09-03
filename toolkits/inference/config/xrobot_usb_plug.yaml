@@ -1,0 +1,26 @@
+# XRobot dual-arm EE — usb_plug
+robot: xrobot
+default_prompt: "Bimanual usb pick and insert"
+
+ckpt: /data/gxy/realworldRL/RLinf/logs/20260829-014826-xrobot_sft_openpi_rlinf_pi05_usb_plug-gpu7/xrobot_dual_arm_ee_pi05_usb_plug_sft/checkpoints/global_step_30000/actor/model_state_dict
+norm_stats: /data/gxy/realworldRL/checkpoints/assets/xrobot/usb_plug/norm_stats.json
+
+precision: bf16
+host: 0.0.0.0
+port: 8015
+
+model:
+  pi05: true
+  num_action_chunks: 50
+  action_dim: 14
+  num_steps: 5
+  add_value_head: false
+  openpi:
+    task: eval
+    config_name: pi05_xrobot
+    num_images_in_input: 3
+    discrete_state_input: true
+    max_token_len: 200
+    model_action_dim: 32
+    paligemma_variant: gemma_2b
+    action_expert_variant: gemma_300m

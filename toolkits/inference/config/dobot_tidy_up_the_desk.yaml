@@ -2,7 +2,7 @@
 robot: dobot
 default_prompt: "tidy up the desk"
 
-ckpt: /data/gxy/realworldRL/RLinf/logs/20260828-133705-hf_v21_dobot_sft_openpi_rlinf_pi05_tidy_up_the_desk_hf_v21-gpu3/dobot_pi05_hf_v21_tidy_up_desk_sft/checkpoints/global_step_30000/actor/model_state_dict
+ckpt: /data/gxy/realworldRL/RLinf/logs/20260901-111733-dobot_sft_openpi_rlinf_pi05_tidy_up_the_desk_hf_v21_resume-gpu7/dobot_pi05_hf_v21_tidy_up_desk_sft_resume_60k/checkpoints/global_step_60000/actor/model_state_dict
 norm_stats: /data/gxy/realworldRL/checkpoints/assets/dobot_hf_v21/tidy_up_the_desk/norm_stats.json
 
 precision: bf16
