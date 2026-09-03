@@ -4,6 +4,14 @@ Welcome to the documentation for RLinf! This README provides detailed instructio
 
 ---
 
+## Real-World Franka Notes
+
+- `docs/franka_recap_rollout_labeling.md`: pnp rollout saving and `is_success` labeling.
+- `docs/realworld_recap_stack_bowls.md`: prepared stack-bowls RECAP rollout dataset, paths, tags, and training commands.
+- `docs/feishu/recap_stack_bowls_feishu.md`: Feishu paste version for `https://mcnklerpx59m.feishu.cn/wiki/Gs60w9DDMibnCIkCUZtcVOIrnhc`.
+
+---
+
 ## Setting Up Your Environment
 
 ### Step 1: Set Environment Variables
