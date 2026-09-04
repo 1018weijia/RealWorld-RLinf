@@ -172,16 +172,29 @@ class FSDPSftWorker(FSDPModelManager, Worker):
 
             self.lr_scheduler.step()
             lr_value = self.optimizer.param_groups[0]["lr"]
+            rlt_lr_value = next(
+                (
+                    group["lr"]
+                    for group in self.optimizer.param_groups
+                    if group.get("group_name") == "rlt"
+                ),
+                None,
+            )
             grad_norm_value = (
                 float(grad_norm) if isinstance(grad_norm, torch.Tensor) else grad_norm
             )
-            append_to_dict(
-                metrics,
-                {
-                    "learning_rate": lr_value,
-                    "grad_norm": grad_norm_value,
-                },
-            )
+            optimizer_metrics = {
+                "learning_rate": lr_value,
+                "grad_norm": grad_norm_value,
+            }
+            for (
+                group_name,
+                group_grad_norm,
+            ) in self.last_optimizer_group_grad_norms.items():
+                optimizer_metrics[f"{group_name}_grad_norm"] = float(group_grad_norm)
+            if rlt_lr_value is not None:
+                optimizer_metrics["rlt_learning_rate"] = rlt_lr_value
+            append_to_dict(metrics, optimizer_metrics)
 
             if self.global_step > 0 and self.global_step % 1000 == 0:
                 clear_memory()

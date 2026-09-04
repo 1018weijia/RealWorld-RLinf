@@ -12,16 +12,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import pytest
 import torch
 
 from rlinf.models.embodiment.modules.rlt_token_transformer import (
+    OpenPIRLTTokenTransformer,
     RLTTokenTransformer,
+    get_rlt_token_transformer_class,
 )
 
+RLT_CLASSES = (RLTTokenTransformer, OpenPIRLTTokenTransformer)
 
-def _make_model(*, prefix_seq_len: int = 5) -> RLTTokenTransformer:
+
+def _make_model(model_class, *, prefix_seq_len: int = 5):
     torch.manual_seed(0)
-    return RLTTokenTransformer(
+    return model_class(
         input_dim=8,
         embed_dim=8,
         prefix_seq_len=prefix_seq_len,
@@ -31,8 +36,16 @@ def _make_model(*, prefix_seq_len: int = 5) -> RLTTokenTransformer:
     )
 
 
-def test_decoder_causal_mask_blocks_future_teacher_targets():
-    model = _make_model()
+def test_architecture_selection_preserves_legacy_default():
+    assert get_rlt_token_transformer_class("legacy") is RLTTokenTransformer
+    assert get_rlt_token_transformer_class("openpi") is OpenPIRLTTokenTransformer
+    with pytest.raises(ValueError, match="must be one of"):
+        get_rlt_token_transformer_class("unknown")
+
+
+@pytest.mark.parametrize("model_class", RLT_CLASSES)
+def test_decoder_causal_mask_blocks_future_teacher_targets(model_class):
+    model = _make_model(model_class)
     model.eval()
     rl_tokens = torch.randn(1, 1, model.embed_dim)
     targets = torch.randn(1, model.prefix_seq_len, model.input_dim)
@@ -54,8 +67,9 @@ def test_decoder_causal_mask_blocks_future_teacher_targets():
     assert not torch.allclose(original_output[:, 3:], changed_output[:, 3:])
 
 
-def test_loss_masks_trailing_padding():
-    model = _make_model(prefix_seq_len=4)
+@pytest.mark.parametrize("model_class", RLT_CLASSES)
+def test_loss_masks_trailing_padding(model_class):
+    model = _make_model(model_class, prefix_seq_len=4)
     model.eval()
     prefix_embs = torch.randn(2, 4, model.input_dim)
     mask = torch.tensor(
@@ -79,8 +93,9 @@ def test_loss_masks_trailing_padding():
     torch.testing.assert_close(loss, changed_loss, rtol=1e-5, atol=1e-5)
 
 
-def test_reconstruct_output_shape_matches_prefix_embeddings():
-    model = _make_model(prefix_seq_len=4)
+@pytest.mark.parametrize("model_class", RLT_CLASSES)
+def test_reconstruct_output_shape_matches_prefix_embeddings(model_class):
+    model = _make_model(model_class, prefix_seq_len=4)
     prefix_embs = torch.randn(3, 4, model.input_dim)
 
     reconstructed, _ = model.reconstruct(prefix_embs)
@@ -88,8 +103,9 @@ def test_reconstruct_output_shape_matches_prefix_embeddings():
     assert reconstructed.shape == prefix_embs.shape
 
 
-def test_reconstruct_detaches_targets_but_trains_encoder_and_decoder():
-    model = _make_model(prefix_seq_len=4)
+@pytest.mark.parametrize("model_class", RLT_CLASSES)
+def test_reconstruct_detaches_targets_but_trains_encoder_and_decoder(model_class):
+    model = _make_model(model_class, prefix_seq_len=4)
     prefix_embs = torch.randn(2, 4, model.input_dim, requires_grad=True)
 
     loss, _ = model.loss(prefix_embs)

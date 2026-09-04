@@ -54,6 +54,13 @@ class OpenPiPytorchSFTActionModel(OpenPiPytorchActionModel):
             action_env_dim=action_env_dim,
             rlt_cfg=rlt_cfg,
         )
+        if self.rlt_cfg.use_rlt and self.rlt_cfg.rlt_architecture == "openpi":
+            # Stage-1 in rlt-openpi trains the RL-token module plus the
+            # configured VLA scope (action expert by default), while the VLM
+            # tower remains frozen. Apply this before FSDP wraps the model so
+            # requires_grad is preserved by the optimizer construction.
+            n_vla = self.set_vla_trainable_scope(self.rlt_cfg.vla_finetune_scope)
+            self._vla_trainable_param_count = n_vla
 
     def forward(self, forward_type: ForwardType = ForwardType.SFT, **kwargs):
         """Dispatch — SFT variant only supports :attr:`ForwardType.SFT`."""
@@ -167,7 +174,17 @@ class OpenPiPytorchSFTActionModel(OpenPiPytorchActionModel):
         device = actions.device
 
         observation = pi0_model_module.preprocess_observation(observation, train=True)
+        # FSDP may expose BF16 parameter views during the forward even when
+        # the master model was loaded in FP32. Match the live action projection
+        # dtype for all VLA inputs; otherwise action_in_proj receives Float32
+        # activations against a BF16 weight.
         embed_dtype = self.model.embed_dtype
+        # The aligned Stage-1 configs use FSDP mixed_precision.param_dtype=bf16.
+        # Inputs to nested FSDP Linear modules must therefore be BF16 even
+        # though Pi0's FP32 master checkpoint/config is retained for optimizer
+        # state and checkpoint fidelity.
+        if self.rlt_cfg.rlt_architecture == "openpi" and embed_dtype == torch.float32:
+            embed_dtype = torch.bfloat16
         observation = pi0_model_module._observation_to_dtype(observation, embed_dtype)
         actions = actions.to(dtype=embed_dtype)
         dtype = actions.dtype

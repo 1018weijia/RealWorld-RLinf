@@ -24,13 +24,13 @@ runner:
   logger:
     log_path: "../results"
     project_name: RLinf_rlt_stage1
-    experiment_name: "cobot_rlt_stage1_cube_into_drawer_franka_aligned"
+    experiment_name: "cobot_rlt_stage1_cube_into_drawer_openpi_sft30k"
     logger_backends: ["wandb", "tensorboard"]
 
   max_epochs: -1
   max_steps: 30000
   val_check_interval: -1
-  save_interval: 1000
+  save_interval: 5000
 
 data:
   train_data_paths: "cobot_magic/cube_into_drawer"
@@ -41,7 +41,7 @@ actor:
   group_name: "ActorGroup"
   training_backend: "fsdp"
   micro_batch_size: 32
-  global_batch_size: 256
+  global_batch_size: 384
   seed: 42
 
   model:
@@ -65,20 +65,25 @@ actor:
       rlt_num_layers: 2
       rlt_num_heads: 8
       rlt_mlp_ratio: 4.0
+      rlt_dropout: 0.1
+      rlt_architecture: openpi
+      vla_finetune_scope: action_expert
     openpi_data:
       default_prompt: "put the cube into the drawer"
       norm_stats_path: /data/gxy/realworldRL/checkpoints/assets/cobot_magic/cube_into_drawer/norm_stats.json
 
   optim:
-    lr: 2.5e-5
+    lr: 1e-5
+    rlt_lr: 1e-4
     adam_beta1: 0.9
-    adam_beta2: 0.95
+    adam_beta2: 0.999
     adam_eps: 1.0e-08
-    weight_decay: 1e-10
+    weight_decay: 1e-5
     clip_grad: 1.0
+    clip_grad_by_optimizer_group: true
     total_training_steps: 30000
-    lr_warmup_steps: 1000
-    lr_scheduler: "openpi_cosine"
+    lr_warmup_steps: 500
+    lr_scheduler: "constant"
     num_cycles: 0.5
     min_lr: 0.0
 

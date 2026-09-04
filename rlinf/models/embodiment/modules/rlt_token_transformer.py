@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
+
 import math
 
 import torch
@@ -387,3 +389,216 @@ class RLTTokenTransformer(nn.Module):
         self, prefix_embs: torch.Tensor, mask: torch.Tensor | None = None
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         return self.loss(prefix_embs, mask)
+
+
+class _OpenPIRLTEncoder(nn.Module):
+    """OpenPI RL-token encoder."""
+
+    def __init__(
+        self,
+        embedding_dim: int,
+        num_layers: int,
+        num_heads: int,
+        dropout: float,
+    ):
+        super().__init__()
+        self.e_rl = nn.Parameter(torch.randn(1, 1, embedding_dim) * 0.02)
+        layer = nn.TransformerEncoderLayer(
+            d_model=embedding_dim,
+            nhead=num_heads,
+            dim_feedforward=4 * embedding_dim,
+            dropout=dropout,
+            batch_first=True,
+            norm_first=True,
+        )
+        self.transformer = nn.TransformerEncoder(layer, num_layers=num_layers)
+
+    def forward(self, z: torch.Tensor, pad_mask: torch.Tensor | None) -> torch.Tensor:
+        batch_size = z.shape[0]
+        tokens = torch.cat(
+            [z.float(), self.e_rl.expand(batch_size, -1, -1).float()], dim=1
+        )
+        if pad_mask is None:
+            ignore_mask = None
+        else:
+            valid = pad_mask.to(device=z.device, dtype=torch.bool)
+            ignore_mask = ~torch.cat(
+                [
+                    valid,
+                    torch.ones(batch_size, 1, device=z.device, dtype=torch.bool),
+                ],
+                dim=1,
+            )
+        with torch.autocast(
+            device_type=tokens.device.type,
+            dtype=torch.bfloat16,
+            enabled=tokens.is_cuda,
+        ):
+            output = self.transformer(tokens, src_key_padding_mask=ignore_mask)
+        return output[:, -1:]
+
+
+class _OpenPIRLTDecoder(nn.Module):
+    """OpenPI teacher-forced RL-token decoder."""
+
+    def __init__(
+        self,
+        embedding_dim: int,
+        num_layers: int,
+        num_heads: int,
+        dropout: float,
+    ):
+        super().__init__()
+        layer = nn.TransformerDecoderLayer(
+            d_model=embedding_dim,
+            nhead=num_heads,
+            dim_feedforward=4 * embedding_dim,
+            dropout=dropout,
+            batch_first=True,
+            norm_first=True,
+        )
+        self.transformer = nn.TransformerDecoder(layer, num_layers=num_layers)
+        self.h_phi = nn.Linear(embedding_dim, embedding_dim)
+
+    def forward(
+        self,
+        z_rl: torch.Tensor,
+        z: torch.Tensor,
+        pad_mask: torch.Tensor | None,
+    ) -> torch.Tensor:
+        if z_rl.ndim == 2:
+            z_rl = z_rl.unsqueeze(1)
+        z_rl = z_rl.float()
+        z = z.float()
+        target_len = z.shape[1]
+        tgt = torch.cat([z_rl, z[:, :-1]], dim=1)
+        causal = torch.triu(
+            torch.ones(
+                target_len,
+                target_len,
+                device=tgt.device,
+                dtype=torch.bool,
+            ),
+            diagonal=1,
+        )
+        tgt_key_padding_mask = None
+        if pad_mask is not None:
+            tgt_key_padding_mask = ~pad_mask.to(device=tgt.device, dtype=torch.bool)
+        with torch.autocast(
+            device_type=tgt.device.type,
+            dtype=torch.bfloat16,
+            enabled=tgt.is_cuda,
+        ):
+            out = self.transformer(
+                tgt,
+                z_rl,
+                tgt_mask=causal,
+                tgt_key_padding_mask=tgt_key_padding_mask,
+            )
+            return self.h_phi(out)
+
+
+class OpenPIRLTTokenTransformer(nn.Module):
+    """RLT-OpenPI Stage-1 autoencoder exposed through RLinf's RLT API."""
+
+    def __init__(
+        self,
+        *,
+        input_dim: int = 2048,
+        embed_dim: int = 2048,
+        prefix_seq_len: int = 768,
+        num_layers: int = 2,
+        num_heads: int = 8,
+        mlp_ratio: float = 4.0,
+        dropout_rate: float = 0.1,
+    ):
+        super().__init__()
+        self.input_dim = int(input_dim)
+        self.embed_dim = int(embed_dim)
+        self.prefix_seq_len = int(prefix_seq_len)
+        del mlp_ratio  # kept for config/API compatibility
+        self.input_proj = (
+            nn.Linear(self.input_dim, self.embed_dim)
+            if self.input_dim != self.embed_dim
+            else nn.Identity()
+        )
+        self.output_proj = (
+            nn.Linear(self.embed_dim, self.input_dim)
+            if self.input_dim != self.embed_dim
+            else nn.Identity()
+        )
+        self.encoder = _OpenPIRLTEncoder(
+            self.embed_dim, num_layers, num_heads, dropout_rate
+        )
+        self.decoder = _OpenPIRLTDecoder(
+            self.embed_dim, num_layers, num_heads, dropout_rate
+        )
+
+    @property
+    def z_dim(self) -> int:
+        return self.embed_dim
+
+    def encode(
+        self, prefix_embs: torch.Tensor, mask: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        return self.encoder(self.input_proj(prefix_embs), mask)
+
+    def encode_flat(
+        self, prefix_embs: torch.Tensor, mask: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        return self.encode(prefix_embs, mask).reshape(prefix_embs.shape[0], -1)
+
+    def decode(
+        self,
+        rl_tokens: torch.Tensor,
+        target_embeddings: torch.Tensor,
+        mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        targets = target_embeddings.detach()
+        if targets.shape[1] < 1:
+            raise ValueError("target_embeddings must contain at least one token")
+        projected_targets = self.input_proj(targets)
+        projected_rl = rl_tokens
+        if projected_rl.ndim == 2:
+            projected_rl = projected_rl.unsqueeze(1)
+        reconstructed = self.decoder(projected_rl, projected_targets, mask)
+        return self.output_proj(reconstructed)
+
+    def reconstruct(
+        self, prefix_embs: torch.Tensor, mask: torch.Tensor | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        targets = prefix_embs.detach()
+        z_rl = self.encode(targets, mask)
+        return self.decode(z_rl, targets, mask), z_rl
+
+    def loss(
+        self, prefix_embs: torch.Tensor, mask: torch.Tensor | None = None
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        reconstructed, z_rl = self.reconstruct(prefix_embs, mask)
+        squared = (
+            (reconstructed.float() - prefix_embs.detach().float()).pow(2).mean(dim=-1)
+        )
+        if mask is None:
+            mse = squared.mean()
+        else:
+            weights = mask.to(device=squared.device, dtype=squared.dtype)
+            mse = (squared * weights).sum() / weights.sum().clamp(min=1.0)
+        return mse, {"mse": mse, "z_rl": z_rl.reshape(prefix_embs.shape[0], -1)}
+
+    def forward(
+        self, prefix_embs: torch.Tensor, mask: torch.Tensor | None = None
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        return self.loss(prefix_embs, mask)
+
+
+def get_rlt_token_transformer_class(architecture: str) -> type[nn.Module]:
+    """Resolve an RLT implementation without changing legacy defaults."""
+    architectures = {
+        "legacy": RLTTokenTransformer,
+        "openpi": OpenPIRLTTokenTransformer,
+    }
+    try:
+        return architectures[architecture]
+    except KeyError as exc:
+        choices = ", ".join(sorted(architectures))
+        raise ValueError(f"RLT architecture must be one of: {choices}") from exc

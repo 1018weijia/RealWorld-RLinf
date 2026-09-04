@@ -64,8 +64,11 @@ class OpenPiPytorchRLTConfig:
     rlt_num_layers: int = 2
     rlt_num_heads: int = 8
     rlt_mlp_ratio: float = 4.0
+    rlt_dropout: float = 0.0
+    rlt_architecture: str = "legacy"
     rlt_image_only: bool = True
     rlt_use_mask: bool = False
+    vla_finetune_scope: str = "full"
 
 
 def build_rlt_config(model_cfg: Any) -> OpenPiPytorchRLTConfig:
@@ -83,10 +86,17 @@ def build_rlt_config(model_cfg: Any) -> OpenPiPytorchRLTConfig:
         rlt_num_layers=int(OmegaConf.select(model_cfg, "rlt_num_layers", default=2)),
         rlt_num_heads=int(OmegaConf.select(model_cfg, "rlt_num_heads", default=8)),
         rlt_mlp_ratio=float(OmegaConf.select(model_cfg, "rlt_mlp_ratio", default=4.0)),
+        rlt_dropout=float(OmegaConf.select(model_cfg, "rlt_dropout", default=0.0)),
+        rlt_architecture=str(
+            OmegaConf.select(model_cfg, "rlt_architecture", default="legacy")
+        ),
         rlt_image_only=bool(
             OmegaConf.select(model_cfg, "rlt_image_only", default=True)
         ),
         rlt_use_mask=bool(OmegaConf.select(model_cfg, "rlt_use_mask", default=False)),
+        vla_finetune_scope=str(
+            OmegaConf.select(model_cfg, "vla_finetune_scope", default="full")
+        ),
     )
 
 

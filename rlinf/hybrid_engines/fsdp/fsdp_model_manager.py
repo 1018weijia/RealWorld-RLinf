@@ -42,7 +42,9 @@ from rlinf.hybrid_engines.fsdp import (
 from rlinf.hybrid_engines.fsdp.strategy.base import FSDPStrategyBase
 from rlinf.hybrid_engines.fsdp.utils import (
     create_device_mesh,
+    get_grad_norm,
     get_lr_scheduler,
+    to_local_if_dtensor,
 )
 from rlinf.models.tokenization.hf import hf_tokenizer
 from rlinf.scheduler import Worker
@@ -86,6 +88,7 @@ class FSDPModelManager:
             )
 
         self.optimizer_steps = 0
+        self.last_optimizer_group_grad_norms: dict[str, float] = {}
         self.critic_warmup_steps = 0
         if self._cfg.get("optim", {}).get(
             "critic_warmup_steps", None
@@ -435,9 +438,11 @@ class FSDPModelManager:
         """
         self.optimizer_steps += 1
         self.grad_scaler.unscale_(self.optimizer)
-        grad_norm = self._strategy.clip_grad_norm_(
-            model=self.model,
-        )
+        if self._cfg.optim.get("clip_grad_by_optimizer_group", False):
+            grad_norm = self._clip_grad_norm_by_optimizer_group()
+        else:
+            self.last_optimizer_group_grad_norms = {}
+            grad_norm = self._strategy.clip_grad_norm_(model=self.model)
 
         if not torch.isfinite(torch.as_tensor(grad_norm)):
             self._logger.warning(
@@ -461,6 +466,51 @@ class FSDPModelManager:
             lr_list = [group["lr"] for group in self.optimizer.param_groups]
 
         return grad_norm, lr_list
+
+    @torch.no_grad()
+    def _clip_grad_norm_by_optimizer_group(
+        self, norm_type: Union[float, int] = 2.0
+    ) -> float:
+        """Clip each optimizer parameter group using its own global FSDP norm."""
+        max_norm = float(self._cfg.optim.clip_grad)
+        norm_type = float(norm_type)
+        is_no_shard = (
+            self._cfg.fsdp_config.get("sharding_strategy", "full_shard") == "no_shard"
+        )
+        dp_group = None if is_no_shard else self._dp_group
+
+        group_params: list[tuple[str, list[torch.Tensor]]] = []
+        group_norms: dict[str, float] = {}
+        for index, group in enumerate(self.optimizer.param_groups):
+            name = str(group.get("group_name", f"group_{index}"))
+            params = list(group["params"])
+            group_params.append((name, params))
+            group_norms[name] = get_grad_norm(
+                params,
+                dp_group=dp_group,
+                norm_type=norm_type,
+            )
+
+        self.last_optimizer_group_grad_norms = group_norms
+        if norm_type == torch.inf:
+            total_norm = max(group_norms.values(), default=0.0)
+        else:
+            total_norm = sum(
+                group_norm**norm_type for group_norm in group_norms.values()
+            ) ** (1.0 / norm_type)
+
+        if not all(torch.isfinite(torch.as_tensor(v)) for v in group_norms.values()):
+            return float(total_norm)
+
+        for name, params in group_params:
+            clip_coefficient = max_norm / (group_norms[name] + 1.0e-6)
+            if clip_coefficient >= 1.0:
+                continue
+            for param in params:
+                if param.grad is not None:
+                    to_local_if_dtensor(param.grad).mul_(clip_coefficient)
+
+        return float(total_norm)
 
     def build_lr_scheduler(
         self, optimizer: Optimizer, optim_config: DictConfig, last_epoch: int = -1
@@ -516,8 +566,16 @@ class FSDPModelManager:
         betas = (self._cfg.optim.adam_beta1, self._cfg.optim.adam_beta2)
         adam_eps = self._cfg.optim.get("adam_eps", 1e-8)
         weight_decay = self._cfg.optim.get("weight_decay", 1e-2)
+        rlt_lr = self._cfg.optim.get("rlt_lr", self._cfg.optim.lr)
+        rlt_betas = (
+            self._cfg.optim.get("rlt_adam_beta1", self._cfg.optim.adam_beta1),
+            self._cfg.optim.get("rlt_adam_beta2", self._cfg.optim.adam_beta2),
+        )
+        rlt_adam_eps = self._cfg.optim.get("rlt_adam_eps", adam_eps)
+        rlt_weight_decay = self._cfg.optim.get("rlt_weight_decay", weight_decay)
 
         params_actor = []
+        params_rlt = []
         params_critic = []
 
         if enable_critic_warmup:
@@ -537,6 +595,8 @@ class FSDPModelManager:
                 if param.requires_grad:
                     if "value_head" in name or "model.value_head" in name:
                         params_critic.append(param)
+                    elif "rlt_module." in name:
+                        params_rlt.append(param)
                     else:
                         params_actor.append(param)
 
@@ -547,6 +607,20 @@ class FSDPModelManager:
                     "params": params_actor,
                     "lr": self._cfg.optim.lr,
                     "betas": betas,
+                    "eps": adam_eps,
+                    "weight_decay": weight_decay,
+                    "group_name": "vla",
+                }
+            )
+        if len(params_rlt) > 0:
+            param_groups.append(
+                {
+                    "params": params_rlt,
+                    "lr": rlt_lr,
+                    "betas": rlt_betas,
+                    "eps": rlt_adam_eps,
+                    "weight_decay": rlt_weight_decay,
+                    "group_name": "rlt",
                 }
             )
         if len(params_critic) > 0:
@@ -555,8 +629,20 @@ class FSDPModelManager:
                     "params": params_critic,
                     "lr": self._cfg.optim.value_lr,
                     "betas": betas,
+                    "eps": adam_eps,
+                    "weight_decay": weight_decay,
+                    "group_name": "critic",
                 }
             )
+
+        self._logger.info(
+            "[FSDP] optimizer groups: vla=%d params lr=%s, rlt=%d params lr=%s, critic=%d params",
+            sum(p.numel() for p in params_actor),
+            self._cfg.optim.lr,
+            sum(p.numel() for p in params_rlt),
+            rlt_lr,
+            sum(p.numel() for p in params_critic),
+        )
 
         # Fused AdamW avoids a large foreach temp buffer during warmup_optimizer_state
         # for NO_SHARD models (e.g. STEAM ensemble SFT). It is unsafe with sharded

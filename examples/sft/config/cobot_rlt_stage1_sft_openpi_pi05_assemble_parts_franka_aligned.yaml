@@ -13,12 +13,7 @@ hydra:
   searchpath:
     - file://${oc.env:EMBODIED_PATH}/config/
 
-# Franka-aligned Stage-1 hyperparameters for Cobot assemble_parts.
-# Diagnosis (wandb run cobot_rlt_stage1_assemble_parts, step ~14k):
-#   train/rlt_loss ~0.73, train/vla_loss ~0.003  => plateau is RLT-only, not failure data.
-# Changes vs default cobot stage1:
-#   lr 2.5e-5, global_batch_size 256, micro_batch_size 32, fp32, full_shard FSDP,
-#   success-only demos (include_failure_episodes=false), explicit RLT head dims.
+# RLT-OpenPI Stage-1 with the task's 30k-step SFT checkpoint.
 
 cluster:
   num_nodes: 1
@@ -30,13 +25,13 @@ runner:
   logger:
     log_path: "../results"
     project_name: RLinf_rlt_stage1
-    experiment_name: "cobot_rlt_stage1_assemble_parts_franka_aligned"
+    experiment_name: "cobot_rlt_stage1_assemble_parts_openpi_sft30k"
     logger_backends: ["wandb", "tensorboard"]
 
   max_epochs: -1
   max_steps: 30000
   val_check_interval: -1
-  save_interval: 1000
+  save_interval: 5000
 
 data:
   train_data_paths: "cobot_magic/assemble_parts"
@@ -48,11 +43,11 @@ actor:
   group_name: "ActorGroup"
   training_backend: "fsdp"
   micro_batch_size: 32
-  global_batch_size: 256
+  global_batch_size: 384
   seed: 42
 
   model:
-    # Keep bf16: fp32 wrapper + FSDP param_dtype=bf16 causes Float/BFloat16 matmul errors.
+    # FSDP executes matmuls in BF16 while reductions and buffers remain FP32.
     precision: bf16
     model_path: "/data/gxy/realworldRL/RLinf/logs/20260823-051812-cobot_sft_openpi_rlinf_pi05_assemble_parts-gpu3/cobot_pi05_assemble_parts_sft/checkpoints/global_step_30000/actor/model_state_dict"
     num_action_chunks: 50
@@ -74,20 +69,25 @@ actor:
       rlt_num_layers: 2
       rlt_num_heads: 8
       rlt_mlp_ratio: 4.0
+      rlt_dropout: 0.1
+      rlt_architecture: openpi
+      vla_finetune_scope: action_expert
     openpi_data:
       default_prompt: "assemble parts"
       norm_stats_path: /data/gxy/realworldRL/checkpoints/assets/cobot_magic/assemble_parts/norm_stats.json
 
   optim:
-    lr: 2.5e-5
+    lr: 1e-5
+    rlt_lr: 1e-4
     adam_beta1: 0.9
-    adam_beta2: 0.95
+    adam_beta2: 0.999
     adam_eps: 1.0e-08
-    weight_decay: 1e-10
+    weight_decay: 1e-5
     clip_grad: 1.0
+    clip_grad_by_optimizer_group: true
     total_training_steps: 30000
-    lr_warmup_steps: 1000
-    lr_scheduler: "openpi_cosine"
+    lr_warmup_steps: 500
+    lr_scheduler: "constant"
     num_cycles: 0.5
     min_lr: 0.0
 

@@ -47,17 +47,24 @@ class OpenPiPytorchActionModel(nn.Module):
         self.rlt_cfg = rlt_cfg or OpenPiPytorchRLTConfig()
         if self.rlt_cfg.use_rlt:
             from rlinf.models.embodiment.modules.rlt_token_transformer import (
-                RLTTokenTransformer,
+                get_rlt_token_transformer_class,
             )
 
-            self.rlt_module = RLTTokenTransformer(
+            rlt_class = get_rlt_token_transformer_class(self.rlt_cfg.rlt_architecture)
+            rlt_module = rlt_class(
                 input_dim=self.rlt_cfg.rlt_input_dim,
                 embed_dim=self.rlt_cfg.rlt_embed_dim,
                 prefix_seq_len=self.rlt_cfg.rlt_prefix_seq_len,
                 num_layers=self.rlt_cfg.rlt_num_layers,
                 num_heads=self.rlt_cfg.rlt_num_heads,
                 mlp_ratio=self.rlt_cfg.rlt_mlp_ratio,
-            ).to(dtype=next(self.model.parameters()).dtype)
+                dropout_rate=self.rlt_cfg.rlt_dropout,
+            )
+            if self.rlt_cfg.rlt_architecture == "openpi":
+                rlt_module = rlt_module.float()
+            else:
+                rlt_module = rlt_module.to(dtype=next(self.model.parameters()).dtype)
+            self.rlt_module = rlt_module
 
         self._mark_fsdp_wrap_names()
 
@@ -69,13 +76,16 @@ class OpenPiPytorchActionModel(nn.Module):
     def _no_split_modules(self) -> list[str] | None:
         if not self.rlt_cfg.use_rlt:
             return None
-        return ["Block", "Encoder1DBlock", "RLTSelfAttentionLayer"]
+        modules = ["Block", "Encoder1DBlock"]
+        if self.rlt_cfg.rlt_architecture == "legacy":
+            modules.append("RLTSelfAttentionLayer")
+        return modules
 
     @property
     def _no_split_names(self) -> list[str] | None:
         if not self.rlt_cfg.use_rlt:
             return None
-        return [
+        names = [
             "action_in_proj",
             "action_out_proj",
             "state_proj",
@@ -84,6 +94,10 @@ class OpenPiPytorchActionModel(nn.Module):
             "time_mlp_in",
             "time_mlp_out",
         ]
+        if self.rlt_cfg.rlt_architecture == "openpi":
+            # Keep the standard Transformer encoder/decoder as one FSDP leaf.
+            names.append("rlt_module")
+        return names
 
     def _mark_fsdp_wrap_names(self) -> None:
         """Mark modules so RLinf's FSDP lambda policy can find leaf projects."""
@@ -106,6 +120,37 @@ class OpenPiPytorchActionModel(nn.Module):
         if not self.rlt_cfg.use_rlt or not hasattr(self, "rlt_module"):
             raise ValueError("RLT operation requires actor.model.openpi.use_rlt=True.")
 
+    def set_vla_trainable_scope(self, scope: str) -> int:
+        """Freeze/select VLA parameters using rlt-openpi Stage-1 semantics."""
+        scope = str(scope).strip().lower().replace("-", "_")
+        if scope not in {"off", "action_expert", "full"}:
+            raise ValueError(
+                "vla_finetune_scope must be one of: off, action_expert, full"
+            )
+        for parameter in self.model.parameters():
+            parameter.requires_grad_(scope == "full")
+        if scope == "action_expert":
+            prefixes = (
+                "action_in_proj.",
+                "action_out_proj.",
+                "time_mlp_in.",
+                "time_mlp_out.",
+                "action_time_mlp_in.",
+                "action_time_mlp_out.",
+                "state_proj.",
+            )
+            for name, parameter in self.model.named_parameters():
+                is_expert_block = name.startswith("llm.layers.") and ".1." in name
+                is_expert_norm = name.startswith("llm.final_norms.1.")
+                if is_expert_block or is_expert_norm or name.startswith(prefixes):
+                    parameter.requires_grad_(True)
+        count = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+        if scope == "action_expert" and count == 0:
+            raise RuntimeError(
+                "action_expert scope selected no trainable VLA parameters"
+            )
+        return count
+
     def _select_rlt_prefix_embeddings(
         self,
         prefix_output: torch.Tensor,
@@ -125,6 +170,9 @@ class OpenPiPytorchActionModel(nn.Module):
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         self._require_rlt()
         rlt_param = next(self.rlt_module.parameters())
+        # Match the live dtype of the independent RLT FSDP leaf. Its master
+        # parameters are initialized in FP32, while FSDP may expose BF16 views
+        # during the forward; the loss reduction remains FP32 internally.
         prefix_output = prefix_output.to(device=rlt_param.device, dtype=rlt_param.dtype)
         rlt_mask = prefix_mask if self.rlt_cfg.rlt_use_mask else None
         return self.rlt_module(prefix_output, rlt_mask)
