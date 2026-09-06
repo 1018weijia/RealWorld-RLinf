@@ -30,7 +30,7 @@ logger = get_logger()
 
 
 def _resolve_pi0_dtype(cfg: Any, torch_dtype: Any = None) -> tuple[Any, str]:
-    """Resolve the model target dtype and matching Pi0 config dtype."""
+    """Resolve master-parameter dtype and Pi0 internal compute precision."""
     import torch
 
     target_dtype = (
@@ -38,7 +38,19 @@ def _resolve_pi0_dtype(cfg: Any, torch_dtype: Any = None) -> tuple[Any, str]:
         if torch_dtype is not None
         else torch_dtype_from_precision(cfg.precision)
     )
-    pi0_dtype = "float32" if target_dtype == torch.float32 else "bfloat16"
+    compute_precision = getattr(getattr(cfg, "openpi", None), "compute_precision", None)
+    if compute_precision is None:
+        pi0_dtype = "float32" if target_dtype == torch.float32 else "bfloat16"
+    else:
+        compute_dtype = torch_dtype_from_precision(str(compute_precision))
+        if compute_dtype == torch.float32:
+            pi0_dtype = "float32"
+        elif compute_dtype == torch.bfloat16:
+            pi0_dtype = "bfloat16"
+        else:
+            raise ValueError(
+                "actor.model.openpi.compute_precision must be fp32 or bf16"
+            )
     return target_dtype, pi0_dtype
 
 

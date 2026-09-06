@@ -130,6 +130,15 @@ class OpenPiPytorchActionModel(nn.Module):
         for parameter in self.model.parameters():
             parameter.requires_grad_(scope == "full")
         if scope == "action_expert":
+            expert_layer_markers = (
+                ".attn.q_proj.1.",
+                ".attn.k_proj.1.",
+                ".attn.v_proj.1.",
+                ".attn.o_proj.1.",
+                ".pre_attention_norms.1.",
+                ".pre_ffw_norms.1.",
+                ".mlps.1.",
+            )
             prefixes = (
                 "action_in_proj.",
                 "action_out_proj.",
@@ -140,7 +149,9 @@ class OpenPiPytorchActionModel(nn.Module):
                 "state_proj.",
             )
             for name, parameter in self.model.named_parameters():
-                is_expert_block = name.startswith("llm.layers.") and ".1." in name
+                is_expert_block = name.startswith("llm.layers.") and any(
+                    marker in name for marker in expert_layer_markers
+                )
                 is_expert_norm = name.startswith("llm.final_norms.1.")
                 if is_expert_block or is_expert_norm or name.startswith(prefixes):
                     parameter.requires_grad_(True)

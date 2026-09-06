@@ -54,11 +54,12 @@ class OpenPiPytorchSFTActionModel(OpenPiPytorchActionModel):
             action_env_dim=action_env_dim,
             rlt_cfg=rlt_cfg,
         )
-        if self.rlt_cfg.use_rlt and self.rlt_cfg.rlt_architecture == "openpi":
-            # Stage-1 in rlt-openpi trains the RL-token module plus the
-            # configured VLA scope (action expert by default), while the VLM
-            # tower remains frozen. Apply this before FSDP wraps the model so
-            # requires_grad is preserved by the optimizer construction.
+        if self.rlt_cfg.use_rlt:
+            # Stage-1 trains the selected RLT architecture plus the configured
+            # VLA scope. Keep scope selection independent of the RLT module so
+            # legacy and OpenPI implementations have identical freeze semantics.
+            # Apply this before FSDP wraps the model so optimizer construction
+            # only sees the intended trainable parameters.
             n_vla = self.set_vla_trainable_scope(self.rlt_cfg.vla_finetune_scope)
             self._vla_trainable_param_count = n_vla
 

@@ -1,0 +1,25 @@
+# @package _global_
+# Franka Stage-1 RLT architecture with an explicit action-expert-only VLA scope.
+
+actor:
+  model:
+    openpi:
+      # Match Franka: BF16 activations/forward with FP32 master parameters and
+      # optimizer state (actor.model.precision remains fp32 in task configs).
+      compute_precision: bf16
+      use_rlt: True
+      rlt_alpha: 1.0
+      rlt_input_dim: 2048
+      rlt_embed_dim: 2048
+      # 3 * 256 image tokens + a 200-token language budget.
+      rlt_prefix_seq_len: 968
+      rlt_num_layers: 2
+      rlt_num_heads: 8
+      rlt_mlp_ratio: 4.0
+      rlt_dropout: 0.0
+      rlt_architecture: legacy
+      rlt_image_only: False
+      rlt_use_mask: True
+      # Freeze SigLIP, token embeddings, and Gemma expert 0. Train the action
+      # projections, Gemma expert 1, its final norm, and the RLT module.
+      vla_finetune_scope: action_expert

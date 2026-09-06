@@ -13,9 +13,9 @@ hydra:
 
 cluster:
   num_nodes: 1
-  # Physical GPU index; set COBOT_GPU_ID at launch (see run_xrobot_sft.sh).
+  # Physical GPU index; set XROBOT_GPU_ID at launch (see run_xrobot_sft.sh).
   component_placement:
-    actor,env,rollout: ${oc.env:COBOT_GPU_ID,0}
+    actor,env,rollout: ${oc.env:XROBOT_GPU_ID,0}
 
 runner:
   task_type: sft
