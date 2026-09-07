@@ -19,7 +19,7 @@ from __future__ import annotations
 import dataclasses
 from typing import Any
 
-from omegaconf import OmegaConf
+from omegaconf import ListConfig, OmegaConf
 
 from rlinf.config import SupportedModel
 from rlinf.data.storage.lerobot import resolve_lerobot_repo_id
@@ -37,22 +37,22 @@ def build_official_openpi_sft_dataloader(
     # Prefer torchcodec when FFmpeg libs are present; else PyAV fallback.
     # Cap BLAS/OpenMP threads before workers are spawned.
     _set_single_thread_blas_env()
-    from rlinf.data.datasets.openpi_rlinf.pyav_video_patch import (
-        apply_pyav_video_decode_patch,
-    )
     from rlinf.data.datasets.openpi_rlinf.lerobot_hf_query_patch import (
         apply_lerobot_hf_query_patch,
     )
     from rlinf.data.datasets.openpi_rlinf.lerobot_list_feature_patch import (
         apply_lerobot_list_feature_patch,
     )
+    from rlinf.data.datasets.openpi_rlinf.pyav_video_patch import (
+        apply_pyav_video_decode_patch,
+    )
 
     apply_pyav_video_decode_patch()
     apply_lerobot_hf_query_patch()
     apply_lerobot_list_feature_patch()
 
-    repo_id = resolve_lerobot_repo_id(data_paths)
-    if repo_id is None:
+    repo_ids = _resolve_openpi_repo_ids(data_paths)
+    if not repo_ids:
         raise ValueError(
             "OpenPI SFT requires data.train_data_paths to be set to a local "
             "dataset path or LeRobot repo id."
@@ -73,7 +73,7 @@ def build_official_openpi_sft_dataloader(
         config_name,
         model_path=model_cfg.model_path,
         batch_size=batch_size * world_size,
-        repo_id=repo_id,
+        repo_id=repo_ids[0],
         data_kwargs=getattr(model_cfg, "openpi_data", None),
     )
     if model_type == SupportedModel.OPENPI_RLINF:
@@ -94,8 +94,19 @@ def build_official_openpi_sft_dataloader(
     include_failures = bool(
         OmegaConf.select(cfg, "data.include_failure_episodes", default=False)
     )
-    if "cobot" in config_name.lower() and not include_failures:
-        _patch_create_torch_dataset_drop_failures(openpi_data_loader)
+    if "cobot" in config_name.lower():
+        if len(repo_ids) > 1:
+            prompts = OmegaConf.select(
+                cfg, "actor.model.openpi.task_prompts", default=None
+            )
+            _patch_create_torch_dataset_multi(
+                openpi_data_loader,
+                repo_ids=repo_ids,
+                prompts=list(prompts) if prompts is not None else None,
+                include_failures=include_failures,
+            )
+        elif not include_failures:
+            _patch_create_torch_dataset_drop_failures(openpi_data_loader)
 
     if "dobot" in config_name.lower():
         from rlinf.data.datasets.openpi_rlinf.dobot_lerobot_dataset_patch import (
@@ -109,6 +120,101 @@ def build_official_openpi_sft_dataloader(
     )
     _boost_openpi_torch_dataloader_prefetch(data_loader, prefetch_factor=4)
     return data_loader, data_loader.data_config()
+
+
+def _resolve_openpi_repo_ids(data_paths: Any) -> list[str]:
+    """Resolve one or more LeRobot IDs while preserving multi-dataset input."""
+    if isinstance(data_paths, (list, tuple, ListConfig)):
+        repo_ids = []
+        for entry in data_paths:
+            repo_id = resolve_lerobot_repo_id(entry)
+            if repo_id is not None:
+                repo_ids.append(repo_id)
+        return repo_ids
+    repo_id = resolve_lerobot_repo_id(data_paths)
+    return [repo_id] if repo_id is not None else []
+
+
+class _PromptFromDatasetIndex:
+    """Inject task prompts for items returned by MultiLeRobotDataset."""
+
+    def __init__(self, prompts: list[str]):
+        self._prompts = tuple(prompts)
+
+    def __call__(self, data: dict) -> dict:
+        data = dict(data)
+        dataset_index = data.get("dataset_index")
+        if dataset_index is None:
+            raise ValueError("Multi-dataset item is missing dataset_index")
+        if hasattr(dataset_index, "item"):
+            dataset_index = dataset_index.item()
+        try:
+            data["prompt"] = self._prompts[int(dataset_index)]
+        except (IndexError, TypeError):
+            raise ValueError(
+                f"dataset_index={dataset_index!r} is not covered by task_prompts"
+            ) from None
+        return data
+
+
+def _patch_create_torch_dataset_multi(
+    openpi_data_loader: Any,
+    *,
+    repo_ids: list[str],
+    prompts: list[str] | None,
+    include_failures: bool,
+) -> None:
+    """Use LeRobot's concatenated dataset for multi-task Cobot training."""
+    if prompts is None or len(prompts) != len(repo_ids):
+        raise ValueError(
+            "Multi-task Cobot training requires one actor.model.openpi.task_prompts "
+            "entry per data.train_data_paths entry."
+        )
+    original = openpi_data_loader.create_torch_dataset
+    if getattr(original, "_rlinf_cobot_multi", False):
+        return
+
+    import openpi.models.model as openpi_model
+    import openpi.training.config as openpi_config
+    from lerobot.datasets.lerobot_dataset import (
+        LeRobotDatasetMetadata,
+        MultiLeRobotDataset,
+    )
+
+    def create_torch_dataset_multi(
+        data_config: openpi_config.DataConfig,
+        action_horizon: int,
+        model_config: openpi_model.BaseModelConfig,
+    ):
+        del model_config
+        metadata = [LeRobotDatasetMetadata(repo_id) for repo_id in repo_ids]
+        fps = metadata[0].info["fps"]
+        if any(item.info["fps"] != fps for item in metadata[1:]):
+            raise ValueError("Cobot multi-task datasets must have the same fps")
+        episodes = None
+        if not include_failures:
+            from rlinf.data.datasets.openpi_rlinf.cobot_episode_filter import (
+                list_success_episode_indices_from_meta,
+            )
+
+            episodes = {
+                repo_id: list_success_episode_indices_from_meta(repo_id)
+                for repo_id in repo_ids
+            }
+        dataset = MultiLeRobotDataset(
+            repo_ids,
+            episodes=episodes,
+            delta_timestamps={
+                key: [t / fps for t in range(action_horizon)]
+                for key in data_config.action_sequence_keys
+            },
+        )
+        return openpi_data_loader.TransformedDataset(
+            dataset, [_PromptFromDatasetIndex(prompts)]
+        )
+
+    create_torch_dataset_multi._rlinf_cobot_multi = True
+    openpi_data_loader.create_torch_dataset = create_torch_dataset_multi
 
 
 def _set_single_thread_blas_env() -> None:
@@ -168,7 +274,9 @@ def _boost_openpi_torch_dataloader_prefetch(
 
     openpi_loader = getattr(data_loader, "_data_loader", None)
     torch_loader = getattr(openpi_loader, "_data_loader", None)
-    if torch_loader is None or not isinstance(torch_loader, torch.utils.data.DataLoader):
+    if torch_loader is None or not isinstance(
+        torch_loader, torch.utils.data.DataLoader
+    ):
         return
     if torch_loader.num_workers <= 0:
         return
@@ -206,7 +314,9 @@ def _boost_openpi_torch_dataloader_prefetch(
 
 def _patch_create_torch_dataset_drop_failures(openpi_data_loader: Any) -> None:
     """Wrap OpenPI ``create_torch_dataset`` to keep only success Cobot episodes."""
-    if getattr(openpi_data_loader.create_torch_dataset, "_rlinf_cobot_success_only", False):
+    if getattr(
+        openpi_data_loader.create_torch_dataset, "_rlinf_cobot_success_only", False
+    ):
         return
 
     import openpi.models.model as openpi_model

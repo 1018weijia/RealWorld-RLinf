@@ -25,13 +25,12 @@ import openpi.transforms as _transforms
 from openpi.training.config import DataConfig, DataConfigFactory, ModelTransformFactory
 from typing_extensions import override
 
-from rlinf.models.embodiment.openpi.policies import aloha_policy
-
 # Ensure PyAV video decode is available in this process (and forked workers
 # that already imported this module before spawning DataLoader workers).
 from rlinf.data.datasets.openpi_rlinf.pyav_video_patch import (
     apply_pyav_video_decode_patch,
 )
+from rlinf.models.embodiment.openpi.policies import aloha_policy
 
 apply_pyav_video_decode_patch()
 
@@ -84,6 +83,31 @@ class SliceCobotToJoint14(_transforms.DataTransformFn):
 
 
 @dataclasses.dataclass(frozen=True)
+class RepackCobotTransform(_transforms.DataTransformFn):
+    """Repack Cobot fields while preserving a task prompt when provided."""
+
+    _repack: _transforms.RepackTransform = dataclasses.field(
+        default_factory=lambda: _transforms.RepackTransform(
+            {
+                "images": {
+                    "cam_high": "observation.images.cam_high",
+                    "cam_left_wrist": "observation.images.cam_left_wrist",
+                    "cam_right_wrist": "observation.images.cam_right_wrist",
+                },
+                "state": "observation.state",
+                "actions": "action",
+            }
+        )
+    )
+
+    def __call__(self, data: dict) -> dict:
+        repacked = self._repack(data)
+        if "prompt" in data:
+            repacked["prompt"] = data["prompt"]
+        return repacked
+
+
+@dataclasses.dataclass(frozen=True)
 class LeRobotCobotDataConfig(DataConfigFactory):
     """Data configuration for Cobot Magic LeRobot datasets (joint 14-D)."""
 
@@ -92,22 +116,7 @@ class LeRobotCobotDataConfig(DataConfigFactory):
     adapt_to_pi: bool = False
 
     repack_transforms: _transforms.Group = dataclasses.field(
-        default_factory=lambda: _transforms.Group(
-            inputs=[
-                _transforms.RepackTransform(
-                    {
-                        "images": {
-                            "cam_high": "observation.images.cam_high",
-                            "cam_left_wrist": "observation.images.cam_left_wrist",
-                            "cam_right_wrist": "observation.images.cam_right_wrist",
-                        },
-                        "state": "observation.state",
-                        "actions": "action",
-                        # Prompt is injected later via ModelTransformFactory(default_prompt=...).
-                    }
-                )
-            ]
-        )
+        default_factory=lambda: _transforms.Group(inputs=[RepackCobotTransform()])
     )
 
     @override
