@@ -19,7 +19,39 @@
 
 Stage 1 checkpoint 必须放在 `rollout.rlt_feature_model.model_path`，不要放到 `rollout.model.model_path` 或 `actor.model.model_path`。后两个字段属于 Stage 2 MLP。
 
-Stage 1 15k 目录通常形如：
+本机已确认的 Stage 1 权重如下。
+
+### 2.1 Assemble / legacy action expert（推荐，15k）
+
+对应 tmux 会话：`RLT_stage1_Cobot_assemble_franka_legacy_actionexpert_gpu5`。
+
+```text
+/data/gxy/realworldRL/RLinf/logs/20260906-06:01:46-cobot_rlt_stage1_sft_openpi_pi05_assemble_parts_franka_legacy_action_expert_base/cobot_assemble_franka_legacy_actionexpert_base_fp32master_bf16compute_30k/checkpoints/global_step_15000/actor/model_state_dict
+```
+
+对应 norm stats：
+
+```text
+/data/gxy/realworldRL/checkpoints/assets/cobot_magic/assemble_parts/norm_stats.json
+```
+
+### 2.2 Mixed cook/cube/pack（备选，当前只有 10k）
+
+对应 tmux 会话：`RLT_stage1_Cobot_mixed_cook_cube_pack_gpu7`。
+
+该实验目前只保存到 `global_step_10000`，没有 `global_step_15000`，因此它不是本次 15k 运行的等价替代。
+
+```text
+/data/gxy/realworldRL/RLinf/logs/20260907-09:26:30-cobot_rlt_stage1_sft_openpi_pi05_mixed_cook_cube_pack_franka_legacy_action_expert_base/cobot_mixed_cook_cube_pack_franka_legacy_actionexpert_base_fp32master_bf16compute_30k/checkpoints/global_step_10000/actor/model_state_dict
+```
+
+对应 mixed norm stats：
+
+```text
+/data/gxy/realworldRL/checkpoints/assets/cobot_magic/mixed_cook_cube_pack/norm_stats.json
+```
+
+Stage 1 权重目录通常都包含 `actor/model_state_dict`，但启动前仍建议检查：
 
 ```text
 /data/gxy/realworldRL/logs/<stage1-run>/<experiment>/checkpoints/global_step_15000/actor/model_state_dict
@@ -28,19 +60,13 @@ Stage 1 15k 目录通常形如：
 真机侧/训练侧先确认实际目录：
 
 ```bash
-find /data/gxy/realworldRL/logs \
+find /data/gxy/realworldRL/RLinf/logs \
   -path '*cobot_rlt_stage1*' \
-  -type d -name 'global_step_15000' \
+  -type d \( -name 'global_step_15000' -o -name 'global_step_10000' \) \
   -print
 ```
 
-norm stats 必须与 Stage 1 使用的 Cobot 数据配置和 `config_name` 匹配，例如：
-
-```text
-/data/gxy/realworldRL/checkpoints/assets/cobot_magic/<task>/norm_stats.json
-```
-
-不要跨任务复用 norm stats。Stage 1 模型、`repo_id`、OpenPI `config_name`、图像数量、action_dim 和 state schema 必须一致。
+不要跨任务复用 norm stats。Stage 1 模型、OpenPI `config_name`、图像数量、action_dim 和 state schema 必须一致。
 
 ## 3. Cobot adapter 必须提供的接口
 
@@ -108,7 +134,9 @@ ray status
 
 ## 5. 从 Stage 1 15k 启动 Stage 2
 
-在 GPU 节点执行。以下路径是占位符，替换为实际 Stage 1 15k checkpoint、norm stats 和 adapter 工厂路径：
+在 GPU 节点执行。下面给出已确认的两个命令，二选一。`controller_factory` 必须替换成真机侧实际 Python 模块路径。
+
+### 5.1 使用 assemble/legacy 的 15k 权重（推荐）
 
 ```bash
 cd /data/gxy/realworldRL/RLinf
@@ -116,18 +144,38 @@ export EMBODIED_PATH=/data/gxy/realworldRL/RLinf
 
 .venv/bin/python examples/embodiment/train_embodied_agent.py \
   --config-name cobot_rlt_stage2_td3_mlp \
-  rollout.rlt_feature_model.model_path=/path/to/global_step_15000/actor/model_state_dict \
-  +rollout.rlt_feature_model.openpi_data.norm_stats_path=/path/to/norm_stats.json \
+  rollout.rlt_feature_model.model_path=/data/gxy/realworldRL/RLinf/logs/20260906-06:01:46-cobot_rlt_stage1_sft_openpi_pi05_assemble_parts_franka_legacy_action_expert_base/cobot_assemble_franka_legacy_actionexpert_base_fp32master_bf16compute_30k/checkpoints/global_step_15000/actor/model_state_dict \
+  +rollout.rlt_feature_model.openpi_data.norm_stats_path=/data/gxy/realworldRL/checkpoints/assets/cobot_magic/assemble_parts/norm_stats.json \
   env.train.override_cfg.is_dummy=false \
   env.train.override_cfg.controller_factory=your_package.controller:create_adapter
 ```
 
-建议第一次真机运行时加上明确的输出目录和有限步数，例如：
+### 5.2 使用 mixed 三任务的 10k 权重（备选）
+
+只有在要运行 mixed cook/cube/pack 任务时使用：
+
+```bash
+cd /data/gxy/realworldRL/RLinf
+export EMBODIED_PATH=/data/gxy/realworldRL/RLinf
+
+.venv/bin/python examples/embodiment/train_embodied_agent.py \
+  --config-name cobot_rlt_stage2_td3_mlp \
+  rollout.rlt_feature_model.model_path=/data/gxy/realworldRL/RLinf/logs/20260907-09:26:30-cobot_rlt_stage1_sft_openpi_pi05_mixed_cook_cube_pack_franka_legacy_action_expert_base/cobot_mixed_cook_cube_pack_franka_legacy_actionexpert_base_fp32master_bf16compute_30k/checkpoints/global_step_10000/actor/model_state_dict \
+  +rollout.rlt_feature_model.openpi_data.norm_stats_path=/data/gxy/realworldRL/checkpoints/assets/cobot_magic/mixed_cook_cube_pack/norm_stats.json \
+  env.train.override_cfg.is_dummy=false \
+  env.train.override_cfg.controller_factory=your_package.controller:create_adapter
+```
+
+不要把 mixed 10k 权重和 `assemble_parts/norm_stats.json` 混用，也不要把 assemble 15k 权重和 mixed norm stats 混用。
+
+第一次真机验证建议在上述命令末尾追加有限步数和独立输出目录：
 
 ```bash
   runner.max_steps=10000 \
   runner.logger.log_path=/data/gxy/realworldRL/results/cobot_stage2_15k
 ```
+
+也就是把这两个 override 接在启动命令最后；确认 HIL 稳定后可去掉 `runner.max_steps`，改为按需要长时间运行。`your_package.controller:create_adapter` 必须替换成真机侧实际的 Python 模块和工厂函数。
 
 Stage 2 的关键默认值：
 
