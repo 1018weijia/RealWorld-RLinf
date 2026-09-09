@@ -590,6 +590,24 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         ref_chunk = self.output_transform(
             {"actions": outputs["actions"], "state": observation.state}
         )["actions"]
+        ref_candidates = [ref_chunk]
+        for _ in range(1, int(getattr(self, "rlt_num_action_candidates", 1))):
+            candidate_outputs = self._sample_actions_with_prefix_cache(
+                state,
+                prefix_output,
+                prefix_pad_masks,
+                past_key_values,
+                mode="eval",
+                compute_values=False,
+            )
+            ref_candidates.append(
+                self.output_transform(
+                    {
+                        "actions": candidate_outputs["actions"],
+                        "state": observation.state,
+                    }
+                )["actions"]
+            )
         raw_proprio = self._select_configured_state(env_obs["states"])
         if (
             isinstance(self.config.config_name, str)
@@ -610,6 +628,9 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             "z_rl": z_rl,
             "proprio": proprio.to(device=z_rl.device, dtype=torch.float32),
             "ref_chunk": ref_chunk.to(device=z_rl.device, dtype=torch.float32),
+            "ref_candidates": torch.stack(ref_candidates, dim=1).to(
+                device=z_rl.device, dtype=torch.float32
+            ),
         }
 
     def prepare_dagger_sft_batch(self, batch):

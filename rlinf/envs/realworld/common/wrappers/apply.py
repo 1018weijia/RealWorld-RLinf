@@ -46,6 +46,9 @@ from rlinf.envs.realworld.common.wrappers.reward_done_wrapper import (
     KeyboardRewardDoneMultiStageWrapper,
     KeyboardRewardDoneWrapper,
 )
+from rlinf.envs.realworld.common.wrappers.rlt_intervention_metadata import (
+    RLTInterventionMetadataWrapper,
+)
 from rlinf.envs.realworld.common.wrappers.spacemouse_intervention import (
     SpacemouseIntervention,
 )
@@ -148,6 +151,8 @@ def apply_single_arm_wrappers(env: gym.Env, cfg: Mapping[str, Any]) -> gym.Env:
         env = PicoIntervention(env, gripper_enabled=gripper_enabled, **pico_cfg)
 
     env = _apply_keyboard_wrapper(env, cfg.get("keyboard_reward_wrapper", None))
+    if cfg.get("rlt_intervention_metadata", False):
+        env = RLTInterventionMetadataWrapper(env)
 
     if cfg.get("use_relative_frame", True):
         env = RelativeFrame(env)
@@ -206,4 +211,6 @@ def apply_dual_franka_joint_wrappers(env: gym.Env, cfg: Mapping[str, Any]) -> gy
         )
 
     env = _apply_keyboard_wrapper(env, cfg.get("keyboard_reward_wrapper", None))
+    if cfg.get("rlt_intervention_metadata", False):
+        env = RLTInterventionMetadataWrapper(env)
     return env

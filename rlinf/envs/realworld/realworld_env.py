@@ -280,13 +280,17 @@ class RealWorldEnv(gym.Env):
         else:
             timeout_truncations = self.elapsed_steps >= self.cfg.max_episode_steps
         if not self.manual_episode_control_only:
-            truncations = timeout_truncations
+            truncations = np.logical_or(truncations, timeout_truncations)
 
         obs = self._wrap_obs(raw_obs)
         step_reward = self._calc_step_reward(_reward)
         success_current_step = np.isclose(step_reward, 1.0)
         intervene_flag = np.zeros(self.num_envs, dtype=bool)
-        if "intervene_action" in infos:
+        if "intervene_flag" in infos:
+            intervene_flag = np.asarray(infos["intervene_flag"], dtype=bool).reshape(
+                self.num_envs
+            )
+        elif "intervene_action" in infos:
             for env_id in range(self.num_envs):
                 if infos["intervene_action"][env_id] is not None:
                     intervene_flag[env_id] = True
@@ -302,13 +306,25 @@ class RealWorldEnv(gym.Env):
             infos["episode"]["success_at_end"] = to_tensor(terminations)
             terminations[:] = False
 
-        intervene_action = np.zeros_like(actions)
-        if "intervene_action" in infos:
-            for env_id in range(self.num_envs):
-                env_intervene_action = infos["intervene_action"][env_id]
-                if env_intervene_action is not None:
-                    intervene_action[env_id] = env_intervene_action.copy()
-        infos["intervene_action"] = to_tensor(intervene_action)
+        executed_action = np.asarray(
+            infos.get("executed_action", infos.get("intervene_action", actions)),
+            dtype=np.float32,
+        )
+        if executed_action.shape != np.asarray(actions).shape:
+            raise ValueError(
+                "executed_action must match the policy action shape: "
+                f"expected {np.asarray(actions).shape}, got {executed_action.shape}."
+            )
+        if not np.isfinite(executed_action).all():
+            raise ValueError("executed_action contains NaN or Inf.")
+        if np.any(executed_action < -1.0) or np.any(executed_action > 1.0):
+            raise ValueError(
+                "executed_action must be returned in normalized [-1, 1] space."
+            )
+        # Keep the existing field name for channel compatibility. It now carries
+        # the action actually sent to the robot; intervene_flag identifies human
+        # takeover separately.
+        infos["intervene_action"] = to_tensor(executed_action)
         infos["intervene_flag"] = to_tensor(intervene_flag)
         if "rlt_switch_flags" in infos:
             infos["rlt_switch_flags"] = to_tensor(
@@ -337,6 +353,18 @@ class RealWorldEnv(gym.Env):
             if callable(on_begin):
                 on_begin()
 
+    def _notify_action_chunk_end(self, committed: torch.Tensor) -> None:
+        """Tell hardware adapters whether each action chunk was committed."""
+
+        committed = torch.as_tensor(committed).reshape(-1).bool()
+        for env_idx, env in enumerate(self.env.envs):
+            try:
+                on_end = env.get_wrapper_attr("on_action_chunk_end")
+            except AttributeError:
+                continue
+            if callable(on_end):
+                on_end(bool(committed[env_idx]))
+
     def chunk_step(self, chunk_actions):
         # chunk_actions: [num_envs, chunk_step, action_dim]
         chunk_size = chunk_actions.shape[1]
@@ -351,6 +379,22 @@ class RealWorldEnv(gym.Env):
         raw_chunk_intervene_actions = []
         raw_chunk_intervene_flag = []
         raw_chunk_rlt_switch_flags = []
+        raw_chunk_record_transition = []
+        rewind_events = []
+
+        def append_rewind_events(value) -> None:
+            if value is None:
+                return
+            if isinstance(value, np.ndarray) and value.dtype == object:
+                rewind_events.extend(
+                    item for item in value.reshape(-1) if item is not None
+                )
+            elif isinstance(value, (list, tuple)):
+                rewind_events.extend(item for item in value if item is not None)
+            else:
+                rewind_events.append(value)
+
+        event_only = False
         self._notify_action_chunk_begin()
         for i in range(chunk_size):
             actions = chunk_actions[:, i]
@@ -364,10 +408,55 @@ class RealWorldEnv(gym.Env):
                 raw_chunk_intervene_flag.append(infos["intervene_flag"])
             if "rlt_switch_flags" in infos:
                 raw_chunk_rlt_switch_flags.append(infos["rlt_switch_flags"])
+            raw_chunk_record_transition.append(
+                infos.get(
+                    "record_transition", torch.ones(self.num_envs, dtype=torch.bool)
+                )
+            )
+            append_rewind_events(infos.get("rlt_rewind_event"))
+            append_rewind_events(infos.get("rewind_events"))
 
             chunk_rewards.append(step_reward)
             raw_chunk_terminations.append(terminations)
             raw_chunk_truncations.append(truncations)
+
+            event_only_value = infos.get("rlt_event_only", False)
+            if bool(torch.as_tensor(event_only_value).reshape(-1).any()):
+                event_only = True
+                break
+            if i + 1 < chunk_size and bool(
+                torch.logical_or(terminations, truncations).reshape(-1).any()
+            ):
+                # No environment in this synchronous batch may execute the
+                # remainder after one member terminates. Padding below keeps
+                # the Ray payload shape fixed and discards the partial chunk.
+                break
+
+        if event_only:
+            # A boundary rewind consumes no policy action. Keep the fixed-size
+            # channel payload while marking the entire proposed chunk discarded.
+            raw_chunk_record_transition = [
+                torch.zeros(self.num_envs, dtype=torch.bool) for _ in range(chunk_size)
+            ]
+        while len(chunk_rewards) < chunk_size:
+            chunk_rewards.append(torch.zeros_like(chunk_rewards[-1]))
+            raw_chunk_terminations.append(torch.zeros_like(raw_chunk_terminations[-1]))
+            raw_chunk_truncations.append(torch.zeros_like(raw_chunk_truncations[-1]))
+            if raw_chunk_intervene_actions:
+                raw_chunk_intervene_actions.append(
+                    torch.zeros_like(raw_chunk_intervene_actions[-1])
+                )
+                raw_chunk_intervene_flag.append(
+                    torch.zeros_like(raw_chunk_intervene_flag[-1])
+                )
+            if raw_chunk_rlt_switch_flags:
+                raw_chunk_rlt_switch_flags.append(
+                    torch.zeros_like(raw_chunk_rlt_switch_flags[-1])
+                )
+            if not event_only:
+                raw_chunk_record_transition.append(
+                    torch.zeros(self.num_envs, dtype=torch.bool)
+                )
 
         chunk_rewards = torch.stack(chunk_rewards, dim=1)  # [num_envs, chunk_steps]
         raw_chunk_terminations = torch.stack(
@@ -392,6 +481,19 @@ class RealWorldEnv(gym.Env):
             infos_last["rlt_switch_flags"] = torch.stack(
                 raw_chunk_rlt_switch_flags, dim=1
             )
+            infos_list[-1] = infos_last
+        if raw_chunk_record_transition:
+            record_transition = torch.stack(
+                [torch.as_tensor(value) for value in raw_chunk_record_transition], dim=1
+            )
+            infos_last["record_transition"] = record_transition
+            infos_list[-1] = infos_last
+            self._notify_action_chunk_end(record_transition.all(dim=1))
+        else:
+            self._notify_action_chunk_end(torch.ones(self.num_envs, dtype=torch.bool))
+        if rewind_events:
+            infos_last["rewind_events"] = rewind_events
+            infos_last["rlt_rewind_event"] = rewind_events[-1]
             infos_list[-1] = infos_last
 
         if past_dones.any() and self.auto_reset:

@@ -910,6 +910,89 @@ def validate_embodied_cfg(cfg):
     model_cfg = cfg.rollout.model if only_eval else cfg.actor.model
     algorithm_cfg = cfg.get("algorithm", {}) or {}
     model_type = SupportedModel(model_cfg.model_type)
+    train_env_cfg = cfg.env.get("train", None)
+    eval_env_cfg = cfg.env.get("eval", None)
+    is_cobot_config = any(
+        env_cfg is not None
+        and str(env_cfg.get("init_params", {}).get("id", "")) == "CobotEnv-v1"
+        for env_cfg in (train_env_cfg, eval_env_cfg)
+    )
+    if is_cobot_config and not only_eval:
+        cobot_action_dim = int(
+            train_env_cfg.get("override_cfg", {}).get("action_dim", 14)
+        )
+        cobot_state_dim = int(
+            train_env_cfg.get("override_cfg", {}).get("state_dim", 14)
+        )
+        assert int(cfg.actor.model.action_dim) == cobot_action_dim, (
+            "Cobot Stage 2 action_dim must match env.train.override_cfg.action_dim: "
+            f"actor={cfg.actor.model.action_dim}, env={cobot_action_dim}"
+        )
+        assert int(cfg.actor.model.proprio_dim) == cobot_state_dim, (
+            "Cobot Stage 2 proprio_dim must match env.train.override_cfg.state_dim: "
+            f"actor={cfg.actor.model.proprio_dim}, env={cobot_state_dim}"
+        )
+        assert int(cfg.rollout.rlt_feature_model.action_dim) == cobot_action_dim, (
+            "Cobot Stage 1 feature action_dim must match the environment: "
+            f"feature={cfg.rollout.rlt_feature_model.action_dim}, env={cobot_action_dim}"
+        )
+        chunk_horizon = int(cfg.actor.model.num_action_chunks)
+        reference_horizon = int(
+            cfg.actor.model.get("ref_num_action_chunks", chunk_horizon)
+        )
+        assert chunk_horizon == 16, (
+            "Cobot Stage 2 uses the remote-franka 16-step chunk horizon. "
+            "A hardware exception requires a separate, explicitly documented config."
+        )
+        assert reference_horizon >= chunk_horizon, (
+            "ref_num_action_chunks must cover the complete Stage 2 chunk."
+        )
+        for name, env_cfg in (("train", train_env_cfg), ("eval", eval_env_cfg)):
+            if env_cfg is None:
+                continue
+            max_steps = int(env_cfg.get("max_episode_steps", 0) or 0)
+            assert max_steps <= 0 or max_steps % chunk_horizon == 0, (
+                f"env.{name}.max_episode_steps must be divisible by {chunk_horizon}."
+            )
+        assert float(algorithm_cfg.get("gamma", 0.99)) == 0.99
+        assert str(algorithm_cfg.get("critic_loss", "huber")) == "huber"
+        assert float(algorithm_cfg.get("critic_huber_delta", 0.5)) == 0.5
+        assert int(algorithm_cfg.get("critic_actor_ratio", 2)) == 2
+        expo_cfg = algorithm_cfg.get("expo", {}) or {}
+        assert bool(expo_cfg.get("enable", False)), "Cobot Stage 2 requires EXPO."
+        assert int(expo_cfg.get("base_candidates", 0)) == 4
+        assert int(expo_cfg.get("edited_candidates", 0)) == 4
+        replay_cfg = algorithm_cfg.get("replay_buffer", {}) or {}
+        assert bool(replay_cfg.get("prioritized", False)), (
+            "Cobot Stage 2 requires prioritized replay."
+        )
+        assert 0.0 <= float(replay_cfg.get("per_alpha", 0.6)) <= 1.0
+        assert 0.0 <= float(replay_cfg.get("per_beta_start", 0.4)) <= 1.0
+        assert 0.0 <= float(replay_cfg.get("per_beta_end", 1.0)) <= 1.0
+        schedule_cfg = algorithm_cfg.get("rlt_schedule", {}) or {}
+        assert int(schedule_cfg.get("warmup_min_size", 0)) == 250
+        assert int(schedule_cfg.get("utd_ratio", 0)) == 5
+        assert bool(schedule_cfg.get("episode_boundary_only", False))
+        rewind_cfg = algorithm_cfg.get("rewind_preference", {}) or {}
+        if bool(rewind_cfg.get("enable", False)):
+            controller_factory = train_env_cfg.get("override_cfg", {}).get(
+                "controller_factory"
+            )
+            is_dummy = bool(train_env_cfg.get("override_cfg", {}).get("is_dummy", True))
+            assert is_dummy or controller_factory, (
+                "Physical Cobot rewind requires env.train.override_cfg.controller_factory. "
+                "The controller must implement rewind_chunks() and poll_rewind_event()."
+            )
+            assert int(rewind_cfg.get("history_chunks", 1)) > 0, (
+                "algorithm.rewind_preference.history_chunks must be positive."
+            )
+            assert bool(rewind_cfg.get("stop_and_go", True)), (
+                "Physical Cobot rewind requires rewind_preference.stop_and_go=true."
+            )
+            assert int(rewind_cfg.get("prefetch_chunks", 0)) == 0, (
+                "Physical Cobot rewind requires rewind_preference.prefetch_chunks=0."
+            )
+
     assert model_type in EMBODIED_MODEL or model_type in DIFFUSION_MODELS, (
         f"Model type: '{model_cfg.model_type}' is not supported by the embodied runner. "
         f"Supported embodied models: {sorted([x.value for x in EMBODIED_MODEL])}; "

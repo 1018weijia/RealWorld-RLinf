@@ -12,12 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import copy
 import queue
 
 import torch
 
 from rlinf.algorithms.rlt import losses as rlt_losses
-from rlinf.algorithms.rlt.transition import use_simulator_transition_replay
+from rlinf.algorithms.rlt.preference import RewindPreferenceBuffer
+from rlinf.algorithms.rlt.transition import (
+    ACTION_SOURCE_HUMAN,
+    ACTION_SOURCE_POLICY,
+    use_simulator_transition_replay,
+)
 from rlinf.data.schema.embodied_types import Trajectory
 from rlinf.models.embodiment.base_policy import ForwardType
 from rlinf.scheduler import Worker
@@ -183,6 +189,81 @@ class RLTACLossMixin:
             obs=next_obs,
         )
 
+    def _preference_batch(self):
+        preference_cfg = self.cfg.algorithm.get("rewind_preference", {}) or {}
+        if not bool(preference_cfg.get("enable", False)):
+            return None
+        return self.rewind_preference_buffer.sample(
+            int(preference_cfg.get("batch_size", 32)), self.device
+        )
+
+    def _add_critic_preference_loss(
+        self, loss: torch.Tensor, metrics: dict[str, float]
+    ):
+        preference_cfg = self.cfg.algorithm.get("rewind_preference", {}) or {}
+        pair_batch = self._preference_batch()
+        min_pairs = int(preference_cfg.get("min_pairs", 1))
+        if pair_batch is None or len(self.rewind_preference_buffer) < min_pairs:
+            metrics["preference_critic_active"] = 0.0
+            return loss
+        preference_loss, preference_metrics = rlt_losses.critic_pairwise_rank_loss(
+            model=self.model,
+            curr_obs=pair_batch["curr_obs"],
+            ref_chunk=pair_batch["ref_chunk"],
+            positive_action=pair_batch["positive_action"],
+            negative_action=pair_batch["negative_action"],
+            action_mask=pair_batch["action_mask"],
+            confidence=pair_batch["confidence"],
+            margin=float(preference_cfg.get("rank_margin", 0.1)),
+        )
+        weight = float(preference_cfg.get("critic_weight", 0.0))
+        metrics.update(preference_metrics)
+        metrics["preference_critic_weight"] = weight
+        metrics["preference_critic_active"] = 1.0
+        return loss + weight * preference_loss
+
+    def _per_beta(self) -> float:
+        replay_cfg = self.cfg.algorithm.replay_buffer
+        start = float(replay_cfg.get("per_beta_start", 0.4))
+        end = float(replay_cfg.get("per_beta_end", 1.0))
+        steps = max(1, int(replay_cfg.get("per_beta_anneal_steps", 50000)))
+        progress = min(1.0, float(getattr(self, "update_step", 0)) / steps)
+        return start + progress * (end - start)
+
+    def _update_replay_priorities(
+        self, batch: dict[str, torch.Tensor], td_errors: torch.Tensor
+    ) -> dict[str, float]:
+        replay_cfg = self.cfg.algorithm.replay_buffer
+        if not bool(replay_cfg.get("prioritized", False)):
+            return {}
+        ids = batch.get("_replay_trajectory_id")
+        rows = batch.get("_replay_row_index")
+        if ids is None or rows is None:
+            raise ValueError("PER batch is missing replay row handles")
+        online_count = int(
+            torch.as_tensor(batch.get("_per_online_count", len(td_errors))).item()
+        )
+        online_count = max(0, min(online_count, len(td_errors)))
+        if online_count:
+            self.replay_buffer.update_priorities(
+                ids[:online_count], rows[:online_count], td_errors[:online_count]
+            )
+        if online_count < len(td_errors):
+            if self.demo_buffer is None:
+                raise ValueError("PER batch contains demo rows without a demo buffer")
+            self.demo_buffer.update_priorities(
+                ids[online_count:], rows[online_count:], td_errors[online_count:]
+            )
+        beta = self._per_beta()
+        self.replay_buffer.set_per_beta(beta)
+        if self.demo_buffer is not None:
+            self.demo_buffer.set_per_beta(beta)
+        return {
+            "per_beta": beta,
+            "per_td_error_mean": float(td_errors.detach().float().mean().item()),
+            "per_weight_mean": float(batch["weights"].float().mean().item()),
+        }
+
     @Worker.timer("forward_critic")
     def forward_critic(self, batch):
         use_crossq = self.cfg.algorithm.get("q_head_type", "default") == "crossq"
@@ -199,9 +280,31 @@ class RLTACLossMixin:
             gamma=float(self.cfg.algorithm.gamma),
             bootstrap_type=bootstrap_type,
             use_crossq=use_crossq,
-            use_done_key=use_simulator_transition_replay(self.cfg),
+            use_done_key=bool(
+                self.cfg.algorithm.get(
+                    "use_done_key", use_simulator_transition_replay(self.cfg)
+                )
+            ),
             next_actions_fn=self._next_actions_for_critic_target,
+            critic_loss_type=self.cfg.algorithm.get("critic_loss", "mse"),
+            critic_huber_delta=float(self.cfg.algorithm.get("critic_huber_delta", 0.5)),
+            intervention_noise_sigma=float(
+                self.cfg.algorithm.get("intervention_critic_action_noise_sigma", 0.0)
+            ),
+            intervention_noise_clip=float(
+                self.cfg.algorithm.get("intervention_critic_action_noise_clip", 0.0)
+            ),
+            rewind_noise_sigma=float(
+                self.cfg.algorithm.get("rewind_critic_action_noise_sigma", 0.0)
+            ),
+            rewind_noise_clip=float(
+                self.cfg.algorithm.get("rewind_critic_action_noise_clip", 0.0)
+            ),
         )
+        td_errors = metrics.pop("_td_errors", None)
+        if td_errors is not None:
+            metrics.update(self._update_replay_priorities(batch, td_errors))
+        critic_loss = self._add_critic_preference_loss(critic_loss, metrics)
         return critic_loss, metrics
 
     @Worker.timer("forward_actor")
@@ -241,14 +344,94 @@ class RLTACReplayMixin:
     def _trajectory_transition_count(traj: Trajectory) -> int:
         if traj.actions is None:
             return 0
+        if isinstance(traj.record_transition, torch.Tensor):
+            steps, envs = traj.actions.shape[:2]
+            return int(
+                traj.record_transition.reshape(steps, envs, -1)
+                .bool()
+                .all(dim=-1)
+                .sum()
+                .item()
+            )
         return int(traj.actions.shape[0] * traj.actions.shape[1])
 
-    @staticmethod
-    def _trajectory_completed_episodes(traj: Trajectory) -> int:
+    def _trajectory_completed_episodes(self, traj: Trajectory) -> int:
         dones = traj.dones
-        if dones is None:
+        if dones is None or traj.actions is None:
             return 0
-        return int(dones.reshape(dones.shape[0], dones.shape[1], -1).any(dim=-1).sum())
+        steps, envs = traj.actions.shape[:2]
+        if dones.shape[0] == steps + 1:
+            dones = dones[1:]
+        else:
+            dones = dones[:steps]
+        done_rows = dones.reshape(steps, envs, -1).bool().any(dim=-1)
+        if isinstance(traj.record_transition, torch.Tensor):
+            done_rows &= (
+                traj.record_transition.reshape(steps, envs, -1).bool().all(dim=-1)
+            )
+
+        identity_fields = (
+            traj.rewind_episode_id,
+            traj.rewind_session_id,
+            traj.rewind_env_id,
+        )
+        if not all(isinstance(value, torch.Tensor) for value in identity_fields):
+            return int(done_rows.sum().item())
+        identities = [
+            value.reshape(steps, envs, -1)[..., 0] for value in identity_fields
+        ]
+        if not any(bool(value.ne(0).any()) for value in identities):
+            return int(done_rows.sum().item())
+
+        processed = getattr(self, "_processed_episode_ends", set())
+        completed = 0
+        for step, env in done_rows.nonzero(as_tuple=False).tolist():
+            key = tuple(int(value[step, env]) for value in identities)
+            if key in processed:
+                continue
+            processed.add(key)
+            completed += 1
+        self._processed_episode_ends = processed
+        return completed
+
+    def _deduplicate_trajectory(self, traj: Trajectory) -> Trajectory:
+        """Drop Ray retry duplicates using committed Cobot transition identity."""
+
+        if traj.actions is None or not isinstance(traj.record_transition, torch.Tensor):
+            return traj
+        steps, envs = traj.actions.shape[:2]
+        identity_fields = (
+            traj.rewind_episode_id,
+            traj.rewind_session_id,
+            traj.rewind_env_id,
+            traj.rewind_chunk_id,
+        )
+        if not all(isinstance(value, torch.Tensor) for value in identity_fields):
+            return traj
+        identities = [
+            value.reshape(steps, envs, -1)[..., 0] for value in identity_fields
+        ]
+        if not any(bool(value.ne(0).any()) for value in identities):
+            return traj
+
+        record = traj.record_transition.reshape(steps, envs, -1).bool().all(dim=-1)
+        committed = getattr(self, "_committed_transition_ids", set())
+        duplicate_rows: list[tuple[int, int]] = []
+        for step, env in record.nonzero(as_tuple=False).tolist():
+            key = tuple(int(value[step, env]) for value in identities)
+            if key in committed:
+                duplicate_rows.append((step, env))
+            else:
+                committed.add(key)
+        self._committed_transition_ids = committed
+        if not duplicate_rows:
+            return traj
+
+        filtered = copy.copy(traj)
+        filtered.record_transition = traj.record_transition.clone()
+        for step, env in duplicate_rows:
+            filtered.record_transition[step, env] = False
+        return filtered
 
     @staticmethod
     def _transition_reward_value(traj: Trajectory) -> float | None:
@@ -468,6 +651,7 @@ class RLTACReplayMixin:
         recv_list: list[Trajectory],
     ) -> tuple[int, int]:
         self._last_replay_metrics = {}
+        recv_list = [self._deduplicate_trajectory(traj) for traj in recv_list]
 
         if use_simulator_transition_replay(self.cfg):
             replay_list = []
@@ -484,6 +668,9 @@ class RLTACReplayMixin:
                 **collect_trajectory_replay_metrics(recv_list, reducer=all_reduce_dict),
             }
             self.replay_buffer.add_trajectories(replay_list)
+            for traj in recv_list:
+                self._ingest_rewind_events(traj.rewind_events)
+                self._consume_rewind_preferences(traj)
 
             if self.demo_buffer is not None:
                 intervene_traj_list = [
@@ -496,7 +683,14 @@ class RLTACReplayMixin:
 
             return len(replay_list), completed
 
+        replay_start = self.replay_buffer._trajectory_counter
         self.replay_buffer.add_trajectories(recv_list)
+        for offset, trajectory in enumerate(recv_list):
+            if replay_start + offset in self.replay_buffer._trajectory_index:
+                self._append_replay_rows(trajectory, replay_start + offset)
+        for trajectory in recv_list:
+            self._ingest_rewind_events(trajectory.rewind_events)
+            self._consume_rewind_preferences(trajectory)
 
         if self.demo_buffer is not None:
             intervene_traj_list = []
@@ -541,12 +735,326 @@ class RLTACFSDPPolicy(RLTACLossMixin, RLTACReplayMixin, EmbodiedSACFSDPPolicy):
         self._warmup_ready_total_transitions: int | None = None
         self._warmup_ready_total_episodes: int | None = None
         self.pending_update_budget = 0
+        preference_cfg = cfg.algorithm.get("rewind_preference", {}) or {}
+        self.rewind_preference_buffer = RewindPreferenceBuffer(
+            int(preference_cfg.get("capacity", 1024))
+        )
+        self._pending_rewind_forks: dict[tuple[int, int, int], dict[str, object]] = {}
+        self._rewind_rows: dict[tuple[int, int, int], list[tuple[int, int, int]]] = {}
+        self._recovery_root_pending: dict[tuple[int, int, int], int] = {}
+        self._processed_rewind_events: set[tuple[int, int, int, int, str]] = set()
+        self._committed_transition_ids: set[tuple[int, int, int, int]] = set()
+        self._processed_episode_ends: set[tuple[int, int, int]] = set()
+
+    @staticmethod
+    def _row_key(episode_id: int, session_id: int, env_id: int) -> tuple[int, int, int]:
+        return (episode_id, session_id, env_id)
+
+    def _append_replay_rows(self, trajectory: Trajectory, trajectory_id: int) -> None:
+        """Index confirmed replay rows by robot-provided session identity."""
+        if trajectory.actions is None:
+            return
+        flat = self.replay_buffer._flatten_trajectory(trajectory)
+        episode_ids = flat.get("rewind_episode_id")
+        session_ids = flat.get("rewind_session_id")
+        env_ids = flat.get("rewind_env_id")
+        chunk_ids = flat.get("rewind_chunk_id")
+        records = flat.get("record_transition")
+        if not all(
+            isinstance(value, torch.Tensor)
+            for value in (episode_ids, session_ids, env_ids, chunk_ids)
+        ):
+            return
+        for row in range(trajectory.actions.shape[0] * trajectory.actions.shape[1]):
+            if isinstance(records, torch.Tensor) and not bool(
+                records[row].reshape(-1)[0]
+            ):
+                continue
+            key = self._row_key(
+                int(episode_ids[row].reshape(-1)[0]),
+                int(session_ids[row].reshape(-1)[0]),
+                int(env_ids[row].reshape(-1)[0]),
+            )
+            self._rewind_rows.setdefault(key, []).append(
+                (trajectory_id, row, int(chunk_ids[row].reshape(-1)[0]))
+            )
+
+    def _patch_rows(
+        self, trajectory_id: int, updates: dict[int, dict[str, torch.Tensor]]
+    ) -> None:
+        self.replay_buffer.patch_trajectory_rows(trajectory_id, updates)
+
+    def _patch_rewind_event(self, event: object) -> None:
+        """Apply remote-franka credit only to real rows in one session."""
+        key = self._row_key(
+            int(event.episode_id), int(event.session_id), int(event.env_id)
+        )
+        rows = [
+            row
+            for row in self._rewind_rows.get(key, [])
+            if row[2] <= int(event.chunk_id)
+        ]
+        count = min(int(event.chunks_rewound), len(rows))
+        if count <= 0:
+            self.log_warning(f"Ignoring rewind event without bad rows: {key}")
+            return
+        bad_rows = rows[-count:]
+        grouped: dict[int, dict[int, dict[str, torch.Tensor]]] = {}
+
+        def row_field(tid: int, row: int, name: str) -> torch.Tensor:
+            trajectory = self.replay_buffer._load_trajectory(
+                tid, self.replay_buffer._trajectory_index[tid]["model_weights_id"]
+            )
+            value = self.replay_buffer._flatten_trajectory(trajectory)[name][
+                row
+            ].clone()
+            return value
+
+        terminal_tid, terminal_row, _ = bad_rows[-1]
+        terminal_reward = row_field(terminal_tid, terminal_row, "rewards")
+        terminal_reward.reshape(-1)[-1] = float(event.terminal_reward)
+        grouped.setdefault(terminal_tid, {})[terminal_row] = {
+            "rewards": terminal_reward,
+            "bootstrap_mask": torch.zeros_like(
+                row_field(terminal_tid, terminal_row, "bootstrap_mask")
+            ),
+            "terminal_type": torch.full_like(
+                row_field(terminal_tid, terminal_row, "terminal_type"), 3
+            ),
+            "branch_id": torch.full_like(
+                row_field(terminal_tid, terminal_row, "branch_id"), 2
+            ),
+            "next_action_override_mask": torch.zeros_like(
+                row_field(terminal_tid, terminal_row, "next_action_override_mask")
+            ),
+        }
+        for current, successor in zip(bad_rows[:-1], bad_rows[1:]):
+            tid, row, _ = current
+            successor_tid, successor_row, _ = successor
+            successor_action = row_field(successor_tid, successor_row, "actions")
+            grouped.setdefault(tid, {})[row] = {
+                "bootstrap_mask": torch.ones_like(
+                    row_field(tid, row, "bootstrap_mask")
+                ),
+                "branch_id": torch.full_like(row_field(tid, row, "branch_id"), 2),
+                "next_action_override": successor_action,
+                "next_action_override_mask": torch.ones_like(
+                    row_field(tid, row, "next_action_override_mask")
+                ),
+            }
+        if event.mode == "credit" and len(rows) > count:
+            predecessor_tid, predecessor_row, _ = rows[-count - 1]
+            prefix_reward = row_field(predecessor_tid, predecessor_row, "rewards")
+            prefix_reward.reshape(-1)[-1] = float(event.prefix_reward)
+            grouped.setdefault(predecessor_tid, {})[predecessor_row] = {
+                "rewards": prefix_reward,
+                "bootstrap_mask": torch.zeros_like(
+                    row_field(predecessor_tid, predecessor_row, "bootstrap_mask")
+                ),
+                "next_action_override_mask": torch.zeros_like(
+                    row_field(
+                        predecessor_tid, predecessor_row, "next_action_override_mask"
+                    )
+                ),
+            }
+        for tid, updates in grouped.items():
+            self._patch_rows(tid, updates)
+        if event.mode == "exit" and len(rows) > count:
+            anchor_tid, anchor_row, _ = rows[-count - 1]
+            bad_tid, bad_row, _ = bad_rows[0]
+            anchor_trajectory = self.replay_buffer._load_trajectory(
+                anchor_tid,
+                self.replay_buffer._trajectory_index[anchor_tid]["model_weights_id"],
+            )
+            anchor_flat = self.replay_buffer._flatten_trajectory(anchor_trajectory)
+            bad_trajectory = self.replay_buffer._load_trajectory(
+                bad_tid,
+                self.replay_buffer._trajectory_index[bad_tid]["model_weights_id"],
+            )
+            bad_flat = self.replay_buffer._flatten_trajectory(bad_trajectory)
+            self._pending_rewind_forks[key] = {
+                "anchor": (anchor_tid, anchor_row),
+                "curr_obs": {
+                    name: value[anchor_row]
+                    for name, value in anchor_flat["next_obs"].items()
+                },
+                "ref_chunk": anchor_flat["next_obs"]["ref_chunk"][anchor_row],
+                "negative_action": bad_flat["actions"][bad_row],
+                "confidence": float(event.confidence),
+                "fork_chunk_id": int(event.chunk_id),
+            }
+        elif event.mode == "credit":
+            self._recovery_root_pending[key] = int(event.chunk_id)
+
+    def _ingest_rewind_events(self, events: list[object] | None) -> None:
+        for event in events or []:
+            event_key = (
+                int(event.episode_id),
+                int(event.session_id),
+                int(event.env_id),
+                int(event.chunk_id),
+                str(event.mode),
+            )
+            if event_key in self._processed_rewind_events:
+                continue
+            self._processed_rewind_events.add(event_key)
+            self._patch_rewind_event(event)
+
+    def _consume_rewind_preferences(self, trajectory: Trajectory) -> None:
+        """Attach the first stored post-fork human or policy replacement."""
+        if trajectory.actions is None:
+            return
+        flat = self.replay_buffer._flatten_trajectory(trajectory)
+        required = (
+            "actions",
+            "curr_obs",
+            "action_source",
+            "record_transition",
+            "rewind_episode_id",
+            "rewind_session_id",
+            "rewind_env_id",
+            "rewind_chunk_id",
+        )
+        if any(key not in flat for key in required):
+            return
+        for row in range(flat["actions"].shape[0]):
+            key = self._row_key(
+                int(flat["rewind_episode_id"][row].reshape(-1)[0]),
+                int(flat["rewind_session_id"][row].reshape(-1)[0]),
+                int(flat["rewind_env_id"][row].reshape(-1)[0]),
+            )
+            fork = self._pending_rewind_forks.get(key)
+            if fork is None:
+                if key in self._recovery_root_pending:
+                    fork_chunk_id = self._recovery_root_pending[key]
+                    rows = [
+                        item
+                        for item in self._rewind_rows.get(key, [])
+                        if item[2] > fork_chunk_id
+                    ]
+                    if rows:
+                        recovery_tid, recovery_row, _ = rows[0]
+                        self._patch_rows(
+                            recovery_tid,
+                            {
+                                recovery_row: {
+                                    "recovery_root": torch.ones((1,), dtype=torch.bool),
+                                }
+                            },
+                        )
+                        del self._recovery_root_pending[key]
+                continue
+            if not bool(flat["record_transition"][row].reshape(-1)[0]):
+                continue
+            chunk_id = int(flat["rewind_chunk_id"][row].reshape(-1)[0])
+            if chunk_id <= int(fork["fork_chunk_id"]):
+                continue
+            action_source = int(flat["action_source"][row].reshape(-1)[0])
+            if action_source not in (ACTION_SOURCE_HUMAN, ACTION_SOURCE_POLICY):
+                continue
+            self.rewind_preference_buffer.add(
+                curr_obs=fork["curr_obs"],
+                ref_chunk=fork["ref_chunk"],
+                positive_action=flat["actions"][row],
+                negative_action=fork["negative_action"],
+                confidence=fork["confidence"],
+                session_key=key,
+            )
+            anchor_tid, anchor_row = fork["anchor"]
+            self._patch_rows(
+                anchor_tid,
+                {
+                    anchor_row: {
+                        "next_action_override": flat["actions"][row],
+                        "next_action_override_mask": torch.ones((1,), dtype=torch.bool),
+                    }
+                },
+            )
+            del self._pending_rewind_forks[key]
 
     def setup_sac_components(self):
         """Initialize replay components and let RLT schedule own readiness."""
         super().setup_sac_components()
         if self.use_rlt_schedule:
             self.buffer_dataset.min_replay_buffer_size = 1
+
+    def save_checkpoint(self, save_base_path, step):
+        super().save_checkpoint(save_base_path, step)
+        import os
+
+        state_path = os.path.join(
+            save_base_path, f"sac_components/rewind_state_rank_{self._rank}.pt"
+        )
+        torch.save(
+            {
+                "preference_buffer": self.rewind_preference_buffer.state_dict(),
+                "pending_forks": self._pending_rewind_forks,
+                "rewind_rows": self._rewind_rows,
+                "recovery_root_pending": self._recovery_root_pending,
+                "processed_rewind_events": self._processed_rewind_events,
+                "committed_transition_ids": self._committed_transition_ids,
+                "processed_episode_ends": self._processed_episode_ends,
+                "schedule": {
+                    "update_step": self.update_step,
+                    "transitions_since_train": self.transitions_since_train,
+                    "episodes_since_train": self.episodes_since_train,
+                    "total_transitions_added": self.total_transitions_added,
+                    "total_episodes_added": self.total_episodes_added,
+                    "warmup_ready_total_transitions": self._warmup_ready_total_transitions,
+                    "warmup_ready_total_episodes": self._warmup_ready_total_episodes,
+                    "pending_update_budget": self.pending_update_budget,
+                },
+            },
+            state_path,
+        )
+
+    def load_checkpoint(self, load_base_path):
+        super().load_checkpoint(load_base_path)
+        import os
+
+        state_path = os.path.join(
+            load_base_path, f"sac_components/rewind_state_rank_{self._rank}.pt"
+        )
+        if not os.path.exists(state_path):
+            return
+        state = torch.load(state_path, map_location="cpu")
+        self.rewind_preference_buffer.load_state_dict(state["preference_buffer"])
+        self._pending_rewind_forks = {
+            key: value
+            for key, value in state.get("pending_forks", {}).items()
+            if "fork_chunk_id" in value
+        }
+        self._rewind_rows = state.get("rewind_rows", {})
+        recovery_pending = state.get("recovery_root_pending", {})
+        self._recovery_root_pending = (
+            recovery_pending if isinstance(recovery_pending, dict) else {}
+        )
+        self._processed_rewind_events = state.get("processed_rewind_events", set())
+        self._committed_transition_ids = state.get("committed_transition_ids", set())
+        self._processed_episode_ends = state.get("processed_episode_ends", set())
+        schedule = state.get("schedule", {})
+        self.update_step = int(schedule.get("update_step", self.update_step))
+        self.transitions_since_train = int(
+            schedule.get("transitions_since_train", self.transitions_since_train)
+        )
+        self.episodes_since_train = int(
+            schedule.get("episodes_since_train", self.episodes_since_train)
+        )
+        self.total_transitions_added = int(
+            schedule.get("total_transitions_added", self.total_transitions_added)
+        )
+        self.total_episodes_added = int(
+            schedule.get("total_episodes_added", self.total_episodes_added)
+        )
+        self._warmup_ready_total_transitions = schedule.get(
+            "warmup_ready_total_transitions", self._warmup_ready_total_transitions
+        )
+        self._warmup_ready_total_episodes = schedule.get(
+            "warmup_ready_total_episodes", self._warmup_ready_total_episodes
+        )
+        self.pending_update_budget = int(
+            schedule.get("pending_update_budget", self.pending_update_budget)
+        )
 
     @Worker.timer("actor/recv_traj")
     async def recv_rollout_trajectories(self, input_channel):
@@ -606,6 +1114,8 @@ class RLTACFSDPPolicy(RLTACLossMixin, RLTACReplayMixin, EmbodiedSACFSDPPolicy):
         train_every_transitions = int(schedule_cfg.get("train_every_transitions", 0))
         train_every_episodes = int(schedule_cfg.get("train_every_episodes", 0))
         update_epoch = int(self.cfg.algorithm.get("update_epoch", 1))
+        utd_ratio = int(schedule_cfg.get("utd_ratio", 0))
+        episode_boundary_only = bool(schedule_cfg.get("episode_boundary_only", False))
         max_updates = int(schedule_cfg.get("max_updates_per_train_step", 0))
 
         updates_to_run = 0
@@ -613,10 +1123,12 @@ class RLTACFSDPPolicy(RLTACLossMixin, RLTACReplayMixin, EmbodiedSACFSDPPolicy):
         desired_total_updates = 0
         pending_updates = 0
         updates_scheduled = 0
-        if update_epoch <= 0:
+        if update_epoch <= 0 and utd_ratio <= 0:
             skip_reason = 3
         elif not buffer_ready:
             skip_reason = 1
+        elif episode_boundary_only and counters["episodes_since_train"] <= 0:
+            skip_reason = 4
         else:
             online_transitions = max(
                 int(counters["total_transitions_added"])
@@ -628,7 +1140,11 @@ class RLTACFSDPPolicy(RLTACLossMixin, RLTACReplayMixin, EmbodiedSACFSDPPolicy):
                 - int(self._warmup_ready_total_episodes or 0),
                 0,
             )
-            if train_every_transitions <= 0 and train_every_episodes <= 0:
+            if utd_ratio > 0:
+                desired_total_updates = (
+                    int(counters["total_transitions_added"]) * utd_ratio
+                )
+            elif train_every_transitions <= 0 and train_every_episodes <= 0:
                 online_cycles = online_transitions
             else:
                 transition_cycles = (
@@ -642,9 +1158,10 @@ class RLTACFSDPPolicy(RLTACLossMixin, RLTACReplayMixin, EmbodiedSACFSDPPolicy):
                     else 0
                 )
                 online_cycles = max(transition_cycles, episode_cycles)
-            desired_total_updates = (
-                warmup_required_updates + online_cycles * update_epoch
-            )
+            if utd_ratio <= 0:
+                desired_total_updates = (
+                    warmup_required_updates + online_cycles * update_epoch
+                )
             pending_updates = max(desired_total_updates - int(self.update_step), 0)
             updates_scheduled = pending_updates
             updates_to_run = pending_updates
@@ -661,6 +1178,8 @@ class RLTACFSDPPolicy(RLTACLossMixin, RLTACReplayMixin, EmbodiedSACFSDPPolicy):
             ),
             "rlt/warmup_required_updates": float(warmup_required_updates),
             "rlt/update_epoch": float(update_epoch),
+            "rlt/utd_ratio": float(utd_ratio),
+            "rlt/episode_boundary_only": float(episode_boundary_only),
             "rlt/max_updates_per_train_step": float(max_updates),
             "rlt/train_every_transitions": float(train_every_transitions),
             "rlt/train_every_episodes": float(train_every_episodes),

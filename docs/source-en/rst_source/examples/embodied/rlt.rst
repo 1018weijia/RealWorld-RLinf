@@ -462,6 +462,62 @@ The default keyboard module implements the key phase switch used by RLT: press
 customized for the task in
 ``rlinf/envs/realworld/common/wrappers/keyboard_rlt_policy_switch_wrapper.py``.
 
+Run the Cobot Stage 2 Example
+-----------------------------
+
+Use the Cobot adapter to collect intervention-aware, chunk-aligned transitions on a robot node while the GPU node trains the Stage 2 TD3 head through RLinf Ray.
+
+The configuration is ``examples/embodiment/config/cobot_rlt_stage2_td3_mlp.yaml``. It uses ``CobotEnv-v1``, a 14-D action/state contract, three image views, ``rlt_td3_mlp_policy``, and ``rlt_intervention_metadata``. The checked-in environment is dummy by default so you can validate configuration without robot hardware.
+
+Set the Stage 1 checkpoint, normalization statistics, and local controller factory before launch.
+
+.. code-block:: yaml
+
+   env:
+     train:
+       override_cfg:
+         is_dummy: false
+         controller_factory: your_package.controller:create_adapter
+         action_dim: 14
+         state_dim: 14
+
+.. code-block:: bash
+
+   export RLINF_NODE_RANK=1  # set before starting Ray on the robot node
+   ray start --address=<gpu-head-ip>:6379
+
+On the GPU node, start Ray with ``RLINF_NODE_RANK=0`` and run:
+
+.. code-block:: bash
+
+   export RLINF_NODE_RANK=0
+   ray start --head --port=6379 --node-ip-address=<gpu-head-ip>
+   python examples/embodiment/train_embodied_agent.py \
+       --config-name cobot_rlt_stage2_td3_mlp \
+       rollout.rlt_feature_model.model_path=/path/to/stage1/actor \
+       rollout.rlt_feature_model.openpi_data.norm_stats_path=/path/to/norm_stats.json
+
+The adapter executes and safety-checks actions locally. It returns the observation captured after the final action in each chunk. RLinf sends the resulting transition through Ray to the actor replay buffer; no WebSocket learner or second replay service is created. A human takeover stores the executed intervention action and sets the BC target accordingly. Safety faults and operator aborts set ``bootstrap_mask=0``.
+
+.. warning::
+
+   Do not enable a real controller until its adapter implements local clipping, watchdog, emergency stop, reset, and ``execute`` semantics. Keep ``is_dummy: true`` until ``controller_factory`` and all Stage 1 / Stage 2 action, state, image, and normalization dimensions match.
+
+Rewind correction is chunk-aligned. A rewind-capable controller records completed
+chunks locally and emits either ``rewind_exit`` or ``rewind_credit`` at a boundary.
+``rewind_exit`` physically reverses locally, marks the pre-rewind bad branch with
+the configured terminal credit and zero bootstrap, then waits for the first
+committed recovery action. That replacement action, whether executed by a human or
+the policy, and the bad fork action create a pair used by the critic hinge ranking
+and actor Bradley-Terry preference losses. ``rewind_credit`` never moves the robot;
+it only applies branch credit and creates a new replay root.
+
+The physical controller must keep action history, clipping, watchdog, emergency
+stop, reset, and rollback abort local. A Ray or GPU failure must leave the controller
+able to stop safely; no rewind command is accepted from the learner. Disable chunk
+prefetch during physical collection so every recorded row has a real pre-chunk
+snapshot and post-chunk observation.
+
 Run the ManiSkill Joint Example
 -------------------------------
 
@@ -637,7 +693,7 @@ To run the TD3-MLP variant, apply the same Stage 1 checkpoint settings to
 
 This variant is currently configured only for ManiSkill simulation. It keeps
 the frozen Stage 1 features and transition replay path, while replacing the
-Stage 2 policy and update objective with a direct TD3 actor and twin-Q critic.
+Stage 2 policy and update objective with a residual TD3 actor and twin-Q critic.
 
 This config starts actor, rollout, and ManiSkill env workers. The rollout side
 freezes ``rollout.rlt_feature_model`` and only synchronizes the Stage 2 MLP

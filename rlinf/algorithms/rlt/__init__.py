@@ -14,9 +14,11 @@
 
 from rlinf.algorithms.expert import build_expert_model_config
 from rlinf.algorithms.rlt.losses import (
+    actor_pairwise_preference_loss,
     compute_q_node1_gap,
     compute_rlt_actor_loss,
     compute_rlt_critic_loss,
+    critic_pairwise_rank_loss,
 )
 from rlinf.algorithms.rlt.progress_head import (
     ProgressHeadEnsemble,
@@ -35,6 +37,7 @@ from rlinf.algorithms.rlt.route import (
 )
 from rlinf.algorithms.rlt.transition import (
     annotate_rlt_branch_fields,
+    branch_fields_from_env_info,
     use_simulator_transition_replay,
 )
 
@@ -45,11 +48,14 @@ __all__ = [
     "RealworldRLTRoute",
     "SimulatorRLTRoute",
     "annotate_rlt_branch_fields",
+    "branch_fields_from_env_info",
     "build_expert_model_config",
     "build_rlt_route",
     "compute_q_node1_gap",
     "compute_rlt_actor_loss",
     "compute_rlt_critic_loss",
+    "actor_pairwise_preference_loss",
+    "critic_pairwise_rank_loss",
     "predict_rlt_actions",
     "progress_d2_ranking_loss",
     "progress_head_loss",

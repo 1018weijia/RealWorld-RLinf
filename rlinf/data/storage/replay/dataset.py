@@ -53,6 +53,7 @@ class ReplayBufferDataset(IterableDataset):
         batch_size: int,
         min_replay_buffer_size: int,
         min_demo_buffer_size: int,
+        allow_empty_demo: bool = False,
         **kwargs: Any,
     ) -> None:
         """Initializes the ReplayBufferDataset.
@@ -74,6 +75,7 @@ class ReplayBufferDataset(IterableDataset):
         self.min_replay_buffer_size = min_replay_buffer_size
         self.min_demo_buffer_size = min_demo_buffer_size
         self.batch_size = batch_size
+        self.allow_empty_demo = bool(allow_empty_demo)
 
     def __iter__(self) -> Iterator[dict[str, torch.Tensor]]:
         """Returns an infinite iterator that yields batches.
@@ -90,18 +92,23 @@ class ReplayBufferDataset(IterableDataset):
             is_ready = True
             if not self.replay_buffer.is_ready(self.min_replay_buffer_size):
                 is_ready = False
-            if self.demo_buffer is not None and not self.demo_buffer.is_ready(
-                self.min_demo_buffer_size
+            if (
+                self.demo_buffer is not None
+                and not self.allow_empty_demo
+                and not self.demo_buffer.is_ready(self.min_demo_buffer_size)
             ):
                 is_ready = False
 
             if is_ready:
-                if self.demo_buffer is not None:
+                if self.demo_buffer is not None and self.demo_buffer.total_samples > 0:
                     replay_batch = self.replay_buffer.sample(self.batch_size // 2)
                     demo_batch = self.demo_buffer.sample(self.batch_size // 2)
+                    online_count = replay_batch["weights"].shape[0]
                     batch = concat_batch(replay_batch, demo_batch)
+                    batch["_per_online_count"] = torch.tensor(online_count)
                 else:
                     batch = self.replay_buffer.sample(self.batch_size)
+                    batch["_per_online_count"] = torch.tensor(batch["weights"].shape[0])
                 yield batch
 
     def close(self) -> None:
@@ -142,6 +149,7 @@ class PreloadReplayBufferDataset(ReplayBufferDataset):
         min_replay_buffer_size: int,
         min_demo_buffer_size: int,
         prefetch_size: int = 5,
+        allow_empty_demo: bool = False,
     ) -> None:
         """Initializes the PreloadReplayBufferDataset.
 
@@ -167,6 +175,7 @@ class PreloadReplayBufferDataset(ReplayBufferDataset):
 
         self.batch_size = batch_size
         self.prefetch_size = prefetch_size
+        self.allow_empty_demo = bool(allow_empty_demo)
         assert self.prefetch_size > 0, f"{self.prefetch_size=} must be greater than 0"
 
         self.preload_queue = queue.Queue(maxsize=prefetch_size)
@@ -189,18 +198,23 @@ class PreloadReplayBufferDataset(ReplayBufferDataset):
             is_ready = True
             if not self.replay_buffer.is_ready(self.min_replay_buffer_size):
                 is_ready = False
-            if self.demo_buffer is not None and not self.demo_buffer.is_ready(
-                self.min_demo_buffer_size
+            if (
+                self.demo_buffer is not None
+                and not self.allow_empty_demo
+                and not self.demo_buffer.is_ready(self.min_demo_buffer_size)
             ):
                 is_ready = False
 
             if is_ready:
-                if self.demo_buffer is not None:
+                if self.demo_buffer is not None and self.demo_buffer.total_samples > 0:
                     replay_batch = self.replay_buffer.sample(self.batch_size // 2)
                     demo_batch = self.demo_buffer.sample(self.batch_size // 2)
+                    online_count = replay_batch["weights"].shape[0]
                     batch = concat_batch(replay_batch, demo_batch)
+                    batch["_per_online_count"] = torch.tensor(online_count)
                 else:
                     batch = self.replay_buffer.sample(self.batch_size)
+                    batch["_per_online_count"] = torch.tensor(batch["weights"].shape[0])
             else:
                 time.sleep(3)
                 continue

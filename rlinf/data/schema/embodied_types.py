@@ -52,6 +52,8 @@ class EnvOutput:
     intervene_actions: Optional[torch.Tensor] = None  # [B]
     intervene_flags: Optional[torch.Tensor] = None  # [B]
     rlt_switch_flags: Optional[torch.Tensor] = None  # [B] or [B, action_chunk]
+    record_transition: Optional[torch.Tensor] = None  # [B], false for event-only steps
+    rewind_events: Optional[list[Any]] = None
 
     def __post_init__(self):
         self.obs = put_tensor_device(self.obs, "cpu")
@@ -92,6 +94,11 @@ class EnvOutput:
         self.rlt_switch_flags = (
             self.rlt_switch_flags.cpu().contiguous()
             if self.rlt_switch_flags is not None
+            else None
+        )
+        self.record_transition = (
+            self.record_transition.cpu().contiguous()
+            if self.record_transition is not None
             else None
         )
 
@@ -210,6 +217,9 @@ class EnvOutput:
             ]
             merged_final_obs = _merge_obs_dicts(final_obs_or_obs)
 
+        merged_rewind_events = []
+        for env_output in env_outputs:
+            merged_rewind_events.extend(env_output.get("rewind_events") or [])
         return EnvOutput(
             obs=merged_obs,
             final_obs=merged_final_obs,
@@ -226,6 +236,10 @@ class EnvOutput:
             rlt_switch_flags=_merge_optional_tensor_field(
                 "rlt_switch_flags", allow_partial_none=True, fill_value=False
             ),
+            record_transition=_merge_optional_tensor_field(
+                "record_transition", allow_partial_none=True, fill_value=True
+            ),
+            rewind_events=merged_rewind_events or None,
         ).to_dict()
 
     def to_dict(self) -> dict[str, Any]:
@@ -244,6 +258,8 @@ class EnvOutput:
             "intervene_actions": self.intervene_actions,
             "intervene_flags": self.intervene_flags,
             "rlt_switch_flags": self.rlt_switch_flags,
+            "record_transition": self.record_transition,
+            "rewind_events": self.rewind_events,
         }
 
 
@@ -293,6 +309,8 @@ class PolicyOutput:
     intervene_flags: torch.Tensor = None  # [B, num_action_chunks]
     forward_inputs: dict[str, torch.Tensor] = field(default_factory=dict)
     versions: torch.Tensor = None  # [B, 1]
+    record_transition: torch.Tensor | None = None
+    rewind_events: list[Any] | None = None
 
     def __post_init__(self):
         if self.actions is not None:
@@ -354,6 +372,8 @@ class ChunkStepResult:
     rewards: torch.Tensor = None  # [B, 1]
     forward_inputs: dict[str, torch.Tensor] = field(default_factory=dict)
     versions: torch.Tensor = None  # [B, 1]
+    record_transition: torch.Tensor | None = None
+    rewind_events: list[Any] | None = None
 
     def __post_init__(self):
         if self.actions is not None:
@@ -374,6 +394,8 @@ class ChunkStepResult:
             self.forward_inputs = put_tensor_device(self.forward_inputs, "cpu")
         if self.versions is not None:
             self.versions = self.versions.cpu().contiguous()
+        if self.record_transition is not None:
+            self.record_transition = self.record_transition.cpu().contiguous()
 
 
 @dataclass
@@ -407,6 +429,21 @@ class Trajectory:
     # String / object metadata is stored outside Trajectory tensors when needed.
     anchor_id: Any | None = None
     rollback_confirmed: torch.Tensor | None = None
+    # Chunk-aligned rewind metadata. Zero rewind_mode means ordinary execution.
+    rewind_mode: torch.Tensor | None = None
+    rewind_episode_id: torch.Tensor | None = None
+    rewind_session_id: torch.Tensor | None = None
+    rewind_env_id: torch.Tensor | None = None
+    rewind_chunk_id: torch.Tensor | None = None
+    next_action_override: torch.Tensor | None = None
+    next_action_override_mask: torch.Tensor | None = None
+    record_transition: torch.Tensor | None = None
+    rewind_chunks: torch.Tensor | None = None
+    rewind_terminal_reward: torch.Tensor | None = None
+    rewind_prefix_reward: torch.Tensor | None = None
+    rewind_confidence: torch.Tensor | None = None
+    recovery_root: torch.Tensor | None = None
+    rewind_events: list[Any] = field(default_factory=list)
 
     @staticmethod
     def _generate_field_mask(
@@ -511,6 +548,21 @@ class Trajectory:
                     progress_mask=apply_mask(self.progress_mask, i),
                     auto_trigger=apply_mask(self.auto_trigger, i),
                     rollback_confirmed=apply_mask(self.rollback_confirmed, i),
+                    rewind_mode=apply_mask(self.rewind_mode, i),
+                    rewind_episode_id=apply_mask(self.rewind_episode_id, i),
+                    rewind_session_id=apply_mask(self.rewind_session_id, i),
+                    rewind_env_id=apply_mask(self.rewind_env_id, i),
+                    rewind_chunk_id=apply_mask(self.rewind_chunk_id, i),
+                    next_action_override=apply_mask(self.next_action_override, i),
+                    next_action_override_mask=apply_mask(
+                        self.next_action_override_mask, i
+                    ),
+                    record_transition=apply_mask(self.record_transition, i),
+                    rewind_chunks=apply_mask(self.rewind_chunks, i),
+                    rewind_terminal_reward=apply_mask(self.rewind_terminal_reward, i),
+                    rewind_prefix_reward=apply_mask(self.rewind_prefix_reward, i),
+                    rewind_confidence=apply_mask(self.rewind_confidence, i),
+                    recovery_root=apply_mask(self.recovery_root, i),
                 )
             )
         return filtered_trajectories if filtered_trajectories else None

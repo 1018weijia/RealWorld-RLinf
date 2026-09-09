@@ -22,11 +22,14 @@ from types import SimpleNamespace
 import torch
 
 from rlinf.algorithms.rlt.losses import (
+    actor_pairwise_preference_loss,
     compute_q_node1_gap,
     compute_rlt_actor_loss,
     compute_rlt_critic_loss,
+    critic_pairwise_rank_loss,
 )
 from rlinf.algorithms.rlt.offline_demo_transitions import make_synthetic_offline_batch
+from rlinf.algorithms.rlt.preference import RewindPreferenceBuffer
 from rlinf.algorithms.rlt.progress_head import (
     ProgressHeadEnsemble,
     progress_d2_ranking_loss,
@@ -37,11 +40,14 @@ from rlinf.algorithms.rlt.transition import (
     RLT_BRANCH_FIELDS,
     RLT_OBS_KEYS,
     annotate_rlt_branch_fields,
+    branch_fields_from_env_info,
     extract_rlt_obs_from_forward_inputs,
     update_rlt_transitions,
 )
 from rlinf.data.schema.embodied_trajectory_builder import EmbodiedTrajectoryBuilder
 from rlinf.data.schema.embodied_types import Trajectory
+from rlinf.data.storage.replay.buffer import TrajectoryReplayBuffer
+from rlinf.envs.realworld.cobot.control import MockRewindAdapter
 from rlinf.models.embodiment.mlp_policy.rlt_mlp_policy import RLTMLPPolicy
 
 Z_DIM, PROPRIO_DIM, ACTION_DIM, CHUNK_LEN, BATCH = 16, 4, 4, 3, 4
@@ -134,7 +140,12 @@ def test_stage2_losses_bootstrap_and_offline():
 def test_progress_head_voc_and_d2():
     torch.manual_seed(0)
     head = ProgressHeadEnsemble(
-        embedding_dim=Z_DIM, num_heads=3, num_bins=8, hidden_dim=32, mlp_layers=1, dropout=0.0
+        embedding_dim=Z_DIM,
+        num_heads=3,
+        num_bins=8,
+        hidden_dim=32,
+        mlp_layers=1,
+        dropout=0.0,
     )
     labels = voc_progress_labels(BATCH)
     out = head(torch.randn(BATCH, Z_DIM))
@@ -201,3 +212,185 @@ def test_branch_fields_and_transition_update():
         raise AssertionError("expected ValueError")
     except ValueError as exc:
         assert "Missing RLT forward_inputs keys" in str(exc)
+
+
+def test_realworld_intervention_metadata_contract():
+    fields = branch_fields_from_env_info(
+        {"rlt_bootstrap_mask": torch.tensor([0.0, 1.0])},
+        batch_size=2,
+        device=torch.device("cpu"),
+        intervene_flags=torch.tensor([[True, False], [False, False]]),
+    )
+    assert fields["bootstrap_mask"].reshape(-1).tolist() == [0.0, 1.0]
+    assert fields["branch_id"].reshape(-1).tolist() == [6, 0]
+    assert fields["terminal_type"].reshape(-1).tolist() == [4, 0]
+    assert fields["action_source"].reshape(-1).tolist() == [2, 1]
+
+
+def test_intervention_branch_metadata_distinguishes_executed_action():
+    fields = branch_fields_from_env_info(
+        {"rlt_bootstrap_mask": torch.ones(1)},
+        batch_size=1,
+        device=torch.device("cpu"),
+        intervene_flags=torch.zeros(1, 2, dtype=torch.bool),
+    )
+    assert fields["action_source"].item() == 1
+    assert fields["bootstrap_mask"].item() == 1.0
+
+
+def test_rewind_preference_losses_and_buffer():
+    model = _policy()
+    batch = _batch()
+    preference = RewindPreferenceBuffer(capacity=2)
+    preference.add(
+        curr_obs={key: value[0] for key, value in batch["curr_obs"].items()},
+        ref_chunk=batch["curr_obs"]["ref_chunk"][0],
+        positive_action=batch["actions"][0],
+        negative_action=batch["actions"][1],
+        action_mask=torch.ones(CHUNK_LEN, ACTION_DIM, dtype=torch.bool),
+        confidence=0.8,
+    )
+    sampled = preference.sample(4, torch.device("cpu"))
+    assert sampled is not None and sampled["positive_action"].shape[0] == 1
+    critic_loss, critic_metrics = critic_pairwise_rank_loss(
+        model=model,
+        curr_obs=sampled["curr_obs"],
+        ref_chunk=sampled["ref_chunk"],
+        positive_action=sampled["positive_action"],
+        negative_action=sampled["negative_action"],
+        action_mask=sampled["action_mask"],
+        confidence=sampled["confidence"],
+        margin=0.1,
+    )
+    action_mean, _, _ = model.sac_forward(sampled["curr_obs"], deterministic=True)
+    actor_loss, actor_metrics = actor_pairwise_preference_loss(
+        action_mean=action_mean,
+        ref_chunk=sampled["ref_chunk"],
+        positive_action=sampled["positive_action"],
+        negative_action=sampled["negative_action"],
+        action_mask=sampled["action_mask"],
+        confidence=sampled["confidence"],
+        fixed_std=model.fixed_std,
+        beta=1.0,
+    )
+    assert torch.isfinite(critic_loss) and torch.isfinite(actor_loss)
+    assert critic_metrics["preference_pair_count"] == 1.0
+    assert "preference_logprob_gap" in actor_metrics
+
+
+def test_mock_cobot_rewind_state_machine():
+    adapter = MockRewindAdapter(action_dim=2, task="test", history_size=2)
+    adapter.reset()
+    adapter.execute([0.2, 0.3])
+    adapter.execute([0.4, 0.5])
+    adapter.request_rewind_exit(chunks_rewound=1, terminal_reward=-2.0)
+    event = adapter.poll_rewind_event()
+    assert event is not None and event.mode == "exit"
+    assert torch.allclose(
+        torch.as_tensor(adapter.rewind_chunks(event.chunks_rewound).state),
+        torch.tensor([0.2, 0.3]),
+    )
+    adapter.request_rewind_credit(
+        bad_chunks=1, terminal_reward=-1.0, prefix_reward=-0.1
+    )
+    credit = adapter.poll_rewind_event()
+    assert (
+        credit is not None and credit.mode == "credit" and credit.prefix_reward == -0.1
+    )
+    adapter.stop("test")
+    assert adapter.execute([0.0, 0.0]).terminated
+
+
+def test_rewind_event_branch_fields():
+    event = SimpleNamespace(
+        mode="exit",
+        chunks_rewound=2,
+        terminal_reward=-2.0,
+        prefix_reward=-0.1,
+        confidence=0.7,
+    )
+    fields = branch_fields_from_env_info(
+        {"rlt_rewind_event": event, "rlt_recovery_root": True},
+        batch_size=1,
+        device=torch.device("cpu"),
+    )
+    assert fields["rewind_mode"].item() == 1
+    assert fields["rewind_chunks"].item() == 2
+    assert fields["recovery_root"].item() is True
+
+
+def _rewind_trajectory() -> Trajectory:
+    """One-session d,e,f,g trace with executable next-action fields."""
+    steps, envs = 4, 1
+    actions = torch.arange(steps * CHUNK_LEN * ACTION_DIM, dtype=torch.float32).reshape(
+        steps, envs, -1
+    )
+    obs = {
+        "z_rl": torch.randn(steps, envs, Z_DIM),
+        "proprio": torch.randn(steps, envs, PROPRIO_DIM),
+        "ref_chunk": torch.randn(steps, envs, CHUNK_LEN, ACTION_DIM),
+    }
+    return Trajectory(
+        max_episode_length=steps,
+        model_weights_id="rewind",
+        actions=actions,
+        rewards=torch.zeros(steps, envs, CHUNK_LEN),
+        terminations=torch.zeros(steps, envs, 1, dtype=torch.bool),
+        curr_obs=obs,
+        next_obs={key: value.clone() for key, value in obs.items()},
+        bootstrap_mask=torch.ones(steps, envs, 1),
+        branch_id=torch.zeros(steps, envs, 1, dtype=torch.long),
+        terminal_type=torch.zeros(steps, envs, 1, dtype=torch.long),
+        next_action_override=torch.zeros_like(actions),
+        next_action_override_mask=torch.zeros(steps, envs, 1, dtype=torch.bool),
+        record_transition=torch.ones(steps, envs, 1, dtype=torch.bool),
+        rewind_episode_id=torch.ones(steps, envs, 1, dtype=torch.long),
+        rewind_session_id=torch.zeros(steps, envs, 1, dtype=torch.long),
+        rewind_env_id=torch.zeros(steps, envs, 1, dtype=torch.long),
+        rewind_chunk_id=torch.arange(steps).reshape(steps, envs, 1),
+    )
+
+
+def test_replay_buffer_filters_event_only_rows():
+    trajectory = _rewind_trajectory()
+    trajectory.record_transition[2] = False
+    buffer = TrajectoryReplayBuffer(auto_save=False, sample_window_size=10)
+    buffer.add_trajectories([trajectory])
+    batch = buffer.sample(20)
+    assert batch["record_transition"].bool().all()
+    assert not (batch["rewind_chunk_id"].reshape(-1) == 2).any()
+
+
+def test_critic_target_prefers_executed_next_action_override():
+    class _Target:
+        def __call__(self, *, forward_type, obs, actions):
+            del forward_type, obs
+            values = actions.reshape(actions.shape[0], -1).sum(dim=-1)
+            return torch.stack([values, values], dim=-1)
+
+    class _Model(_Target):
+        def __call__(self, *, forward_type, obs, actions=None):
+            if actions is None:
+                return (
+                    torch.zeros(obs["z_rl"].shape[0], CHUNK_LEN * ACTION_DIM),
+                    None,
+                    None,
+                )
+            return super().__call__(forward_type=forward_type, obs=obs, actions=actions)
+
+    batch = _batch(rewards=torch.zeros(BATCH, CHUNK_LEN))
+    override = torch.full_like(batch["actions"], 2.0)
+    batch["next_action_override"] = override
+    batch["next_action_override_mask"] = torch.ones(BATCH, 1, dtype=torch.bool)
+    loss_override, metrics = compute_rlt_critic_loss(
+        model=_Model(), target_model=_Target(), batch=batch, gamma=0.9
+    )
+    batch.pop("next_action_override")
+    batch.pop("next_action_override_mask")
+    loss_policy, _ = compute_rlt_critic_loss(
+        model=_Model(), target_model=_Target(), batch=batch, gamma=0.9
+    )
+    assert (
+        torch.isfinite(loss_override) and metrics["next_action_override_ratio"] == 1.0
+    )
+    assert not torch.allclose(loss_override, loss_policy)

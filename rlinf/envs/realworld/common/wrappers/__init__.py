@@ -35,6 +35,7 @@ from .reward_done_wrapper import (
     KeyboardRewardDoneMultiStageWrapper,
     KeyboardRewardDoneWrapper,
 )
+from .rlt_intervention_metadata import RLTInterventionMetadataWrapper
 from .spacemouse_intervention import SpacemouseIntervention
 
 if TYPE_CHECKING:
@@ -56,6 +57,7 @@ __all__ = [
     "LeaderFollowerKeyboardIntervention",
     "Quat2EulerWrapper",
     "RelativeFrame",
+    "RLTInterventionMetadataWrapper",
     "SpacemouseIntervention",
     "apply_dual_franka_joint_wrappers",
     "apply_single_arm_wrappers",

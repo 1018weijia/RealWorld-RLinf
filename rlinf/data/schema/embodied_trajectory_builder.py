@@ -77,8 +77,33 @@ class EmbodiedTrajectoryBuilder:
     progress_mask: list[torch.Tensor] = field(default_factory=list)
     auto_trigger: list[torch.Tensor] = field(default_factory=list)
     rollback_confirmed: list[torch.Tensor] = field(default_factory=list)
+    rewind_mode: list[torch.Tensor] = field(default_factory=list)
+    rewind_episode_id: list[torch.Tensor] = field(default_factory=list)
+    rewind_session_id: list[torch.Tensor] = field(default_factory=list)
+    rewind_env_id: list[torch.Tensor] = field(default_factory=list)
+    rewind_chunk_id: list[torch.Tensor] = field(default_factory=list)
+    next_action_override: list[torch.Tensor] = field(default_factory=list)
+    next_action_override_mask: list[torch.Tensor] = field(default_factory=list)
+    record_transition: list[torch.Tensor] = field(default_factory=list)
+    rewind_chunks: list[torch.Tensor] = field(default_factory=list)
+    rewind_terminal_reward: list[torch.Tensor] = field(default_factory=list)
+    rewind_prefix_reward: list[torch.Tensor] = field(default_factory=list)
+    rewind_confidence: list[torch.Tensor] = field(default_factory=list)
+    recovery_root: list[torch.Tensor] = field(default_factory=list)
+    rewind_events: list[Any] = field(default_factory=list)
+
+    def append_rewind_events(self, events: list[Any] | None) -> None:
+        """Keep rewind decisions separate from executable replay rows."""
+        if events:
+            self.rewind_events.extend(events)
 
     def append_step_result(self, result: ChunkStepResult):
+        if result.record_transition is not None and not bool(
+            torch.as_tensor(result.record_transition).all()
+        ):
+            self.append_rewind_events(result.rewind_events)
+            return
+        self.append_rewind_events(result.rewind_events)
         if result.actions is not None:
             self.actions.append(result.actions)
             self.intervene_flags.append(
@@ -100,6 +125,23 @@ class EmbodiedTrajectoryBuilder:
             self.versions.append(result.versions)
         if result.forward_inputs:
             self.forward_inputs.append(result.forward_inputs)
+
+    def discard_last_step(self) -> None:
+        """Discard a proposed action that the environment did not execute."""
+        for store in (
+            self.actions,
+            self.intervene_flags,
+            self.rewards,
+            self.terminations,
+            self.truncations,
+            self.dones,
+            self.prev_logprobs,
+            self.prev_values,
+            self.versions,
+            self.forward_inputs,
+        ):
+            if store:
+                store.pop()
 
     def mark_last_step_with_intervene_flags(self, intervene_flags: torch.Tensor):
         if not self.intervene_flags:
@@ -181,6 +223,19 @@ class EmbodiedTrajectoryBuilder:
             "progress_mask": self.progress_mask,
             "auto_trigger": self.auto_trigger,
             "rollback_confirmed": self.rollback_confirmed,
+            "rewind_mode": self.rewind_mode,
+            "rewind_episode_id": self.rewind_episode_id,
+            "rewind_session_id": self.rewind_session_id,
+            "rewind_env_id": self.rewind_env_id,
+            "rewind_chunk_id": self.rewind_chunk_id,
+            "next_action_override": self.next_action_override,
+            "next_action_override_mask": self.next_action_override_mask,
+            "record_transition": self.record_transition,
+            "rewind_chunks": self.rewind_chunks,
+            "rewind_terminal_reward": self.rewind_terminal_reward,
+            "rewind_prefix_reward": self.rewind_prefix_reward,
+            "rewind_confidence": self.rewind_confidence,
+            "recovery_root": self.recovery_root,
         }
         for key, store in mapping.items():
             value = branch_fields.get(key)
@@ -211,6 +266,20 @@ class EmbodiedTrajectoryBuilder:
         self.progress_mask.clear()
         self.auto_trigger.clear()
         self.rollback_confirmed.clear()
+        self.rewind_mode.clear()
+        self.rewind_episode_id.clear()
+        self.rewind_session_id.clear()
+        self.rewind_env_id.clear()
+        self.rewind_chunk_id.clear()
+        self.next_action_override.clear()
+        self.next_action_override_mask.clear()
+        self.record_transition.clear()
+        self.rewind_chunks.clear()
+        self.rewind_terminal_reward.clear()
+        self.rewind_prefix_reward.clear()
+        self.rewind_confidence.clear()
+        self.recovery_root.clear()
+        self.rewind_events.clear()
 
     def to_trajectory(self) -> Trajectory:
         trajectory = Trajectory(
@@ -273,6 +342,22 @@ class EmbodiedTrajectoryBuilder:
         trajectory.progress_mask = _stack_optional(self.progress_mask)
         trajectory.auto_trigger = _stack_optional(self.auto_trigger)
         trajectory.rollback_confirmed = _stack_optional(self.rollback_confirmed)
+        trajectory.rewind_mode = _stack_optional(self.rewind_mode)
+        trajectory.rewind_episode_id = _stack_optional(self.rewind_episode_id)
+        trajectory.rewind_session_id = _stack_optional(self.rewind_session_id)
+        trajectory.rewind_env_id = _stack_optional(self.rewind_env_id)
+        trajectory.rewind_chunk_id = _stack_optional(self.rewind_chunk_id)
+        trajectory.next_action_override = _stack_optional(self.next_action_override)
+        trajectory.next_action_override_mask = _stack_optional(
+            self.next_action_override_mask
+        )
+        trajectory.record_transition = _stack_optional(self.record_transition)
+        trajectory.rewind_chunks = _stack_optional(self.rewind_chunks)
+        trajectory.rewind_terminal_reward = _stack_optional(self.rewind_terminal_reward)
+        trajectory.rewind_prefix_reward = _stack_optional(self.rewind_prefix_reward)
+        trajectory.rewind_confidence = _stack_optional(self.rewind_confidence)
+        trajectory.recovery_root = _stack_optional(self.recovery_root)
+        trajectory.rewind_events = list(self.rewind_events)
 
         trajectory.model_weights_id = get_model_weights_id(
             trajectory.versions
@@ -287,6 +372,8 @@ class EmbodiedTrajectoryBuilder:
         splited_trajectories: list[Trajectory] = [
             Trajectory() for _ in range(split_size)
         ]
+        for split_trajectory in splited_trajectories:
+            split_trajectory.rewind_events = list(all_trajectory.rewind_events)
 
         if len(all_trajectory.curr_obs) > 0:
             splited_obs = split_dict_to_chunk(
@@ -338,6 +425,8 @@ class EmbodiedTrajectoryBuilder:
     ) -> list[Trajectory]:
         trajectory = self.to_trajectory()
         trajectories = [Trajectory() for _ in split_sizes]
+        for split_trajectory in trajectories:
+            split_trajectory.rewind_events = list(trajectory.rewind_events)
 
         for field_name in trajectory.__dataclass_fields__:
             value = getattr(trajectory, field_name)

@@ -14,6 +14,7 @@
 
 import torch
 
+from rlinf.algorithms.rlt import losses as rlt_losses
 from rlinf.models.embodiment.base_policy import ForwardType
 from rlinf.scheduler import Worker
 from rlinf.workers.actor.fsdp_rlt_ac_policy_worker import (
@@ -26,10 +27,54 @@ class RLTTD3LossMixin(RLTACLossMixin):
     """Ablation-style TD3 actor objective over current RLT replay fields."""
 
     def _next_actions_for_critic_target(self, next_obs):
-        return self.target_model(
+        expo_cfg = self.cfg.algorithm.get("expo", {}) or {}
+        if not bool(expo_cfg.get("enable", False)):
+            return self.target_model(
+                forward_type=ForwardType.SAC,
+                obs=next_obs,
+            )
+
+        chunk_len, action_dim = self._chunk_shape()
+        candidates = next_obs.get("ref_candidates")
+        if candidates is None:
+            candidates = next_obs["ref_chunk"].unsqueeze(1)
+        candidates = candidates.reshape(
+            candidates.shape[0], candidates.shape[1], -1, action_dim
+        )[:, :, :chunk_len]
+        num_base = min(int(expo_cfg.get("base_candidates", 4)), candidates.shape[1])
+        bases = candidates[:, :num_base].reshape(candidates.shape[0], num_base, -1)
+        num_edits = min(int(expo_cfg.get("edited_candidates", 4)), num_base)
+        if num_edits <= 0:
+            return bases
+
+        edit_obs = {}
+        for key, value in next_obs.items():
+            if torch.is_tensor(value) and value.shape[0] == bases.shape[0]:
+                edit_obs[key] = value.repeat_interleave(num_edits, dim=0)
+            else:
+                edit_obs[key] = value
+        edit_obs["ref_chunk"] = bases[:, :num_edits].reshape(-1, chunk_len, action_dim)
+        edited, _, _ = self.target_model(
             forward_type=ForwardType.SAC,
-            obs=next_obs,
+            obs=edit_obs,
+            deterministic=True,
+            apply_action_noise=False,
         )
+        edited = edited.reshape(bases.shape[0], num_edits, -1)
+        return torch.cat([bases, edited], dim=1)
+
+    @staticmethod
+    def _unwrap_policy(model):
+        while hasattr(model, "module") or hasattr(model, "_orig_mod"):
+            model = getattr(model, "module", getattr(model, "_orig_mod", model))
+        return model
+
+    def soft_update_target_model(self, tau=None):
+        super().soft_update_target_model(tau=tau)
+        online = self._unwrap_policy(self.model)
+        target = self._unwrap_policy(self.target_model)
+        if hasattr(online, "sync_selection_critic_from") and hasattr(target, "q_head"):
+            online.sync_selection_critic_from(target.q_head)
 
     def _human_mask(
         self,
@@ -169,6 +214,34 @@ class RLTTD3LossMixin(RLTACLossMixin):
             .item()
         )
         metrics["reference_dropout_prob"] = reference_dropout_prob
+        preference_cfg = self.cfg.algorithm.get("rewind_preference", {}) or {}
+        pair_batch = self._preference_batch()
+        min_pairs = int(preference_cfg.get("min_pairs", 1))
+        if pair_batch is not None and len(self.rewind_preference_buffer) >= min_pairs:
+            mean_action, _, _ = self.model(
+                forward_type=ForwardType.SAC,
+                obs=pair_batch["curr_obs"],
+                deterministic=True,
+            )
+            preference_loss, preference_metrics = (
+                rlt_losses.actor_pairwise_preference_loss(
+                    action_mean=mean_action,
+                    ref_chunk=pair_batch["ref_chunk"],
+                    positive_action=pair_batch["positive_action"],
+                    negative_action=pair_batch["negative_action"],
+                    action_mask=pair_batch["action_mask"],
+                    confidence=pair_batch["confidence"],
+                    fixed_std=float(self.cfg.actor.model.actor_noise_sigma),
+                    beta=float(preference_cfg.get("actor_beta", 1.0)),
+                )
+            )
+            weight = float(preference_cfg.get("actor_weight", 0.0))
+            actor_loss = actor_loss + weight * preference_loss
+            metrics.update(preference_metrics)
+            metrics["preference_actor_weight"] = weight
+            metrics["preference_actor_active"] = 1.0
+        else:
+            metrics["preference_actor_active"] = 0.0
 
         entropy = -log_pi.mean()
         return actor_loss, entropy, metrics

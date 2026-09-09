@@ -436,6 +436,60 @@ Stage 2：运行 RLT Actor-Critic
 控制阶段。其他功能可根据具体任务需求进行定制
 （``rlinf/envs/realworld/common/wrappers/keyboard_rlt_policy_switch_wrapper.py``）。
 
+运行 Cobot Stage 2 示例
+-------------------
+
+使用 Cobot adapter 在机器人节点采集带接管信息且按 chunk 对齐的 transition，同时由 GPU 节点通过 RLinf Ray 训练 Stage 2 TD3 head。
+
+The configuration is ``examples/embodiment/config/cobot_rlt_stage2_td3_mlp.yaml``. It uses ``CobotEnv-v1``, a 14-D action/state contract, three image views, ``rlt_td3_mlp_policy``, and ``rlt_intervention_metadata``. The checked-in environment is dummy by default so you can validate configuration without robot hardware.
+
+启动前设置 Stage 1 检查点、归一化统计和本地 controller factory。
+
+.. code-block:: yaml
+
+   env:
+     train:
+       override_cfg:
+         is_dummy: false
+         controller_factory: your_package.controller:create_adapter
+         action_dim: 14
+         state_dim: 14
+
+.. code-block:: bash
+
+   export RLINF_NODE_RANK=1  # set before starting Ray on the robot node
+   ray start --address=<gpu-head-ip>:6379
+
+On the GPU node, start Ray with ``RLINF_NODE_RANK=0`` and run:
+
+.. code-block:: bash
+
+   export RLINF_NODE_RANK=0
+   ray start --head --port=6379 --node-ip-address=<gpu-head-ip>
+   python examples/embodiment/train_embodied_agent.py \
+       --config-name cobot_rlt_stage2_td3_mlp \
+       rollout.rlt_feature_model.model_path=/path/to/stage1/actor \
+       rollout.rlt_feature_model.openpi_data.norm_stats_path=/path/to/norm_stats.json
+
+The adapter executes and safety-checks actions locally. It returns the observation captured after the final action in each chunk. RLinf sends the resulting transition through Ray to the actor replay buffer; no WebSocket learner or second replay service is created. A human takeover stores the executed intervention action and sets the BC target accordingly. Safety faults and operator aborts set ``bootstrap_mask=0``.
+
+.. warning::
+
+   Do not enable a real controller until its adapter implements local clipping, watchdog, emergency stop, reset, and ``execute`` semantics. Keep ``is_dummy: true`` until ``controller_factory`` and all Stage 1 / Stage 2 action, state, image, and normalization dimensions match.
+
+倒车纠正按 action chunk 对齐。支持倒车的 controller 在机器人本地保存已完成的
+chunk，并在边界上报 ``rewind_exit`` 或 ``rewind_credit``。``rewind_exit`` 只在
+本地执行物理倒车，将倒车前的 bad branch 写入终止 credit 并切断 bootstrap，随后
+等待首个已提交的恢复动作。该 replacement action 无论来自 ``human`` 还是
+``policy``，都可与 bad fork action 构成 pair，分别进入 critic hinge ranking 与
+actor Bradley-Terry preference loss。``rewind_credit`` 不移动机器人，只修改
+branch credit 并建立新的 replay root。
+
+物理 controller 必须在机器人本地维护动作历史、限幅、watchdog、急停、reset 和
+倒车中止；Ray 或 GPU 断开后仍必须可以安全停止，learner 不会向机器人下发倒车命令。
+物理采集时关闭 chunk prefetch，保证每个 replay row 都使用真实的 chunk 前快照和
+chunk 后观测。
+
 运行 ManiSkill Joint 示例
 -------------------------
 
@@ -601,7 +655,7 @@ Stage 1 checkpoint，然后执行：
    bash examples/embodiment/run_embodiment.sh maniskill_rlt_stage2_td3_mlp
 
 目前该变体只提供 ManiSkill 仿真配置。它保留冻结的 Stage 1 特征和 transition
-replay 路径，仅将 Stage 2 策略和更新目标替换为直接 TD3 actor 与 twin-Q critic。
+replay 路径，仅将 Stage 2 策略和更新目标替换为残差 TD3 actor 与 twin-Q critic。
 
 这个配置会启动 actor、rollout 和 ManiSkill env。rollout 侧冻结
 ``rollout.rlt_feature_model``，只同步和执行 Stage 2 MLP actor。ManiSkill route

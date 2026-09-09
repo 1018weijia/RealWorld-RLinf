@@ -154,6 +154,12 @@ class MultiStepRolloutWorker(Worker):
         )
         if rlt_feature_model_config is not None:
             self.rlt_feature_model = get_model(copy.deepcopy(rlt_feature_model_config))
+            self.rlt_feature_model.rlt_num_action_candidates = int(
+                self.cfg.actor.model.get("expo_num_base_samples", 1)
+                if self.cfg.actor.model.get("action_selection_mode", "original")
+                == "expo"
+                else 1
+            )
             self.rlt_feature_model.eval()
             self.rlt_feature_model.requires_grad_(False)
             self.rlt_route = build_rlt_route(self.cfg)

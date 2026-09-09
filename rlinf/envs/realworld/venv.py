@@ -47,26 +47,36 @@ class NoAutoResetSyncVectorEnv(SyncVectorEnv):
         """
         self._actions = actions
         observations, infos = [], {}
+        terminations = getattr(self, "_terminations", None)
+        if terminations is None:
+            terminations = self._terminateds
+        truncations = getattr(self, "_truncations", None)
+        if truncations is None:
+            truncations = self._truncateds
         for i, (env, action) in enumerate(zip(self.envs, self._actions)):
             (
                 observation,
                 self._rewards[i],
-                self._terminateds[i],
-                self._truncateds[i],
+                terminations[i],
+                truncations[i],
                 info,
             ) = env.step(action)
 
             observations.append(observation)
             infos = self._add_info(infos, info, i)
-        self.observations = concatenate(
-            self.single_observation_space, observations, self.observations
+        observation_buffer = getattr(self, "_observations", None)
+        if observation_buffer is None:
+            observation_buffer = self.observations
+        observation_buffer = concatenate(
+            self.single_observation_space, observations, observation_buffer
         )
+        self._observations = observation_buffer
 
         return (
-            deepcopy(self.observations) if self.copy else self.observations,
+            deepcopy(observation_buffer) if self.copy else observation_buffer,
             np.copy(self._rewards),
-            np.copy(self._terminateds),
-            np.copy(self._truncateds),
+            np.copy(terminations),
+            np.copy(truncations),
             infos,
         )
 

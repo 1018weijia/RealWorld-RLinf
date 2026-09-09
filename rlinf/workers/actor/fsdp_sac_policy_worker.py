@@ -94,6 +94,16 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         # Record the original trainable parameter names before FSDP wrapping.
         # Persistent buffer names are also recorded for selective weight syncing.
         self.param_names_need_sync = collect_param_names_need_sync(module)
+        # EXPO rollout selection uses a frozen shadow of the target critic. It
+        # is intentionally excluded from optimizers but must cross weight sync.
+        if hasattr(module, "selection_critic"):
+            self.param_names_need_sync.extend(
+                name
+                for name, _ in module.selection_critic.named_parameters(
+                    prefix="selection_critic", remove_duplicate=False
+                )
+                if name not in self.param_names_need_sync
+            )
 
         # build model, optimizer, lr_scheduler, grad_scaler
         self.model = self._strategy.wrap_model(
@@ -189,6 +199,10 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
             trajectory_format=self.cfg.algorithm.replay_buffer.get(
                 "trajectory_format", "pt"
             ),
+            use_per=self.cfg.algorithm.replay_buffer.get("prioritized", False),
+            per_alpha=self.cfg.algorithm.replay_buffer.get("per_alpha", 0.6),
+            per_beta=self.cfg.algorithm.replay_buffer.get("per_beta_start", 0.4),
+            per_eps=self.cfg.algorithm.replay_buffer.get("per_eps", 1e-6),
         )
 
         min_demo_buffer_size = 0
@@ -208,6 +222,10 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
                 auto_save=self.cfg.algorithm.demo_buffer.get("auto_save", False),
                 auto_save_path=auto_save_path,
                 trajectory_format="pt",
+                use_per=self.cfg.algorithm.replay_buffer.get("prioritized", False),
+                per_alpha=self.cfg.algorithm.replay_buffer.get("per_alpha", 0.6),
+                per_beta=self.cfg.algorithm.replay_buffer.get("per_beta_start", 0.4),
+                per_eps=self.cfg.algorithm.replay_buffer.get("per_eps", 1e-6),
             )
             min_demo_buffer_size = self.cfg.algorithm.demo_buffer.min_buffer_size
             if self.cfg.algorithm.demo_buffer.get("load_path", None) is not None:
@@ -229,6 +247,9 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
             min_replay_buffer_size=self.cfg.algorithm.replay_buffer.min_buffer_size,
             min_demo_buffer_size=min_demo_buffer_size,
             prefetch_size=self.cfg.algorithm.replay_buffer.get("prefetch_size", 10),
+            allow_empty_demo=bool(
+                self.cfg.algorithm.get("demo_buffer", {}).get("allow_empty", False)
+            ),
         )
         self.buffer_dataloader = DataLoader(
             self.buffer_dataset,

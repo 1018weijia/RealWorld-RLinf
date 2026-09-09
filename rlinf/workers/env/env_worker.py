@@ -22,7 +22,10 @@ import torch
 from omegaconf import DictConfig, OmegaConf
 
 from rlinf.algorithms.registry import calculate_adv_and_returns
-from rlinf.algorithms.rlt.transition import update_rlt_transitions
+from rlinf.algorithms.rlt.transition import (
+    branch_fields_from_env_info,
+    update_rlt_transitions,
+)
 from rlinf.data.schema.embodied_trajectory_builder import (
     EmbodiedLerobotTrajectoryBuilder,
     EmbodiedTrajectoryBuilder,
@@ -525,9 +528,10 @@ class EnvWorker(Worker):
             infos["intervene_action"] if "intervene_action" in infos else None
         )
         intervene_flags = infos["intervene_flag"] if "intervene_flag" in infos else None
-        rlt_switch_flags = (
-            infos["rlt_switch_flags"] if "rlt_switch_flags" in infos else None
-        )
+        infos = infos if isinstance(infos, dict) else {}
+        rlt_switch_flags = infos.get("rlt_switch_flags")
+        record_transition = infos.get("record_transition")
+        rewind_events = infos.get("rewind_events")
         if self.cfg.env.train.auto_reset and chunk_dones.any():
             if "intervene_action" in infos["final_info"]:
                 intervene_actions = infos["final_info"]["intervene_action"]
@@ -544,6 +548,8 @@ class EnvWorker(Worker):
             intervene_actions=intervene_actions,
             intervene_flags=intervene_flags,
             rlt_switch_flags=rlt_switch_flags,
+            record_transition=record_transition,
+            rewind_events=rewind_events,
         )
         chunk_step_payload = {
             "chunk_actions": exec_actions,
@@ -607,15 +613,18 @@ class EnvWorker(Worker):
                 for key in infos["episode"]:
                     env_info[key] = infos["episode"][key][newly_done].cpu()
 
-        rlt_switch_flags = (
-            infos["rlt_switch_flags"] if "rlt_switch_flags" in infos else None
-        )
+        infos = infos if isinstance(infos, dict) else {}
+        rlt_switch_flags = infos.get("rlt_switch_flags")
+        record_transition = infos.get("record_transition")
+        rewind_events = infos.get("rewind_events")
 
         env_output = EnvOutput(
             obs=extracted_obs,
             final_obs=final_obs,
             env_infos=infos if isinstance(infos, dict) else None,
             rlt_switch_flags=rlt_switch_flags,
+            record_transition=record_transition,
+            rewind_events=rewind_events,
         )
         return env_output, env_info
 
@@ -1151,6 +1160,8 @@ class EnvWorker(Worker):
                         truncations=env_output.truncations,
                         terminations=env_output.terminations,
                         rewards=rewards,
+                        record_transition=env_output.record_transition,
+                        rewind_events=env_output.rewind_events,
                     )
 
                     self.trajectory_builders[stage_id].append_step_result(
@@ -1169,19 +1180,41 @@ class EnvWorker(Worker):
                             policy_output.intervene_flags
                         )
                     if self.enable_rlt and self.collect_transitions:
-                        update_rlt_transitions(
-                            stage_id,
-                            rlt_pending_obs,
-                            self.trajectory_builders,
-                            policy_output,
-                            cache_current=True,
-                            intervene_actions=env_output.intervene_actions,
-                            intervene_flags=env_output.intervene_flags,
+                        event_only = (
+                            env_output.record_transition is not None
+                            and not bool(
+                                torch.as_tensor(env_output.record_transition).all()
+                            )
                         )
+                        if event_only:
+                            rlt_pending_obs[stage_id] = None
+                        else:
+                            update_rlt_transitions(
+                                stage_id,
+                                rlt_pending_obs,
+                                self.trajectory_builders,
+                                policy_output,
+                                cache_current=True,
+                                intervene_actions=env_output.intervene_actions,
+                                intervene_flags=env_output.intervene_flags,
+                                branch_fields=branch_fields_from_env_info(
+                                    env_output.env_infos,
+                                    batch_size=policy_output.actions.shape[0],
+                                    device=policy_output.actions.device,
+                                    intervene_flags=env_output.intervene_flags,
+                                ),
+                            )
 
                     env_output, env_info, chunk_step_payload = self.env_interact_step(
                         policy_output.actions,
                         stage_id,
+                    )
+                    if env_output.record_transition is not None and not bool(
+                        torch.as_tensor(env_output.record_transition).all()
+                    ):
+                        self.trajectory_builders[stage_id].discard_last_step()
+                    self.trajectory_builders[stage_id].append_rewind_events(
+                        env_output.rewind_events
                     )
                     # Emulated observation latency: wait before the obs goes out,
                     # without blocking the other coroutines in this worker.
@@ -1302,6 +1335,8 @@ class EnvWorker(Worker):
                     truncations=env_output.truncations,
                     terminations=env_output.terminations,
                     rewards=rewards,
+                    record_transition=env_output.record_transition,
+                    rewind_events=env_output.rewind_events,
                 )
                 self.trajectory_builders[stage_id].append_step_result(chunk_step_result)
                 if (
@@ -1311,15 +1346,27 @@ class EnvWorker(Worker):
                 ):
                     self.assign_history_reward(stage_id, reward_model_output)
                 if self.enable_rlt and self.collect_transitions:
-                    update_rlt_transitions(
-                        stage_id,
-                        rlt_pending_obs,
-                        self.trajectory_builders,
-                        policy_output,
-                        cache_current=False,
-                        intervene_actions=env_output.intervene_actions,
-                        intervene_flags=env_output.intervene_flags,
+                    event_only = env_output.record_transition is not None and not bool(
+                        torch.as_tensor(env_output.record_transition).all()
                     )
+                    if event_only:
+                        rlt_pending_obs[stage_id] = None
+                    else:
+                        update_rlt_transitions(
+                            stage_id,
+                            rlt_pending_obs,
+                            self.trajectory_builders,
+                            policy_output,
+                            cache_current=False,
+                            intervene_actions=env_output.intervene_actions,
+                            intervene_flags=env_output.intervene_flags,
+                            branch_fields=branch_fields_from_env_info(
+                                env_output.env_infos,
+                                batch_size=policy_output.actions.shape[0],
+                                device=policy_output.actions.device,
+                                intervene_flags=env_output.intervene_flags,
+                            ),
+                        )
 
             if self.use_training_pipeline and actor_channel is not None:
                 await self.send_rollout_trajectories_pipeline(

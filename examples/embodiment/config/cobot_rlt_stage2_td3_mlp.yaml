@@ -1,0 +1,340 @@
+defaults:
+  - env/cobot@env.train
+  - env/cobot@env.eval
+  - hybrid_engines/fsdp@actor.fsdp_config
+  - weight_syncer/patch_syncer@weight_syncer
+  - override hydra/job_logging: stdout
+  - _self_
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  searchpath:
+    - file://${oc.env:EMBODIED_PATH}/config/
+
+cluster:
+  num_nodes: 2
+  component_placement:
+    actor:
+      node_group: "4090"
+      placement: 0 # Local GPU rank in the 4090 node group (n for the n+1 th GPU)
+    env:
+      node_group: cobot
+      placement: 0 # Local robot rank in the franka node group (n for the n+1 th robot)
+    rollout:
+      node_group: "4090"
+      placement: 0 # Local GPU rank in the 4090 node group (n for the n+1 th GPU)
+  node_groups:
+    - label: "4090" # GPU node group
+      node_ranks: 0 # The ranks of the nodes to be included in this group， change this if your training node is not rank 0
+    - label: cobot
+      node_ranks: 1 # Change this if your robot node is not rank 1
+
+runner:
+  task_type: embodied
+  logger:
+    log_path: "../results"
+    project_name: rlinf-rlt
+    experiment_name: "cobot_rlt_stage2_td3_mlp"
+    logger_backends: ["tensorboard"]
+
+  max_epochs: 8000
+  max_steps: -1
+
+  only_eval: False
+  val_check_interval: -1
+  save_interval: -1
+
+  # Resume a saved Stage2 training run from a full RLinf checkpoint directory.
+  # Do not point this to the Stage1 OpenPI checkpoint.
+  resume_dir: null
+  # Optional single Stage2 weight file, e.g. actor/model_state_dict/full_weights.pt.
+  # For normal Stage2 training from scratch, keep this null.
+  ckpt_path: null
+
+algorithm:
+  update_epoch: 1
+  group_size: 1
+  agg_q: min
+  actor_agg_q: min
+  enable_drq: False
+  q_head_type: ${actor.model.q_head_type}
+
+  adv_type: rlt_td3
+  loss_type: rlt_td3
+  loss_agg_func: "token-mean"
+
+  # remote-franka EXPO actor: pure -min(Q1, Q2), without VLA/human BC.
+  q_weight: 1.0
+  bc_weight: 0.0
+
+  # Reference-action dropout on the actor input, as in RLT Stage2.
+  reference_dropout_prob: 0.0
+  actor_update_action_noise: True
+
+  expo:
+    enable: True
+    base_candidates: 4
+    edited_candidates: 4
+
+  # Remote-franka-compatible rewind preference, implemented inside Ray.
+  rewind_preference:
+    enable: True
+    capacity: 2000
+    batch_size: 32
+    min_pairs: 1
+    history_chunks: 64
+    critic_weight: 0.1
+    actor_weight: 0.1
+    rank_margin: 0.1
+    actor_beta: 0.1
+    # Rewind event collection is stop-and-go: do not prefetch executable chunks.
+    stop_and_go: True
+    prefetch_chunks: 0
+    rewind_exit_terminal_reward: -1.0
+    rewind_credit_terminal_reward: -1.0
+    rewind_credit_prefix_reward: 0.1
+
+  bootstrap_type: standard
+  gamma: 0.99
+  tau: 0.005
+  use_done_key: True
+  critic_loss: huber
+  critic_huber_delta: 0.5
+  intervention_critic_action_noise_sigma: 0.002
+  intervention_critic_action_noise_clip: 0.005
+  rewind_critic_action_noise_sigma: 0.002
+  rewind_critic_action_noise_clip: 0.005
+
+  # Entropy/alpha is kept at zero; this is not standard maximum-entropy SAC.
+  entropy_tuning:
+    alpha_type: fixed_alpha
+    initial_alpha: 0.0
+    optim:
+      lr: 3.0e-4
+      lr_scheduler: torch_constant
+      clip_grad: 10.0
+
+  replay_buffer:
+    enable_cache: True
+    cache_size: 200
+    min_buffer_size: 2
+    sample_window_size: 200
+    auto_save: False
+    prioritized: True
+    per_alpha: 0.6
+    per_beta_start: 0.4
+    per_beta_end: 1.0
+    per_beta_anneal_steps: 50000
+    per_eps: 1.0e-6
+
+  # Reuse RLinf's demo buffer as the 50% intervention sampling partition.
+  demo_buffer:
+    enable_cache: True
+    cache_size: 200
+    min_buffer_size: 1
+    sample_window_size: 200
+    auto_save: False
+    allow_empty: True
+
+  rlt_schedule:
+    enable: True
+    warmup_min_size: 250
+    warmup_post_collect_updates: 0
+    utd_ratio: 5
+    episode_boundary_only: True
+    max_updates_per_train_step: 0
+
+  target_update_freq: 1
+  target_update_type: all
+  train_actor_steps: 2
+  critic_actor_ratio: 2
+  critic_subsample_size: 0
+  backup_entropy: False
+
+env:
+  group_name: "EnvGroup"
+
+  train:
+    rollout_epoch: 1
+    total_num_envs: 1
+    auto_reset: True
+    ignore_terminations: False
+    keyboard_reward_wrapper: rlt_policy_switch
+    max_episode_steps: 480
+    max_steps_per_rollout_epoch: 480
+    use_spacemouse: False
+    use_gello: False
+    use_pico: False
+    rlt_intervention_metadata: True
+    no_gripper: False
+    override_cfg:
+      is_dummy: True
+      action_dim: 14
+      state_dim: 14
+      image_keys: [image, wrist_image, side_image]
+      controller_factory: null
+      rewind_history_chunks: 12
+      # Physical rewind requires a controller exposing rewind_chunks and
+      # poll_rewind_event. The dummy adapter implements this for smoke tests.
+      use_dense_reward: False
+      reward_scale: 1.0
+      max_num_steps: 480
+
+  eval:
+    rollout_epoch: 1
+    total_num_envs: 1
+    auto_reset: True
+    ignore_terminations: False
+    keyboard_reward_wrapper: rlt_policy_switch
+    max_episode_steps: 160
+    max_steps_per_rollout_epoch: 160
+    use_fixed_reset_state_ids: False
+    group_size: 1
+    use_spacemouse: False
+    use_gello: False
+    use_pico: False
+    rlt_intervention_metadata: True
+    no_gripper: False
+    override_cfg:
+      is_dummy: True
+      action_dim: 14
+      state_dim: 14
+      image_keys: [image, wrist_image, side_image]
+      controller_factory: null
+      rewind_history_chunks: 12
+      # Physical rewind requires a controller exposing rewind_chunks and
+      # poll_rewind_event. The dummy adapter implements this for smoke tests.
+      use_dense_reward: False
+      reward_scale: 1.0
+      max_num_steps: 160
+    video_cfg:
+      save_video: True
+      video_base_dir: ${runner.logger.log_path}/video/eval
+
+rollout:
+  group_name: "RolloutGroup"
+  generation_backend: "huggingface"
+  enable_offload: False
+  pipeline_stage_num: 1
+
+  collect_transitions: True
+  collect_prev_infos: False
+
+  # Synced Stage2 MLP policy used by rollout inference.
+  # During training (runner.only_eval=False), rollout builds this from actor.model
+  # and then receives fresh weights from the actor via RLinf weight_syncer.
+  # Keep model_path null for scratch Stage2 training; do not set it to Stage1.
+  # To resume/load Stage2 weights, use runner.resume_dir or runner.ckpt_path.
+  model:
+    model_path: null
+    precision: ${actor.model.precision}
+    action_dim: ${actor.model.action_dim}
+    num_action_chunks: ${actor.model.num_action_chunks}
+    ref_num_action_chunks: ${actor.model.ref_num_action_chunks}
+    actor_noise_sigma: ${actor.model.actor_noise_sigma}
+    residual_scale: ${actor.model.residual_scale}
+    action_selection_mode: ${actor.model.action_selection_mode}
+    expo_num_base_samples: ${actor.model.expo_num_base_samples}
+    expo_num_edit_samples: ${actor.model.expo_num_edit_samples}
+
+  # Frozen Stage1 pi0.5 + RLT token transformer.
+  # This is the actual Stage1 model path. Rollout uses it to convert raw env
+  # observations into the Stage2 obs dict: z_rl, proprio, ref_chunk.
+  rlt_feature_model:
+    model_type: "openpi_rlinf"
+    precision: bf16
+    is_lora: False
+    num_action_chunks: 20
+    action_dim: 14
+    num_steps: 4
+    add_value_head: False
+    # Checkpoint produced by examples/sft/config/realworld_rlt_stage1_sft_openpi_pi05.yaml.
+    model_path: "/path/to/stage1/checkpoint"
+    openpi_data:
+      # Must match the repo_id/config_name used to compute Stage1 OpenPI norm stats.
+      repo_id: "cobot_rlt_stage1"
+    openpi:
+      task: eval
+      config_name: "pi05_cobot_magic"
+      num_images_in_input: 3
+      action_chunk: ${actor.model.ref_num_action_chunks}
+      action_horizon: ${rollout.rlt_feature_model.num_action_chunks}
+      action_env_dim: ${rollout.rlt_feature_model.action_dim}
+      num_steps: 4
+      model_action_dim: 32
+      paligemma_variant: "gemma_2b"
+      action_expert_variant: "gemma_300m"
+      max_token_len: 200
+      discrete_state_input: True
+      # Keep the collected Cobot state as Stage2 proprio.
+      state_indices: []
+      noise_method: "flow_noise"
+      noise_params: [0.16, 0.12, 200]
+      joint_logprob: True
+      use_rlt: True
+      rlt_prefix_seq_len: 1024
+      rlt_image_only: False
+      rlt_use_mask: True
+
+  enable_torch_compile: True
+  enable_cuda_graph: False
+
+actor:
+  group_name: "ActorGroup"
+  training_backend: "fsdp"
+
+  micro_batch_size: 256
+  global_batch_size: 256
+  seed: 1234
+  enable_offload: False
+
+  # Do not add actor.model.model_path for Stage1; this block only defines the
+  # Stage2 head. Stage2 resume/load is controlled by runner.resume_dir/ckpt_path.
+  model:
+    model_type: "rlt_td3_mlp_policy"
+
+    # RLT AC defaults to fp32 for Q-learning and target-update stability.
+    precision: fp32
+    add_value_head: False
+    add_q_head: True
+    q_head_type: "default"
+    fixed_std: 0.2
+    is_lora: False
+
+    # RLT Stage2 MLP input/output shape.
+    z_dim: 2048
+    proprio_dim: 14
+    action_dim: 14
+    num_action_chunks: 16
+    ref_num_action_chunks: 20
+    actor_noise_sigma: 0.2
+    residual_scale: 0.2
+    action_selection_mode: expo
+    expo_num_base_samples: 4
+    expo_num_edit_samples: 4
+
+  optim:
+    clip_grad: 10.0
+    lr: 3e-4
+    lr_scheduler: torch_constant
+
+  critic_optim:
+    clip_grad: 10.0
+    lr: 3e-4
+    lr_scheduler: torch_constant
+
+  fsdp_config:
+    strategy: "fsdp"
+    sharding_strategy: "no_shard"
+    mixed_precision:
+      param_dtype: ${actor.model.precision}
+      reduce_dtype: ${actor.model.precision}
+      buffer_dtype: ${actor.model.precision}
+
+reward:
+  use_reward_model: False
+
+critic:
+  use_critic_model: False
