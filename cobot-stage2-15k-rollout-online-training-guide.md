@@ -168,14 +168,15 @@ export EMBODIED_PATH=/data/gxy/realworldRL/RLinf
 
 不要把 mixed 10k 权重和 `assemble_parts/norm_stats.json` 混用，也不要把 assemble 15k 权重和 mixed norm stats 混用。
 
-第一次真机验证建议在上述命令末尾追加有限步数和独立输出目录：
+第一次真机验证建议使用有限步数和独立输出目录。把上面命令的最后三行替换为：
 
 ```bash
+  env.train.override_cfg.controller_factory=your_package.controller:create_adapter \
   runner.max_steps=10000 \
   runner.logger.log_path=/data/gxy/realworldRL/results/cobot_stage2_15k
 ```
 
-也就是把这两个 override 接在启动命令最后；确认 HIL 稳定后可去掉 `runner.max_steps`，改为按需要长时间运行。`your_package.controller:create_adapter` 必须替换成真机侧实际的 Python 模块和工厂函数。
+这三行需要接在 `.venv/bin/python ... --config-name ...` 之后，形成一条完整命令。确认 HIL 稳定后可去掉最后两项 `runner.max_steps` 和 `runner.logger.log_path`，按需要长时间运行。`your_package.controller:create_adapter` 必须替换成真机侧实际的 Python 模块和工厂函数。
 
 Stage 2 的关键默认值：
 
