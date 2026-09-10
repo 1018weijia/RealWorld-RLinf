@@ -7,7 +7,7 @@
 - GPU/训练侧：启动 Stage 2 server，加载最新 Stage 1 权重，跑在线训练。
 - Cobot 真机侧：实现 transport，启动本地控制程序和 client，执行 rollout、接管和回退。
 
-> 文件名里的 `15k` 是历史遗留。当前推荐的是 assemble **30k**（该次 SFT 的最终权重），见第 2 节。
+当前推荐的 Stage 1 权重是 assemble **30k**（该次 SFT 的最终权重），见第 2 节。
 
 ## 1. 架构与边界
 
