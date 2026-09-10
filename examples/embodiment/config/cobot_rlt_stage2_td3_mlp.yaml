@@ -44,7 +44,7 @@ runner:
 
   only_eval: False
   val_check_interval: -1
-  save_interval: -1
+  save_interval: 1000
 
   # Resume a saved Stage2 training run from a full RLinf checkpoint directory.
   # Do not point this to the Stage1 OpenPI checkpoint.

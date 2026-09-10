@@ -15,6 +15,8 @@ use_gello: False
 use_pico: False
 rlt_intervention_metadata: True
 main_image_key: image
+# Preserve physical camera semantics; do not infer left/right from dict sorting.
+extra_image_keys: [wrist_image, side_image]
 
 video_cfg:
   save_video: False

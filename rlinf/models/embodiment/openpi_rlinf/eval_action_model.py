@@ -380,9 +380,9 @@ class OpenPiPytorchEvalActionModel(OpenPiPytorchActionModel):
             prefix_mask,
             kv_cache,
         )
-        ref_chunk = self.output_transform(
-            {"actions": model_actions, "state": observation.state}
-        )["actions"]
+        # Stage 2 consumes normalized model actions. Physical unnormalization
+        # belongs only at a direct environment-control boundary.
+        ref_chunk = model_actions[..., : self.action_env_dim]
         ref_candidates = [ref_chunk]
         for _ in range(1, int(getattr(self, "rlt_num_action_candidates", 1))):
             candidate_actions = self._sample_actions_from_prefix_cache(
@@ -390,11 +390,7 @@ class OpenPiPytorchEvalActionModel(OpenPiPytorchActionModel):
                 prefix_mask,
                 kv_cache,
             )
-            ref_candidates.append(
-                self.output_transform(
-                    {"actions": candidate_actions, "state": observation.state}
-                )["actions"]
-            )
+            ref_candidates.append(candidate_actions[..., : self.action_env_dim])
 
         raw_proprio = self._select_configured_state(env_obs["states"])
         if "maniskill" in self.config_name.lower():

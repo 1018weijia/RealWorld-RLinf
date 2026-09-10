@@ -258,8 +258,16 @@ class RealWorldEnv(gym.Env):
                 f"main_image_key {self.main_image_key!r} not in {list(frames)}"
             )
         obs["main_images"] = frames[self.main_image_key]
-        raw_images = OrderedDict(sorted(frames.items()))
-        raw_images.pop(self.main_image_key)
+        raw_images = OrderedDict()
+        configured_extra = self.cfg.get("extra_image_keys", None)
+        if configured_extra:
+            for key in configured_extra:
+                if key not in frames:
+                    raise KeyError(f"Configured extra image key {key!r} missing from frames {list(frames)}")
+                raw_images[key] = frames[key]
+        else:
+            raw_images.update(sorted(frames.items()))
+        raw_images.pop(self.main_image_key, None)
 
         if raw_images:
             obs["extra_view_images"] = np.stack(list(raw_images.values()), axis=1)
