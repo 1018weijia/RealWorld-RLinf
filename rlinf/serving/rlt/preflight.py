@@ -163,14 +163,20 @@ def check_norm_stats(norm_stats_path: str) -> None:
     logger.info("Preflight: norm stats loaded from %s", path)
 
 
-def check_task_prompt(prompt: str) -> None:
-    """Reject an unconfigured task prompt.
+def check_task_prompt(prompt: str, *, stage1_prompt: str | None = None) -> None:
+    """Reject an unconfigured or inconsistent task prompt.
 
     Args:
         prompt: The prompt the server will send to the frozen VLA.
+        stage1_prompt: ``openpi_data.default_prompt``, i.e. the prompt the
+            Stage 1 checkpoint was trained with. When given it must match
+            ``prompt``; the two feed different code paths (the observation
+            repacker and the OpenPI data config) and disagreement means one of
+            them conditions the VLA on a task it never learned.
 
     Raises:
-        PreflightError: The prompt is empty or a known placeholder.
+        PreflightError: The prompt is empty, a known placeholder, or disagrees
+            with ``stage1_prompt``.
     """
     normalized = str(prompt).strip().lower()
     if normalized in PLACEHOLDER_PROMPTS:
@@ -180,7 +186,91 @@ def check_task_prompt(prompt: str) -> None:
             "actions with no error. Set the prompt the Stage 1 checkpoint was "
             "trained with."
         )
+    if stage1_prompt is not None and normalized != str(stage1_prompt).strip().lower():
+        raise PreflightError(
+            f"server.task_prompt={prompt!r} disagrees with "
+            f"openpi_data.default_prompt={stage1_prompt!r}. Set both to the "
+            "prompt used by the Stage 1 SFT config that produced this "
+            "checkpoint."
+        )
     logger.info("Preflight: task prompt = %r", prompt)
+
+
+def resolve_stage1_weights(model_path: str) -> str:
+    """Locate the Stage 1 weights file the OpenPI loader will actually read.
+
+    The loader accepts a checkpoint directory in either of two layouts and
+    otherwise falls back to globbing ``*.safetensors``. Pointing ``model_path``
+    one level too deep -- at the ``model_state_dict`` directory that holds
+    ``full_weights.pt`` -- therefore matches neither layout and dies inside the
+    safetensors reader long after startup looked healthy. Resolving the path
+    the same way here turns that into an immediate, explicit failure.
+
+    Args:
+        model_path: ``rlt_feature_model.model_path`` from the config.
+
+    Returns:
+        Absolute path to the ``full_weights.pt`` that will be loaded.
+
+    Raises:
+        PreflightError: No known layout matches ``model_path``.
+    """
+    candidates = (
+        os.path.join(model_path, "model_state_dict", "full_weights.pt"),
+        os.path.join(model_path, "actor", "model_state_dict", "full_weights.pt"),
+    )
+    for candidate in candidates:
+        if os.path.exists(candidate):
+            return candidate
+    if os.path.isfile(model_path):
+        return model_path
+
+    direct = os.path.join(model_path, "full_weights.pt")
+    hint = ""
+    if os.path.exists(direct):
+        hint = (
+            " It does contain full_weights.pt directly, so model_path is one "
+            "level too deep: point it at the global_step_* directory instead "
+            "of its actor/model_state_dict subdirectory."
+        )
+    raise PreflightError(
+        f"No Stage 1 weights under model_path={model_path}. Expected "
+        f"model_state_dict/full_weights.pt or "
+        f"actor/model_state_dict/full_weights.pt beneath it.{hint}"
+    )
+
+
+def check_norm_stats_configured(openpi_data: Any) -> str:
+    """Require an explicit norm-stats path and return it.
+
+    Leaving ``norm_stats_path`` unset is not a benign omission. OpenPI then
+    resolves stats relative to the Stage 1 checkpoint directory, which holds
+    only ``full_weights.pt``, and falls back to the ``asset_id`` baked into the
+    named OpenPI config -- a *different* task's statistics. The load either
+    fails or, worse, succeeds with the wrong quantiles and de-normalizes every
+    action into wrong robot units.
+
+    Args:
+        openpi_data: The ``rlt_feature_model.openpi_data`` config section.
+
+    Returns:
+        The configured norm-stats path.
+
+    Raises:
+        PreflightError: The path is missing or empty.
+    """
+    path = None
+    if openpi_data is not None:
+        path = openpi_data.get("norm_stats_path")
+    if not path:
+        raise PreflightError(
+            "rlt_feature_model.openpi_data.norm_stats_path is not set. Without "
+            "it OpenPI looks for norm stats inside the Stage 1 checkpoint "
+            "directory and falls back to the named config's default asset_id, "
+            "so actions get de-normalized with another task's statistics. "
+            "Point it at the norm_stats.json used by the Stage 1 SFT run."
+        )
+    return str(path)
 
 
 def check_camera_layout(camera_keys: tuple[str, ...], num_images: int) -> None:

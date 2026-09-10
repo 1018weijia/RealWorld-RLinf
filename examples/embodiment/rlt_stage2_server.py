@@ -24,7 +24,6 @@ from __future__ import annotations
 
 import copy
 import logging
-import os
 
 import hydra
 import torch
@@ -39,9 +38,12 @@ from rlinf.serving.rlt.inference import (
 from rlinf.serving.rlt.policy import RLTStage2Policy
 from rlinf.serving.rlt.preflight import (
     check_camera_layout,
+    check_norm_stats,
+    check_norm_stats_configured,
     check_stage1_checkpoint,
     check_task_prompt,
     report_reference_deviations,
+    resolve_stage1_weights,
 )
 from rlinf.serving.rlt.protocol import ACTION_SPACE_ROBOT, ServerMetadata
 from rlinf.serving.rlt.trainer import RLTStage2Trainer
@@ -102,18 +104,19 @@ def run_preflight(cfg: DictConfig) -> None:
         cfg: Full server config.
     """
     feature_cfg = cfg.rlt_feature_model
-    weights_path = os.path.join(
-        feature_cfg.model_path, "actor", "model_state_dict", "full_weights.pt"
-    )
-    if not os.path.exists(weights_path):
-        weights_path = feature_cfg.model_path
+    weights_path = resolve_stage1_weights(str(feature_cfg.model_path))
 
     check_stage1_checkpoint(
         weights_path,
         configured_prefix_seq_len=int(feature_cfg.openpi.rlt_prefix_seq_len),
         require_rlt=bool(feature_cfg.get("require_rlt_checkpoint", True)),
     )
-    check_task_prompt(cfg.server.task_prompt)
+    openpi_data = feature_cfg.get("openpi_data")
+    check_norm_stats(check_norm_stats_configured(openpi_data))
+    check_task_prompt(
+        cfg.server.task_prompt,
+        stage1_prompt=openpi_data.get("default_prompt") if openpi_data else None,
+    )
     check_camera_layout(
         tuple(cfg.server.camera_keys),
         int(feature_cfg.openpi.num_images_in_input),

@@ -27,9 +27,11 @@ server:
   ping_interval: 20.0
   ping_timeout: 600.0
 
-  # Language instruction for the frozen Stage 1 VLA. Preflight rejects
-  # placeholders: a wrong prompt yields confident but wrong actions.
-  task_prompt: "put cube in drawer"
+  # Language instruction for the frozen Stage 1 VLA. Must be the prompt the
+  # Stage 1 checkpoint was trained with -- preflight rejects placeholders and
+  # any disagreement with openpi_data.default_prompt, because a wrong prompt
+  # yields confident but wrong actions with no error.
+  task_prompt: "assemble parts"
 
   # Client camera keys, main view first. Must match the client transport and
   # openpi.num_images_in_input.
@@ -170,12 +172,24 @@ rlt_feature_model:
   action_dim: 14
   num_steps: 4
   add_value_head: False
-  # Stage 1 checkpoint directory produced by the Stage 1 SFT config.
-  model_path: "/path/to/stage1/checkpoint"
+  # Stage 1 checkpoint directory produced by the Stage 1 SFT config. Override
+  # on the command line to pick a newer global_step_*; see the rollout guide
+  # for how to find the latest one.
+  # Point at the global_step_* directory itself, not its actor/model_state_dict
+  # subdirectory: the loader looks for actor/model_state_dict/full_weights.pt
+  # beneath model_path.
+  model_path: "/data/gxy/realworldRL/RLinf/logs/20260906-06:01:46-cobot_rlt_stage1_sft_openpi_pi05_assemble_parts_franka_legacy_action_expert_base/cobot_assemble_franka_legacy_actionexpert_base_fp32master_bf16compute_30k/checkpoints/global_step_30000"
   # Refuse to start on a checkpoint without rlt_module.* weights.
   require_rlt_checkpoint: True
   openpi_data:
     repo_id: "cobot_rlt_stage1"
+    # Both keys must match the Stage 1 SFT config that produced model_path.
+    # norm_stats_path is not optional: without it OpenPI resolves stats against
+    # the checkpoint directory and falls back to the named config's default
+    # asset_id, i.e. another task's quantiles. Preflight now refuses to start
+    # rather than let that reach the robot.
+    norm_stats_path: /data/gxy/realworldRL/checkpoints/assets/cobot_magic/assemble_parts/norm_stats.json
+    default_prompt: "assemble parts"
   openpi:
     task: eval
     config_name: "pi05_cobot_magic"
@@ -195,8 +209,9 @@ rlt_feature_model:
     joint_logprob: True
     use_rlt: True
     # Must equal the checkpoint's rlt_module.encoder.prefix_pos_enc length.
-    # The assemble 15k checkpoint was trained with 968; preflight checks this
-    # and prints the correct value on mismatch.
+    # Every assemble/mixed Stage 1 checkpoint so far carries 968, not the
+    # OpenPI default 1024; preflight reads the real value from the checkpoint
+    # and prints the number to use on mismatch.
     rlt_prefix_seq_len: 968
     rlt_image_only: False
     rlt_use_mask: True

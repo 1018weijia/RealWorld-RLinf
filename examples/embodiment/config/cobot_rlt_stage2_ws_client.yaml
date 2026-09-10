@@ -61,7 +61,9 @@ transport:
   # Must equal actor.model.num_action_chunks on the server.
   chunk_len: 16
   camera_keys: [image, wrist_image, side_image]
-  task: "put cube in drawer"
+  # Must equal server.task_prompt, which must in turn be the prompt the Stage 1
+  # checkpoint was trained with.
+  task: "assemble parts"
 
   # Chunks the adapter can physically reverse-play. A rewind request beyond
   # this is capped, with a warning.

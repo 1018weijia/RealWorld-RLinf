@@ -4,8 +4,10 @@
 
 本文面向两类人员：
 
-- GPU/训练侧：启动 Stage 2 server，加载 Stage 1 15k 权重，跑在线训练。
+- GPU/训练侧：启动 Stage 2 server，加载最新 Stage 1 权重，跑在线训练。
 - Cobot 真机侧：实现 transport，启动本地控制程序和 client，执行 rollout、接管和回退。
+
+> 文件名里的 `15k` 是历史遗留。当前推荐的是 assemble **30k**（该次 SFT 的最终权重），见第 2 节。
 
 ## 1. 架构与边界
 
@@ -28,37 +30,67 @@ GPU 节点                                    Cobot 节点
 3. **真机侧独占安全职责**：限幅、watchdog、急停、rewind 回放必须在 adapter 内本地实现，且在 learner 断连时仍然可用。
 4. 默认配置 `transport.is_dummy: true`，跑的是 `MockRewindAdapter`：机械臂不动，所有相机帧全黑。真机运行必须显式设 `is_dummy=false` 并提供 `controller_factory`，否则 client 直接拒绝启动。
 
-## 2. Stage 1 15k 权重和 norm stats
+## 2. Stage 1 权重和 norm stats
 
 Stage 1 checkpoint 放在 `rlt_feature_model.model_path`。`actor.model` 是 Stage 2 的 MLP head，不要往里填 Stage 1 路径。
 
-### 2.1 Assemble / legacy action expert（推荐，15k）
+两个 Stage 1 任务都以 30k 步为目标。assemble 已经跑完（`global_step_30000` 是最终权重），**mixed 还在跑**，所以用 mixed 时先查一下现在最新的是哪一步，不要照抄本文的数字：
 
-```text
-/data/gxy/realworldRL/RLinf/logs/20260906-06:01:46-cobot_rlt_stage1_sft_openpi_pi05_assemble_parts_franka_legacy_action_expert_base/cobot_assemble_franka_legacy_actionexpert_base_fp32master_bf16compute_30k/checkpoints/global_step_15000/actor/model_state_dict
+```bash
+find /data/gxy/realworldRL/RLinf/logs -maxdepth 5 -type d -name 'global_step_*' \
+  -path '*cobot_*legacy_action_expert_base*' | sort -V
 ```
 
-对应 norm stats：
+`sort -V` 会按数字后缀正确排序并按 run 分组，每组最后一行就是该 run 当前最新的 step。截至本文修订，assemble 到 **30000**（已完成），mixed 到 **20000**。
+
+挑到新 step 之后确认它写完了再用 —— checkpoint 有 16 GB，正在写入的文件字节数会偏小。preflight 会读实际张量，读得通就是完整的。
+
+### 2.1 Assemble / legacy action expert（推荐，30k 最终权重）
 
 ```text
+model_path:
+/data/gxy/realworldRL/RLinf/logs/20260906-06:01:46-cobot_rlt_stage1_sft_openpi_pi05_assemble_parts_franka_legacy_action_expert_base/cobot_assemble_franka_legacy_actionexpert_base_fp32master_bf16compute_30k/checkpoints/global_step_30000
+
+norm_stats_path:
 /data/gxy/realworldRL/checkpoints/assets/cobot_magic/assemble_parts/norm_stats.json
+
+task_prompt: "assemble parts"
 ```
 
-这份 checkpoint 的 RLT prefix 长度是 **968**，不是配置默认的 1024。server preflight 会读出实际值并在不匹配时直接报错，同时打印应该填的数字。
-
-### 2.2 Mixed cook/cube/pack（备选，当前只有 10k）
+### 2.2 Mixed cook/cube/pack（备选，20k）
 
 ```text
-/data/gxy/realworldRL/RLinf/logs/20260907-09:26:30-cobot_rlt_stage1_sft_openpi_pi05_mixed_cook_cube_pack_franka_legacy_action_expert_base/cobot_mixed_cook_cube_pack_franka_legacy_actionexpert_base_fp32master_bf16compute_30k/checkpoints/global_step_10000/actor/model_state_dict
-```
+model_path:
+/data/gxy/realworldRL/RLinf/logs/20260907-09:26:30-cobot_rlt_stage1_sft_openpi_pi05_mixed_cook_cube_pack_franka_legacy_action_expert_base/cobot_mixed_cook_cube_pack_franka_legacy_actionexpert_base_fp32master_bf16compute_30k/checkpoints/global_step_20000
 
-对应 norm stats：
-
-```text
+norm_stats_path:
 /data/gxy/realworldRL/checkpoints/assets/cobot_magic/mixed_cook_cube_pack/norm_stats.json
+
+task_prompt: "cook vegetable" / "put cube in drawer" /
+             "pack fruit into a container and pour it out"
 ```
+
+mixed 是三任务模型，prompt 必须是训练时用过的三条之一，一次运行只跑一条。
+
+### 2.3 三个容易写错的点
+
+**`model_path` 指向 `global_step_*` 本身，不要指到 `actor/model_state_dict`。** 加载器只认 `<model_path>/model_state_dict/full_weights.pt` 和 `<model_path>/actor/model_state_dict/full_weights.pt` 两种布局；多写一层会两个都不匹配，然后掉进 safetensors 分支，在启动看起来一切正常之后才报错。preflight 现在会当场拦下并告诉你该往上退一级。
+
+**`norm_stats_path` 必须显式配置，它不是可选项。** 不填的话 OpenPI 会拿 `model_path` 当 assets 目录（那里只有 `full_weights.pt`），并回退到 `pi05_cobot_magic` 内置的默认 `asset_id`，也就是 `cobot_magic/cube_into_drawer` —— **另一个任务的分位数**。反归一化会静默地用错统计量，直接把错误的关节量下发到机械臂。preflight 现在拒绝在未配置时启动。
+
+**`task_prompt` 必须是 Stage 1 训练时用的那条。** 同样地，`pi05_cobot_magic` 的内置默认 prompt 是 `"put cube in drawer"`，而 assemble 那次 Stage 1 训练用的是 `"assemble parts"`。冻结的 VLA 是 prompt 条件化的，写错不会报错，只会产出自信但错误的动作。preflight 会校验 `server.task_prompt` 与 `openpi_data.default_prompt` 一致，两者必须同时改。
 
 不要跨任务复用 norm stats。Stage 1 模型、OpenPI `config_name`、图像数量、`action_dim` 和 state schema 必须一致。
+
+### 2.4 关于 `rlt_prefix_seq_len = 968`
+
+目前 assemble 和 mixed 的所有 checkpoint 都是 **968**，不是 OpenPI 默认的 1024。这个数字是图文 prefix 的 token 数：
+
+```text
+3 相机 × 256 patch + max_token_len 200 = 968
+```
+
+所以它由 `num_images_in_input` 和 `max_token_len` 决定，跟 action horizon 无关。改相机数量或 `max_token_len` 就得跟着改。preflight 会从 checkpoint 里读出 `rlt_module.encoder.prefix_pos_enc` 的实际长度，不匹配时报错并打印应该填的数字。
 
 ## 3. 真机侧需要提供什么
 
@@ -95,17 +127,33 @@ class MyCobotAdapter:
 
 ### 4.1 GPU 节点：启动 server
 
+`cobot_rlt_stage2_ws_server.yaml` 里已经填好了 2.1 的 assemble 30k 路径、norm stats 和 prompt，所以默认情况直接：
+
 ```bash
 cd /data/gxy/realworldRL/RLinf
 bash examples/embodiment/run_rlt_stage2_server.sh cobot_rlt_stage2_ws_server \
-  rlt_feature_model.model_path=/data/gxy/realworldRL/RLinf/logs/20260906-06:01:46-cobot_rlt_stage1_sft_openpi_pi05_assemble_parts_franka_legacy_action_expert_base/cobot_assemble_franka_legacy_actionexpert_base_fp32master_bf16compute_30k/checkpoints/global_step_15000/actor/model_state_dict \
-  rlt_feature_model.openpi.rlt_prefix_seq_len=968 \
-  +rlt_feature_model.openpi_data.norm_stats_path=/data/gxy/realworldRL/checkpoints/assets/cobot_magic/assemble_parts/norm_stats.json \
-  server.task_prompt="put cube in drawer" \
   server.host=0.0.0.0 server.port=8000
 ```
 
-启动时 preflight 会依次检查：checkpoint 里 `rlt_module.encoder.prefix_pos_enc` 的实际长度与 `rlt_prefix_seq_len` 是否一致、`rlt_module.*` 是否存在（`require_rlt_checkpoint: true` 时缺失即报错）、norm stats 是否可读、task prompt 是否还是占位符、相机数量是否与 `num_images_in_input` 匹配。任何一项失败都在机械臂上电之前终止。
+换成别的 checkpoint 时，三项要一起改，不能只改路径：
+
+```bash
+bash examples/embodiment/run_rlt_stage2_server.sh cobot_rlt_stage2_ws_server \
+  rlt_feature_model.model_path=<.../checkpoints/global_step_XXXXX> \
+  rlt_feature_model.openpi_data.norm_stats_path=<.../norm_stats.json> \
+  rlt_feature_model.openpi_data.default_prompt="<stage1 prompt>" \
+  server.task_prompt="<stage1 prompt>" \
+  server.host=0.0.0.0 server.port=8000
+```
+
+启动时 preflight 会依次检查：`model_path` 下能否按加载器的两种布局找到 `full_weights.pt`、checkpoint 里 `rlt_module.encoder.prefix_pos_enc` 的实际长度与 `rlt_prefix_seq_len` 是否一致、`rlt_module.*` 是否存在（`require_rlt_checkpoint: true` 时缺失即报错）、`norm_stats_path` 是否配置且可读、task prompt 是否是占位符或与 Stage 1 prompt 不一致、相机数量是否与 `num_images_in_input` 匹配。任何一项失败都在机械臂上电之前终止。全绿时的输出形如：
+
+```text
+Preflight: Stage 1 RLT prefix_seq_len=968 matches .../global_step_30000/actor/model_state_dict/full_weights.pt
+Preflight: norm stats loaded from .../cobot_magic/assemble_parts/norm_stats.json
+Preflight: task prompt = 'assemble parts'
+Preflight: camera layout = ['image', 'wrist_image', 'side_image']
+```
 
 随后 server 打印全部关键超参，并对每个偏离 remote-franka 参考部署的值发一条警告。警告不阻塞启动 —— 有意的 sweep 应该跑得起来 —— 但意外的偏差（比如 actor 学习率差一个数量级）在几小时的真机运行里几乎不可能靠肉眼发现。
 
@@ -117,8 +165,10 @@ bash examples/embodiment/run_cobot_control.sh cobot_rlt_stage2_ws_client \
   client.host=<GPU_HEAD_IP> client.port=8000 \
   transport.is_dummy=false \
   transport.controller_factory=your_package.controller:create_adapter \
-  transport.task="put cube in drawer"
+  transport.task="assemble parts"
 ```
+
+`transport.task` 必须与 server 的 `task_prompt` 一致。
 
 `run_cobot_control.sh` 里预留了站点相关的 ROS/驱动/相机 bring-up 段落，填好之后它会把 adapter 起好再转交给 `run_rlt_stage2_client.sh`。只想跑通链路不动机械臂时，去掉 `transport.is_dummy=false` 即可。
 
@@ -152,6 +202,14 @@ action = clip(ref_chunk + 0.2 * tanh(delta), -1.4, 1.4)
 clip 边界是 ±1.4 而不是 ±1.0：分位数归一化下合法动作可以超出单位盒，卡在 1.0 会连同它加在上面的 Stage 1 reference 一起削掉，直接删掉一部分可达动作。
 
 residual 输出层零初始化，所以刚启动时 Stage 2 行为应与 Stage 1 reference 一致。首次真机运行必须先验证这一点。
+
+### 4.4 已知注意点：reference horizon 20 vs Stage 1 的 50
+
+`pi05_cobot_magic` 的默认 `action_horizon` 是 50，两次 Stage 1 SFT 都没有覆盖它，所以它们是按 **50 步** action block 训练的。而 Stage 2 把推理时的 horizon 覆盖成 **20**（`rlt_feature_model.num_action_chunks`），执行前 16 步。
+
+这不是权重形状问题 —— checkpoint 里没有任何按 horizon 定长的张量，20 和 50 都能正常加载，`968` 也只跟图文 prefix 有关。但 action expert 在训练时始终看到 50 个 action token，推理时只给 20 个，属于 attention 序列长度上的 train/inference 偏移，可能让 reference chunk 的质量比 Stage 1 评估时差一些。
+
+这个 16/20 设置是从既有的 Ray 版 `cobot_rlt_stage2_td3_mlp.yaml` 继承的（那边的数值最初来自 `pi05_franka_state`，它的 Stage 1 horizon 本来就是 20），WebSocket 配置只是保持一致，并非新引入。第 11 节的 dry run 会暴露它：如果 zero-init 的 Stage 2 输出与直接跑 Stage 1（horizon 50）的动作明显不同，就把 `rlt_feature_model.num_action_chunks` 和 `actor.model.ref_num_action_chunks` 一起改成 50 再比一次。
 
 ## 5. Rollout：warmup 由 server 自动切换
 
@@ -224,6 +282,8 @@ info = {
 
 `stop_on_safety_fault: true`（默认）时 client 立即中断剩余 low-level step，把已执行的部分作为截断 chunk 提交（reward 数组短于 chunk 长度，server 按零补齐），然后结束 episode。
 
+截断 chunk 里没跑到的尾部不会被当成"已执行"上报：client 用最后一个真正执行的动作填充剩余位置，因为机械臂停下后物理上就停在那里。
+
 异常路径有两道保证：任何在执行期间抛出的异常都会先 `transport.stop()` 再向上传播，而挂起的 `transition_id` 一定会被 `discard` 掉。断开 WebSocket 不影响真机侧急停和 stop。
 
 ## 10. 在线训练何时发生
@@ -236,15 +296,15 @@ info = {
 
 只数 policy 驱动的 chunk。warmup 和 eval 的 chunk 照常收集数据但不换取梯度步，否则 warmup 阶段会把实际 UTD 抬到配置值以上。训练在请求锁内同步执行，这期间 server 不响应新请求 —— 机械臂本来就是停走式的，`ping_timeout` 默认给到 600 秒就是为了让 keepalive 熬过训练突发。
 
-checkpoint 按 `server.save_interval_episodes` 落在 `server.save_dir/episode_<N>/`，包含模型、target、两个 optimizer、rewind/schedule 状态和 replay/demo buffer。恢复用 `runner.resume_dir` 指向该目录。
+checkpoint 按 `server.save_interval_episodes` 落在 `server.save_dir/episode_<N>_step_<update_step>/`，包含模型、target、两个 optimizer、rewind/schedule 状态和 replay/demo buffer。目录名带上 update step 是为了让恢复后再存不会覆盖掉恢复前同编号的 episode。恢复用 `runner.resume_dir` 指向该目录。
 
 ## 11. 推荐的首次真机顺序
 
 1. 用 `transport.is_dummy=true` 跑通 server + client 链路，确认握手、warmup、`episode_end` 训练日志都正常。
 2. 校验 adapter：observation 三路相机、state 宽度、动作范围、watchdog、stop、fault、rewind。
-3. 启动 server，确认 preflight 全绿且超参警告里没有意料之外的项。
+3. 启动 server，确认 preflight 全绿（尤其是 norm stats 指向的是本任务）且超参警告里没有意料之外的项。
 4. 启动本地控制栈，先禁止真实动作或用最低速度/最小限幅。
-5. Dry run：确认 Stage 2 zero-init 输出与 Stage 1 reference 一致。
+5. Dry run：确认 Stage 2 zero-init 输出与 Stage 1 reference 一致；同时按 4.4 比一次 horizon 20 与 50 的差异。
 6. 单条低速 chunk：确认每步返回的 `executed_action` shape 和量纲正确。
 7. 分别实测：正常 rollout、人工接管、物理回退后人工恢复、物理回退后 policy 恢复。
 8. 跑到 replay 超过 250 行，确认 `mode` 从 `warmup` 变成 `actor`，且 `episode_end` 出现 critic/actor update 日志。

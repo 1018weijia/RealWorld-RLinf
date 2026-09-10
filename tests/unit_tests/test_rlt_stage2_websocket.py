@@ -27,6 +27,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 import torch
+from omegaconf import OmegaConf
 
 from rlinf.serving.rlt.inference import (
     ActionSelection,
@@ -37,8 +38,10 @@ from rlinf.serving.rlt.policy import RLTStage2Policy
 from rlinf.serving.rlt.preflight import (
     PreflightError,
     check_camera_layout,
+    check_norm_stats_configured,
     check_task_prompt,
     read_rlt_prefix_seq_len,
+    resolve_stage1_weights,
 )
 from rlinf.serving.rlt.protocol import (
     ACTION_SPACE_NORMALIZED,
@@ -914,3 +917,54 @@ def test_preflight_reads_the_rlt_prefix_length_from_a_checkpoint(tmp_path):
 
     with pytest.raises(PreflightError, match="not found"):
         read_rlt_prefix_seq_len(str(tmp_path / "missing.pt"))
+
+
+def test_preflight_resolves_both_stage1_checkpoint_layouts(tmp_path):
+    """The loader accepts two layouts; preflight must agree on both."""
+    for parts in (("model_state_dict",), ("actor", "model_state_dict")):
+        root = tmp_path / "_".join(parts)
+        target = root.joinpath(*parts, "full_weights.pt")
+        target.parent.mkdir(parents=True)
+        torch.save({"rlt_module.encoder.prefix_pos_enc": torch.zeros(968, 8)}, target)
+        assert resolve_stage1_weights(str(root)) == str(target)
+
+
+def test_preflight_rejects_a_model_path_pointing_at_model_state_dict(tmp_path):
+    """The old guide documented this path shape; it dies inside safetensors.
+
+    Pointing model_path at the directory that holds full_weights.pt matches
+    neither loader layout, so the run would fail well after startup looked
+    healthy. Preflight must say which way to correct it.
+    """
+    deep = tmp_path / "global_step_25000" / "actor" / "model_state_dict"
+    deep.mkdir(parents=True)
+    torch.save(
+        {"rlt_module.encoder.prefix_pos_enc": torch.zeros(968, 8)},
+        deep / "full_weights.pt",
+    )
+
+    with pytest.raises(PreflightError, match="one level too deep"):
+        resolve_stage1_weights(str(deep))
+
+    # ...and the correct parent resolves.
+    assert resolve_stage1_weights(str(deep.parent.parent)).endswith("full_weights.pt")
+
+
+def test_preflight_requires_norm_stats_to_be_configured_explicitly():
+    """An unset norm_stats_path silently selects another task's quantiles."""
+    assert (
+        check_norm_stats_configured(OmegaConf.create({"norm_stats_path": "/a/b.json"}))
+        == "/a/b.json"
+    )
+    for bad in ({}, {"norm_stats_path": ""}, {"norm_stats_path": None}):
+        with pytest.raises(PreflightError, match="norm_stats_path is not set"):
+            check_norm_stats_configured(OmegaConf.create(bad))
+
+
+def test_preflight_rejects_a_prompt_that_disagrees_with_stage1():
+    """server.task_prompt and openpi_data.default_prompt feed different paths."""
+    check_task_prompt("assemble parts", stage1_prompt="assemble parts")
+    check_task_prompt("Assemble Parts", stage1_prompt="assemble parts")
+
+    with pytest.raises(PreflightError, match="disagrees with"):
+        check_task_prompt("put cube in drawer", stage1_prompt="assemble parts")
