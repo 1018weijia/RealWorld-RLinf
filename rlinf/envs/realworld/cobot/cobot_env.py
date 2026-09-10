@@ -213,10 +213,11 @@ class CobotEnv(gym.Env):
             info.get("executed_action", info.get("intervene_action", action)),
             self.action_dim,
         )
-        if np.any(executed_action < -1.0) or np.any(executed_action > 1.0):
-            raise ValueError(
-                "Cobot adapter executed_action must be in normalized [-1, 1] space."
-            )
+        # No [-1, 1] range check. OpenPI quantile normalization maps the
+        # q01/q99 percentiles - not the extremes - to -1/+1, so a valid action
+        # legitimately falls outside the unit box, which is why the Stage 2
+        # actor clips at +/-1.4. Bounds belong to the adapter, which knows the
+        # robot's real joint limits.
         info["executed_action"] = executed_action
         if info["intervene_flag"]:
             info.setdefault("intervene_action", executed_action)

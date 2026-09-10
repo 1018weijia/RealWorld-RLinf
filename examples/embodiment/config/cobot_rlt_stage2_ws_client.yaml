@@ -1,0 +1,85 @@
+# Robot-side client for the RLT Stage 2 WebSocket server (Cobot Magic).
+#
+# This process owns the robot, the operator interface and the episode loop. It
+# never loads a model: it uploads raw camera frames, proprioception and the
+# prompt, and executes the robot-space chunks the server returns.
+#
+# Launch:  bash examples/embodiment/run_rlt_stage2_client.sh cobot_rlt_stage2_ws_client
+
+defaults:
+  - override hydra/job_logging: stdout
+  - _self_
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+
+client:
+  # Address of the training server. Use the training node's IP for a
+  # two-machine setup.
+  host: "127.0.0.1"
+  port: 8000
+  # The server may still be loading the Stage 1 checkpoint, which takes
+  # minutes; keep retrying rather than failing the operator's launch.
+  connect_timeout: 600.0
+  retry_interval: 2.0
+  # Must exceed the longest episode_end training burst.
+  recv_timeout: 900.0
+
+  num_episodes: 200
+
+  # Local chunk budget. The smaller of this and the server's value applies.
+  max_episode_chunks: 150
+
+  # Leave null to use the server's configured exploration noise.
+  exploration_noise_sigma: null
+
+  # Terminal rewards written onto the last chunk when the operator judges the
+  # episode. Sparse by design: the reference deployment learns from success
+  # and rewind penalties, not shaped reward.
+  success_reward: 1.0
+  failure_reward: 0.0
+  rewind_terminal_reward: -1.0
+  rewind_prefix_reward: 0.1
+
+  # Refuse to start when the server's action_dim, chunk length, proprio width
+  # or camera keys disagree with the transport.
+  validate_handshake: True
+
+transport:
+  # true runs MockRewindAdapter: no robot moves and every frame is black.
+  # Only for wiring smoke tests.
+  is_dummy: True
+
+  # Real hardware needs a controller factory; the client refuses to start with
+  # is_dummy=false and no factory rather than silently running the mock.
+  controller_factory: null
+
+  action_dim: 14
+  proprio_dim: 14
+  # Must equal actor.model.num_action_chunks on the server.
+  chunk_len: 16
+  camera_keys: [image, wrist_image, side_image]
+  task: "put cube in drawer"
+
+  # Chunks the adapter can physically reverse-play. A rewind request beyond
+  # this is capped, with a warning.
+  rewind_history_chunks: 12
+
+  # Abort the chunk as soon as the adapter reports rlt_safety_fault.
+  stop_on_safety_fault: True
+
+# Operator keys. There is no Stage 2 toggle: the server decides between the
+# Stage 1 reference and the Stage 2 head based on warmup progress, so a manual
+# switch would only desynchronize the two sides.
+keyboard:
+  success: "s"          # mark the episode solved, terminal reward on this chunk
+  failure: "f"          # mark the episode failed and stop
+  rewind_exit: "b"      # physical rewind: back the arm out of a bad branch
+  rewind_credit: "q"    # credit-only rewind: patch replay, do not move
+  abort: "escape"       # stop the arm and end the episode without a verdict
+
+logging:
+  log_path: "../results"
+  experiment_name: "cobot_rlt_stage2_ws_client"

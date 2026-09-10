@@ -28,6 +28,7 @@ def _make_td3_mlp(
     output_dim: int,
     hidden_dim: int,
     num_hidden_layers: int,
+    use_layer_norm: bool = False,
 ) -> nn.Sequential:
     layers = make_mlp(
         in_channels=input_dim,
@@ -37,9 +38,22 @@ def _make_td3_mlp(
         ],
         act_builder=nn.ReLU,
         last_act=False,
+        use_layer_norm=use_layer_norm,
     )
     # Keep the historical ablation MLP state_dict shape: mlp.net.*
     return nn.Sequential(OrderedDict([("net", nn.Sequential(*layers))]))
+
+
+DEFAULT_ACTION_CLIP_MIN = -1.4
+DEFAULT_ACTION_CLIP_MAX = 1.4
+"""Default residual-action bounds in OpenPI normalized space.
+
+OpenPI quantile normalization maps ``q01``/``q99`` to ``-1``/``+1``, so a
+legitimate demonstration action can sit outside ``[-1, 1]``. Clipping the
+residual output to ``[-1, 1]`` would also clip the frozen VLA reference
+``a_tilde`` it is added to, silently deleting reachable actions. ``+/-1.4``
+matches the remote-franka reference deployment.
+"""
 
 
 class DirectGaussianActor(nn.Module):
@@ -58,11 +72,20 @@ class DirectGaussianActor(nn.Module):
         sigma: float = 0.1,
         ref_dropout: float = 0.0,
         edit_scale: float = 0.2,
+        action_clip_min: float = DEFAULT_ACTION_CLIP_MIN,
+        action_clip_max: float = DEFAULT_ACTION_CLIP_MAX,
     ) -> None:
         super().__init__()
         self.sigma = float(sigma)
         self.ref_dropout = float(ref_dropout)
         self.edit_scale = float(edit_scale)
+        self.action_clip_min = float(action_clip_min)
+        self.action_clip_max = float(action_clip_max)
+        if self.action_clip_min >= self.action_clip_max:
+            raise ValueError(
+                "action_clip_min must be < action_clip_max, got "
+                f"[{self.action_clip_min}, {self.action_clip_max}]"
+            )
         if self.edit_scale <= 0.0:
             raise ValueError("edit_scale must be positive")
         self.mlp = _make_td3_mlp(
@@ -112,7 +135,7 @@ class DirectGaussianActor(nn.Module):
         if apply_action_noise and self.sigma > 0.0:
             residual = residual + torch.randn_like(residual) * self.sigma
         action = a_tilde + self.edit_scale * torch.tanh(residual)
-        return action.clamp(-1.0, 1.0)
+        return action.clamp(self.action_clip_min, self.action_clip_max)
 
     def mean(self, x: torch.Tensor, a_tilde: torch.Tensor) -> torch.Tensor:
         return self.forward(
@@ -133,6 +156,7 @@ class QNetwork(nn.Module):
         action_chunk_dim: int,
         hidden_dim: int = 256,
         num_hidden_layers: int = 2,
+        use_layer_norm: bool = False,
     ) -> None:
         super().__init__()
         self.mlp = _make_td3_mlp(
@@ -140,6 +164,7 @@ class QNetwork(nn.Module):
             output_dim=1,
             hidden_dim=int(hidden_dim),
             num_hidden_layers=int(num_hidden_layers),
+            use_layer_norm=bool(use_layer_norm),
         )
 
     def forward(self, x: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
@@ -155,6 +180,7 @@ class TwinQCritic(nn.Module):
         action_chunk_dim: int,
         hidden_dim: int = 256,
         num_hidden_layers: int = 2,
+        use_layer_norm: bool = False,
     ) -> None:
         super().__init__()
         self.q1 = QNetwork(
@@ -162,12 +188,14 @@ class TwinQCritic(nn.Module):
             action_chunk_dim=action_chunk_dim,
             hidden_dim=hidden_dim,
             num_hidden_layers=num_hidden_layers,
+            use_layer_norm=use_layer_norm,
         )
         self.q2 = QNetwork(
             state_dim=state_dim,
             action_chunk_dim=action_chunk_dim,
             hidden_dim=hidden_dim,
             num_hidden_layers=num_hidden_layers,
+            use_layer_norm=use_layer_norm,
         )
 
     def forward(self, x: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
@@ -202,6 +230,9 @@ class RLTTD3MLPPolicy(nn.Module, BasePolicy):
         action_selection_mode: str = "expo",
         expo_num_base_samples: int = 4,
         expo_num_edit_samples: int = 4,
+        action_clip_min: float = DEFAULT_ACTION_CLIP_MIN,
+        action_clip_max: float = DEFAULT_ACTION_CLIP_MAX,
+        critic_use_layer_norm: bool = False,
     ) -> None:
         super().__init__()
         if not add_q_head:
@@ -244,6 +275,8 @@ class RLTTD3MLPPolicy(nn.Module, BasePolicy):
                 "expo_num_edit_samples must be in [0, expo_num_base_samples]"
             )
 
+        self.action_clip_min = float(action_clip_min)
+        self.action_clip_max = float(action_clip_max)
         self.actor = DirectGaussianActor(
             state_dim=self.state_dim,
             action_chunk_dim=self.flat_action_dim,
@@ -252,6 +285,8 @@ class RLTTD3MLPPolicy(nn.Module, BasePolicy):
             sigma=actor_noise_sigma,
             ref_dropout=ref_action_dropout,
             edit_scale=residual_scale,
+            action_clip_min=action_clip_min,
+            action_clip_max=action_clip_max,
         )
         # Name this q_head so existing SAC/RLT optimizer filtering keeps actor
         # and critic optimizers separate.
@@ -260,6 +295,7 @@ class RLTTD3MLPPolicy(nn.Module, BasePolicy):
             action_chunk_dim=self.flat_action_dim,
             hidden_dim=mlp_hidden_dim,
             num_hidden_layers=mlp_num_hidden_layers,
+            use_layer_norm=critic_use_layer_norm,
         )
         # Rollout workers need the target critic for EXPO selection. This frozen
         # shadow is refreshed by the learner before normal RLinf weight sync.

@@ -1,0 +1,253 @@
+# RLT Stage 2 online-RL server for Cobot Magic, aligned with the
+# rlt-openpi remote-franka deployment.
+#
+# This config drives a single process that holds the frozen Stage 1 VLA, the
+# Stage 2 actor/critic, the replay buffers and the optimizers, and serves the
+# robot over WebSocket. There is deliberately no `cluster`, `weight_syncer`,
+# `fsdp_config` or `rollout` section: Ray is not involved, and the policy that
+# acts is the same object that trains, so there is nothing to synchronize.
+#
+# Launch:  bash examples/embodiment/run_rlt_stage2_server.sh cobot_rlt_stage2_ws_server
+
+defaults:
+  - override hydra/job_logging: stdout
+  - _self_
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+
+server:
+  host: "0.0.0.0"
+  port: 8000
+  # WebSocket keepalive. Training bursts can block the handler for tens of
+  # seconds, so the ping timeout must be generous or the client is dropped
+  # mid-episode.
+  ping_interval: 20.0
+  ping_timeout: 600.0
+
+  # Language instruction for the frozen Stage 1 VLA. Preflight rejects
+  # placeholders: a wrong prompt yields confident but wrong actions.
+  task_prompt: "put cube in drawer"
+
+  # Client camera keys, main view first. Must match the client transport and
+  # openpi.num_images_in_input.
+  camera_keys: [image, wrist_image, side_image]
+
+  # Chunk budget per episode. Reported in the handshake; the client takes the
+  # smaller of this and its own.
+  max_episode_chunks: 150
+
+  # Replay rows collected before the Stage 2 head is allowed to drive. Until
+  # then, every chunk is the Stage 1 reference.
+  warmup_steps: 250
+
+  # Gradient steps per policy-driven chunk, run at episode_end.
+  utd_ratio: 5
+
+  # Space the replay buffer stores actions in. `normalized` keeps replay in
+  # OpenPI model space, matching the Stage 2 actor's own output space.
+  replay_action_space: normalized
+
+  # Evaluate without training or writing replay.
+  eval_only: False
+
+  save_dir: "../results/cobot_rlt_stage2_ws/checkpoints"
+  save_interval_episodes: 10
+
+  # Warn when any of these differ from the remote-franka reference.
+  check_reference_hyperparameters: True
+
+runner:
+  logger:
+    log_path: "../results"
+    project_name: rlinf-rlt
+    experiment_name: "cobot_rlt_stage2_ws"
+    logger_backends: ["tensorboard"]
+
+  # Resume a Stage 2 server checkpoint directory (model + optimizers + replay).
+  # Do not point this at the Stage 1 OpenPI checkpoint.
+  resume_dir: null
+
+algorithm:
+  group_size: 1
+  agg_q: min
+  actor_agg_q: min
+  q_head_type: ${actor.model.q_head_type}
+
+  adv_type: rlt_td3
+  loss_type: rlt_td3
+  loss_agg_func: "token-mean"
+
+  # remote-franka EXPO actor: pure -min(Q1, Q2), without VLA/human BC.
+  q_weight: 1.0
+  bc_weight: 0.0
+
+  reference_dropout_prob: 0.0
+  actor_update_action_noise: True
+
+  expo:
+    enable: True
+    base_candidates: 4
+    edited_candidates: 4
+
+  rewind_preference:
+    enable: True
+    capacity: 2000
+    batch_size: 32
+    min_pairs: 1
+    history_chunks: 64
+    critic_weight: 0.1
+    actor_weight: 0.1
+    rank_margin: 0.1
+    actor_beta: 0.1
+    rewind_exit_terminal_reward: -1.0
+    rewind_credit_terminal_reward: -1.0
+    rewind_credit_prefix_reward: 0.1
+
+  bootstrap_type: standard
+  gamma: 0.99
+  tau: 0.005
+  use_done_key: True
+  critic_loss: huber
+  critic_huber_delta: 0.5
+  intervention_critic_action_noise_sigma: 0.002
+  intervention_critic_action_noise_clip: 0.005
+  rewind_critic_action_noise_sigma: 0.002
+  rewind_critic_action_noise_clip: 0.005
+
+  # Entropy/alpha is kept at zero; this is not maximum-entropy SAC.
+  entropy_tuning:
+    alpha_type: fixed_alpha
+    initial_alpha: 0.0
+
+  # Fraction of each batch drawn from the intervention/demo partition.
+  demo_batch_ratio: 0.5
+
+  replay_buffer:
+    enable_cache: True
+    cache_size: 200
+    min_buffer_size: 2
+    sample_window_size: 200
+    auto_save: False
+    prioritized: True
+    per_alpha: 0.6
+    per_beta_start: 0.4
+    per_beta_end: 1.0
+    per_beta_anneal_steps: 50000
+    per_eps: 1.0e-6
+
+  # Reuse the demo buffer as the intervention sampling partition.
+  demo_buffer:
+    enable_cache: True
+    cache_size: 200
+    min_buffer_size: 1
+    sample_window_size: 200
+    auto_save: False
+    allow_empty: True
+
+  rlt_schedule:
+    enable: True
+    warmup_min_size: ${server.warmup_steps}
+    warmup_post_collect_updates: 0
+    utd_ratio: ${server.utd_ratio}
+    episode_boundary_only: True
+    max_updates_per_train_step: 0
+
+  target_update_freq: 1
+  target_update_type: all
+  critic_actor_ratio: 2
+  critic_subsample_size: 0
+  backup_entropy: False
+
+# Frozen Stage 1 pi0.5 + RLT token transformer. Runs in this process.
+rlt_feature_model:
+  model_type: "openpi_rlinf"
+  precision: bf16
+  is_lora: False
+  num_action_chunks: 20
+  action_dim: 14
+  num_steps: 4
+  add_value_head: False
+  # Stage 1 checkpoint directory produced by the Stage 1 SFT config.
+  model_path: "/path/to/stage1/checkpoint"
+  # Refuse to start on a checkpoint without rlt_module.* weights.
+  require_rlt_checkpoint: True
+  openpi_data:
+    repo_id: "cobot_rlt_stage1"
+  openpi:
+    task: eval
+    config_name: "pi05_cobot_magic"
+    num_images_in_input: 3
+    action_chunk: ${actor.model.ref_num_action_chunks}
+    action_horizon: ${rlt_feature_model.num_action_chunks}
+    action_env_dim: ${rlt_feature_model.action_dim}
+    num_steps: 4
+    model_action_dim: 32
+    paligemma_variant: "gemma_2b"
+    action_expert_variant: "gemma_300m"
+    max_token_len: 200
+    discrete_state_input: True
+    state_indices: []
+    noise_method: "flow_noise"
+    noise_params: [0.16, 0.12, 200]
+    joint_logprob: True
+    use_rlt: True
+    # Must equal the checkpoint's rlt_module.encoder.prefix_pos_enc length.
+    # The assemble 15k checkpoint was trained with 968; preflight checks this
+    # and prints the correct value on mismatch.
+    rlt_prefix_seq_len: 968
+    rlt_image_only: False
+    rlt_use_mask: True
+
+actor:
+  seed: 1234
+  micro_batch_size: 256
+  global_batch_size: 256
+
+  model:
+    model_type: "rlt_td3_mlp_policy"
+
+    # fp32 throughout: Q-learning and Polyak target updates are the first
+    # things to destabilize in bf16.
+    precision: fp32
+    add_value_head: False
+    add_q_head: True
+    q_head_type: "default"
+    fixed_std: 0.2
+    is_lora: False
+
+    z_dim: 2048
+    proprio_dim: 14
+    action_dim: 14
+    num_action_chunks: 16
+    ref_num_action_chunks: 20
+    actor_noise_sigma: 0.2
+    residual_scale: 0.2
+    action_selection_mode: expo
+    expo_num_base_samples: 4
+    expo_num_edit_samples: 4
+
+    # remote-franka reference head geometry.
+    mlp_hidden_dim: 256
+    mlp_num_hidden_layers: 3
+    critic_use_layer_norm: True
+
+    # Residual bounds in OpenPI normalized space. Quantile normalization maps
+    # q01/q99 (not the extremes) to -1/+1, so a valid action can sit outside
+    # the unit box; clipping at 1.0 would delete reachable actions.
+    action_clip_min: -1.4
+    action_clip_max: 1.4
+
+  optim:
+    clip_grad: 10.0
+    # remote-franka runs the actor an order of magnitude slower than the
+    # critic; a faster actor chases a critic that has not converged yet.
+    lr: 3e-5
+    lr_scheduler: torch_constant
+
+  critic_optim:
+    clip_grad: 10.0
+    lr: 3e-4
+    lr_scheduler: torch_constant

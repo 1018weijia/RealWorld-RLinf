@@ -13,6 +13,14 @@
 # limitations under the License.
 
 from rlinf.algorithms.expert import build_expert_model_config
+from rlinf.algorithms.rlt.learner import (
+    RLTHostHooks,
+    RLTLearnerCore,
+    RLTLossCore,
+    RLTReplayCore,
+    RLTRewindCore,
+    RLTScheduleCore,
+)
 from rlinf.algorithms.rlt.losses import (
     actor_pairwise_preference_loss,
     compute_q_node1_gap,
@@ -43,8 +51,14 @@ from rlinf.algorithms.rlt.transition import (
 
 __all__ = [
     "ProgressHeadEnsemble",
+    "RLTHostHooks",
+    "RLTLearnerCore",
+    "RLTLossCore",
+    "RLTReplayCore",
+    "RLTRewindCore",
     "RLTRoute",
     "RLTRouteContext",
+    "RLTScheduleCore",
     "RealworldRLTRoute",
     "SimulatorRLTRoute",
     "annotate_rlt_branch_fields",

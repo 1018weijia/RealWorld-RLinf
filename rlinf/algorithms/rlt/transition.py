@@ -249,7 +249,12 @@ def branch_fields_from_env_info(
 
 def use_simulator_transition_replay(cfg: Any) -> bool:
     """Return True for envs that store one replay row per env step."""
-    train_env_cfg = cfg.env.get("train", None)
+    # The WebSocket server config has no `env` section at all: the robot loop
+    # lives in a separate process, so there is nothing simulator-like here.
+    env_cfg = cfg.get("env", None)
+    if env_cfg is None:
+        return False
+    train_env_cfg = env_cfg.get("train", None)
     if train_env_cfg is None:
         return False
     try:

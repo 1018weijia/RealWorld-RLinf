@@ -363,8 +363,23 @@ def test_residual_actor_and_checkpoint_semantic_golden():
     ][-1]
     with torch.no_grad():
         last.bias.fill_(2.0)
-    expected = (reference + 0.2 * torch.tanh(torch.tensor(2.0))).clamp(-1, 1)
+    # OpenPI quantile normalization lets a valid reference exceed [-1, 1], so
+    # the residual is bounded by the configured clip, not by unit range.
+    assert (actor.action_clip_min, actor.action_clip_max) == (-1.4, 1.4)
+    expected = (reference + 0.2 * torch.tanh(torch.tensor(2.0))).clamp(-1.4, 1.4)
     assert torch.allclose(actor.mean(state, reference), expected)
+
+    tight = DirectGaussianActor(
+        state_dim=2,
+        action_chunk_dim=3,
+        hidden_dim=4,
+        num_hidden_layers=1,
+        sigma=0.0,
+        edit_scale=0.2,
+        action_clip_min=-0.5,
+        action_clip_max=0.5,
+    )
+    assert torch.equal(tight.mean(state, reference), reference.clamp(-0.5, 0.5))
 
     model = _policy()
     assert model.actor_semantic_version.item() == 2

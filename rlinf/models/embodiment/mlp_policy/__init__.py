@@ -20,7 +20,11 @@ def get_model(cfg: DictConfig, torch_dtype=torch.bfloat16):
     from rlinf.models.embodiment.mlp_policy.iql_mlp_policy import IQLMLPPolicy
     from rlinf.models.embodiment.mlp_policy.mlp_policy import MLPPolicy
     from rlinf.models.embodiment.mlp_policy.rlt_mlp_policy import RLTMLPPolicy
-    from rlinf.models.embodiment.mlp_policy.rlt_td3_mlp_policy import RLTTD3MLPPolicy
+    from rlinf.models.embodiment.mlp_policy.rlt_td3_mlp_policy import (
+        DEFAULT_ACTION_CLIP_MAX,
+        DEFAULT_ACTION_CLIP_MIN,
+        RLTTD3MLPPolicy,
+    )
 
     iql_config = cfg.get("iql_config", None)
     if cfg.model_type == "rlt_mlp_policy":
@@ -55,6 +59,9 @@ def get_model(cfg: DictConfig, torch_dtype=torch.bfloat16):
             action_selection_mode=cfg.get("action_selection_mode", "expo"),
             expo_num_base_samples=cfg.get("expo_num_base_samples", 4),
             expo_num_edit_samples=cfg.get("expo_num_edit_samples", 4),
+            action_clip_min=cfg.get("action_clip_min", DEFAULT_ACTION_CLIP_MIN),
+            action_clip_max=cfg.get("action_clip_max", DEFAULT_ACTION_CLIP_MAX),
+            critic_use_layer_norm=cfg.get("critic_use_layer_norm", False),
         )
     elif iql_config is not None:
         model = IQLMLPPolicy(

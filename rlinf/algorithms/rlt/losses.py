@@ -141,6 +141,8 @@ def compute_rlt_critic_loss(
     intervention_noise_clip: float = 0.0,
     rewind_noise_sigma: float = 0.0,
     rewind_noise_clip: float = 0.0,
+    action_clip_min: float = -1.0,
+    action_clip_max: float = 1.0,
 ) -> tuple[Tensor, dict[str, Any]]:
     """Twin-Q TD loss with EXPO expected-max and optional PER weights."""
     from rlinf.models.embodiment.base_policy import ForwardType
@@ -274,7 +276,12 @@ def compute_rlt_critic_loss(
         noise = torch.randn_like(values) * float(sigma)
         if noise_clip > 0.0:
             noise = noise.clamp(-float(noise_clip), float(noise_clip))
-        return torch.where(selected, (values + noise).clamp(-1.0, 1.0), values)
+        # Smoothed target actions must stay inside the same bounds the actor
+        # enforces, or the critic scores actions the policy can never emit.
+        smoothed = (values + noise).clamp(
+            float(action_clip_min), float(action_clip_max)
+        )
+        return torch.where(selected, smoothed, values)
 
     critic_actions = _augment_selected(
         critic_actions,

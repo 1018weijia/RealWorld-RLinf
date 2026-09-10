@@ -285,14 +285,48 @@ class MockRewindAdapter:
         self._chunk_start_state = None
 
 
-def validate_action(action: Sequence[float], action_dim: int) -> np.ndarray:
-    """Validate a normalized action before passing it to a controller."""
+def validate_action(
+    action: Sequence[float],
+    action_dim: int,
+    *,
+    clip_min: float | None = None,
+    clip_max: float | None = None,
+) -> np.ndarray:
+    """Validate one action before passing it to a controller.
 
-    value = np.asarray(action, dtype=np.float32).reshape(-1)
+    Args:
+        action: Flat action for a single step.
+        action_dim: Expected number of joints/DoF.
+        clip_min: Lower bound to enforce, or ``None`` to skip the range check.
+        clip_max: Upper bound to enforce, or ``None`` to skip the range check.
+
+    Returns:
+        The action as a flat ``float32`` array.
+
+    Raises:
+        ValueError: The action has the wrong size, is non-finite, or falls
+            outside an enforced bound.
+
+    Note:
+        No range check runs by default. Actions reaching a controller are in
+        robot space (radians, metres), and even model-space actions legitimately
+        exceed ``[-1, 1]`` because OpenPI quantile normalization maps the
+        ``q01``/``q99`` percentiles - not the extremes - to ``-1``/``+1``.
+        Callers that do have a hard bound pass it explicitly.
+    """
+    # np.array, not np.asarray: callers store the result as mutable controller
+    # state, and an action that arrived over msgpack is a read-only view.
+    value = np.array(action, dtype=np.float32).reshape(-1)
     if value.size != action_dim:
         raise ValueError(f"Expected action_dim={action_dim}, got {value.size}.")
     if not np.isfinite(value).all():
         raise ValueError("Cobot actions must contain only finite values.")
-    if np.any(value < -1.0) or np.any(value > 1.0):
-        raise ValueError("Cobot actions must be normalized to [-1, 1].")
+    if clip_min is not None and np.any(value < clip_min):
+        raise ValueError(
+            f"Cobot action below clip_min={clip_min}: min={value.min():.4f}"
+        )
+    if clip_max is not None and np.any(value > clip_max):
+        raise ValueError(
+            f"Cobot action above clip_max={clip_max}: max={value.max():.4f}"
+        )
     return value
