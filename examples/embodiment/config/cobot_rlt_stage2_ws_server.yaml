@@ -61,6 +61,11 @@ server:
   # Warn when any of these differ from the remote-franka reference.
   check_reference_hyperparameters: True
 
+  # Run the startup checks and exit without loading Stage 1 or opening the
+  # port. Override to True to validate a checkpoint/prompt/norm-stats
+  # combination in seconds instead of minutes.
+  preflight_only: False
+
 runner:
   logger:
     log_path: "../results"

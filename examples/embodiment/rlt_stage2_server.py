@@ -226,6 +226,13 @@ def main(cfg: DictConfig) -> None:
     logger.info("Server config:\n%s", OmegaConf.to_yaml(cfg))
 
     run_preflight(cfg)
+    if bool(cfg.server.get("preflight_only", False)):
+        # Loading Stage 1 costs minutes and 16 GB of reads, so allow checking a
+        # checkpoint/prompt/norm-stats combination on its own. Useful before
+        # committing a robot session to a config.
+        logger.info("server.preflight_only is set; exiting without serving.")
+        return
+
     policy = build_policy(cfg)
 
     server = RLinfWebsocketPolicyServer(

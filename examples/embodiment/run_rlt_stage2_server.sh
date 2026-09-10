@@ -13,6 +13,9 @@ set -euo pipefail
 export EMBODIED_PATH="$( cd "$(dirname "${BASH_SOURCE[0]}" )" && pwd )"
 export REPO_PATH=$(dirname $(dirname "$EMBODIED_PATH"))
 export SRC_FILE="${EMBODIED_PATH}/rlt_stage2_server.py"
+# RLinf is used from the source tree, not pip-installed, and running the script
+# by path puts only its own directory on sys.path.
+export PYTHONPATH="${REPO_PATH}:${PYTHONPATH:-}"
 
 CONFIG_NAME="${1:-cobot_rlt_stage2_ws_server}"
 shift || true

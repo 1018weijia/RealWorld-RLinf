@@ -9,6 +9,44 @@
 
 当前推荐的 Stage 1 权重是 assemble **30k**（该次 SFT 的最终权重），见第 2 节。
 
+## 0. 命令速查
+
+按顺序执行。前四条不需要机械臂，第 1、2 条连 GPU 都不需要。
+
+```bash
+cd /data/gxy/realworldRL/RLinf
+
+# 1. 协议/循环冒烟：真 WebSocket + 假模型，跑完一整个 episode
+.venv/bin/python -m pytest tests/unit_tests/test_rlt_stage2_websocket.py -q
+
+# 2. 列出可用的 Stage 1 checkpoint，每组最后一行是该 run 最新的 step
+find /data/gxy/realworldRL/RLinf/logs -maxdepth 5 -type d -name 'global_step_*' \
+  -path '*cobot_*legacy_action_expert_base*' | sort -V
+
+# 3. 只跑启动检查，不加载 Stage 1、不开端口（约 6 秒）
+bash examples/embodiment/run_rlt_stage2_server.sh cobot_rlt_stage2_ws_server \
+  server.preflight_only=True
+
+# 4. 启动 server（加载 16 GB Stage 1，需要 GPU，之后常驻）
+bash examples/embodiment/run_rlt_stage2_server.sh cobot_rlt_stage2_ws_server \
+  server.host=0.0.0.0 server.port=8000
+
+# 5. 空跑 client：机械臂不动、相机全黑，只验证握手和链路
+bash examples/embodiment/run_rlt_stage2_client.sh cobot_rlt_stage2_ws_client \
+  client.host=<GPU_HEAD_IP> client.port=8000 client.num_episodes=1
+
+# 6. 真机 client（在接机械臂的那台机器上跑）
+bash examples/embodiment/run_cobot_control.sh cobot_rlt_stage2_ws_client \
+  client.host=<GPU_HEAD_IP> client.port=8000 \
+  transport.is_dummy=false \
+  transport.controller_factory=your_package.controller:create_adapter \
+  transport.task="assemble parts"
+```
+
+第 5 条用的是 `run_rlt_stage2_client.sh`（不拉起控制栈），第 6 条用的是 `run_cobot_control.sh`（先拉起 ROS/驱动/相机再转交 client）。两个脚本吃同一份 config。
+
+各步的含义、需要确认什么、以及换 checkpoint 时要一起改哪几项，见下面对应章节。
+
 ## 1. 架构与边界
 
 Stage 2 不使用 Ray。整套系统只有两个进程：
@@ -300,15 +338,75 @@ checkpoint 按 `server.save_interval_episodes` 落在 `server.save_dir/episode_<
 
 ## 11. 推荐的首次真机顺序
 
-1. 用 `transport.is_dummy=true` 跑通 server + client 链路，确认握手、warmup、`episode_end` 训练日志都正常。
-2. 校验 adapter：observation 三路相机、state 宽度、动作范围、watchdog、stop、fault、rewind。
-3. 启动 server，确认 preflight 全绿（尤其是 norm stats 指向的是本任务）且超参警告里没有意料之外的项。
-4. 启动本地控制栈，先禁止真实动作或用最低速度/最小限幅。
-5. Dry run：确认 Stage 2 zero-init 输出与 Stage 1 reference 一致；同时按 4.4 比一次 horizon 20 与 50 的差异。
-6. 单条低速 chunk：确认每步返回的 `executed_action` shape 和量纲正确。
-7. 分别实测：正常 rollout、人工接管、物理回退后人工恢复、物理回退后 policy 恢复。
-8. 跑到 replay 超过 250 行，确认 `mode` 从 `warmup` 变成 `actor`，且 `episode_end` 出现 critic/actor update 日志。
-9. 确认 checkpoint 正常落盘，并用 `runner.resume_dir` 验证一次恢复。
+**第 1 步：不碰 GPU、不碰机械臂，先验协议和循环。**
+
+```bash
+.venv/bin/python -m pytest tests/unit_tests/test_rlt_stage2_websocket.py -q
+```
+
+其中 `test_full_episode_over_a_real_websocket` 会起一个真 WebSocket server、连一个真 client，用假模型跑完一整个 episode，覆盖 warmup、UTD 预算、成功判定和 rewind。这一步失败就不用往下走了。
+
+**第 2 步：确认 checkpoint 组合是对的。**
+
+```bash
+bash examples/embodiment/run_rlt_stage2_server.sh cobot_rlt_stage2_ws_server \
+  server.preflight_only=True
+```
+
+约 6 秒返回，不加载 Stage 1 也不开端口。要确认的是：prefix_seq_len 匹配、**norm stats 那行指向的是本任务**（不是 `cube_into_drawer`）、prompt 是 Stage 1 训练用的那条、相机是三路，以及超参警告里没有意料之外的项。
+
+**第 3 步：启动 server，让它常驻。**
+
+```bash
+bash examples/embodiment/run_rlt_stage2_server.sh cobot_rlt_stage2_ws_server \
+  server.host=0.0.0.0 server.port=8000
+```
+
+等到出现 `RLT Stage 2 server ready on 0.0.0.0:8000 (warmup 250 rows, utd 5)` 再继续。
+
+**第 4 步：空跑 client，验证握手。**
+
+```bash
+bash examples/embodiment/run_rlt_stage2_client.sh cobot_rlt_stage2_ws_client \
+  client.host=<GPU_HEAD_IP> client.port=8000 client.num_episodes=1
+```
+
+默认 `is_dummy: true`，机械臂不动、相机全黑。要看到握手通过、每个 chunk 打出 `mode=warmup`、`episode_end` 正常返回。这一步验证的是网络和形状约定，不验证策略质量（输入是黑图，动作没有意义）。
+
+**第 5 步：校验你自己的 adapter。** observation 三路相机、state 宽度、动作范围、watchdog、stop、fault、rewind。这部分没有通用命令，取决于你的控制栈。
+
+**第 6 步：启动本地控制栈，先禁止真实动作或用最低速度/最小限幅。**
+
+```bash
+bash examples/embodiment/run_cobot_control.sh cobot_rlt_stage2_ws_client \
+  client.host=<GPU_HEAD_IP> client.port=8000 \
+  transport.is_dummy=false \
+  transport.controller_factory=your_package.controller:create_adapter \
+  transport.task="assemble parts"
+```
+
+**第 7 步：Dry run。** 确认 Stage 2 zero-init 输出与 Stage 1 reference 一致（residual 输出层零初始化，两者应当逐元素相同）；同时按 4.4 比一次 horizon 20 与 50 的差异。
+
+**第 8 步：单条低速 chunk。** 确认每步返回的 `executed_action` shape 和量纲正确。
+
+**第 9 步：分别实测**正常 rollout、人工接管、物理回退后人工恢复、物理回退后 policy 恢复。
+
+**第 10 步：跑过 warmup。** 累计 replay 超过 250 行后，确认 `act` 响应里的 `mode` 从 `warmup` 变成 `actor`，且 `episode_end` 开始出现 critic/actor update 日志。
+
+**第 11 步：验证恢复。** 确认 checkpoint 落盘：
+
+```bash
+ls ../results/cobot_rlt_stage2_ws/checkpoints/
+# episode_10_step_<N>/  里应有 stage2_state.pt、replay_buffer/、demo_buffer/
+```
+
+然后停掉 server，指向该目录重启一次，确认日志里出现 `Resuming Stage 2 state from ...` 且 replay 行数接上了：
+
+```bash
+bash examples/embodiment/run_rlt_stage2_server.sh cobot_rlt_stage2_ws_server \
+  server.host=0.0.0.0 server.port=8000 \
+  runner.resume_dir=../results/cobot_rlt_stage2_ws/checkpoints/episode_10_step_<N>
+```
 
 ## 12. 运行中应观察的日志/指标
 
