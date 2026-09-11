@@ -20,7 +20,9 @@ import copy
 from types import SimpleNamespace
 
 import torch
+from omegaconf import OmegaConf
 
+from rlinf.algorithms.rlt.learner import RLTLossCore
 from rlinf.algorithms.rlt.losses import (
     actor_pairwise_preference_loss,
     compute_q_node1_gap,
@@ -276,6 +278,65 @@ def test_rewind_preference_losses_and_buffer():
     assert torch.isfinite(critic_loss) and torch.isfinite(actor_loss)
     assert critic_metrics["preference_pair_count"] == 1.0
     assert "preference_logprob_gap" in actor_metrics
+
+
+class _LossHost(RLTLossCore):
+    """Minimal host so ``forward_actor`` can be exercised without a Worker."""
+
+    def __init__(self, model, preference, cfg) -> None:
+        self.model = model
+        self.cfg = cfg
+        self.device = torch.device("cpu")
+        self.rewind_preference_buffer = preference
+        self.update_step = 0
+
+
+def test_shared_forward_actor_adds_rewind_preference_loss():
+    """The extracted learner must apply actor BT preference, not only critic."""
+    torch.manual_seed(1)
+    model = _policy()
+    batch = _batch()
+    preference = RewindPreferenceBuffer(capacity=2)
+    cfg = OmegaConf.create(
+        {
+            "actor": {
+                "model": {
+                    "num_action_chunks": CHUNK_LEN,
+                    "action_dim": ACTION_DIM,
+                    "actor_noise_sigma": 0.2,
+                }
+            },
+            "algorithm": {
+                "bc_weight": 1.0,
+                "q_weight": 0.0,
+                "rewind_preference": {
+                    "enable": True,
+                    "batch_size": 4,
+                    "min_pairs": 1,
+                    "actor_weight": 1.0,
+                    "actor_beta": 1.0,
+                },
+            },
+        }
+    )
+    host = _LossHost(model, preference, cfg)
+    empty_loss, _, empty_metrics = host.forward_actor(batch)
+    assert empty_metrics["preference_actor_active"] == 0.0
+
+    preference.add(
+        curr_obs={key: value[0] for key, value in batch["curr_obs"].items()},
+        ref_chunk=batch["curr_obs"]["ref_chunk"][0],
+        positive_action=batch["actions"][0],
+        negative_action=batch["actions"][1],
+        action_mask=torch.ones(CHUNK_LEN, ACTION_DIM, dtype=torch.bool),
+        confidence=0.8,
+    )
+    paired_loss, _, paired_metrics = host.forward_actor(batch)
+    assert paired_metrics["preference_actor_active"] == 1.0
+    assert paired_metrics["preference_actor_weight"] == 1.0
+    assert "preference_actor_loss" in paired_metrics
+    assert torch.isfinite(paired_loss)
+    assert not torch.allclose(empty_loss, paired_loss)
 
 
 def test_mock_cobot_rewind_state_machine():

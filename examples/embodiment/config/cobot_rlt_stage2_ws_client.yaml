@@ -52,9 +52,10 @@ transport:
   # Only for wiring smoke tests.
   is_dummy: True
 
-  # Real hardware needs a controller factory; the client refuses to start with
-  # is_dummy=false and no factory rather than silently running the mock.
-  controller_factory: null
+  # Real hardware: set is_dummy=false and point at the factory. The string is
+  # imported as module:function (or module.function) and called with
+  # action_dim= and task=. Fill stage2_hardware_adapter.py before using this.
+  controller_factory: rlinf.envs.realworld.cobot.stage2_hardware_adapter:create_adapter
 
   action_dim: 14
   proprio_dim: 14

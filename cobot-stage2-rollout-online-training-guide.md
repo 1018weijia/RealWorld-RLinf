@@ -4,8 +4,8 @@
 
 本文面向两类人员：
 
-- GPU/训练侧：启动 Stage 2 server，加载最新 Stage 1 权重，跑在线训练。
-- Cobot 真机侧：实现 transport，启动本地控制程序和 client，执行 rollout、接管和回退。
+- GPU/训练侧：启动 Stage 2 server，加载最新 Stage 1 权重，跑在线训练。看第 0、2、4、10、11 节。
+- Cobot 真机侧：**只看第 3 节就能知道要改哪些文件、每个方法填什么。** 第 0 节命令 6、第 6–9 节和第 11 节第 5 步以后是联调顺序。
 
 当前推荐的 Stage 1 权重是 assemble **30k**（该次 SFT 的最终权重），见第 2 节。
 
@@ -17,7 +17,8 @@
 cd /data/gxy/realworldRL/RLinf
 
 # 1. 协议/循环冒烟：真 WebSocket + 假模型，跑完一整个 episode
-.venv/bin/python -m pytest tests/unit_tests/test_rlt_stage2_websocket.py -q
+.venv/bin/python -m pytest tests/unit_tests/test_rlt_stage2_websocket.py \
+  tests/unit_tests/test_rlt_client_import_does_not_kill_roscore.py -q
 
 # 2. 列出可用的 Stage 1 checkpoint，每组最后一行是该 run 最新的 step
 find /data/gxy/realworldRL/RLinf/logs -maxdepth 5 -type d -name 'global_step_*' \
@@ -35,11 +36,11 @@ bash examples/embodiment/run_rlt_stage2_server.sh cobot_rlt_stage2_ws_server \
 bash examples/embodiment/run_rlt_stage2_client.sh cobot_rlt_stage2_ws_client \
   client.host=<GPU_HEAD_IP> client.port=8000 client.num_episodes=1
 
-# 6. 真机 client（在接机械臂的那台机器上跑）
+# 6. 真机 client（先按第 3 节填完 adapter 和 bring-up）
 bash examples/embodiment/run_cobot_control.sh cobot_rlt_stage2_ws_client \
   client.host=<GPU_HEAD_IP> client.port=8000 \
   transport.is_dummy=false \
-  transport.controller_factory=your_package.controller:create_adapter \
+  'transport.controller_factory=rlinf.envs.realworld.cobot.stage2_hardware_adapter:create_adapter' \
   transport.task="assemble parts"
 ```
 
@@ -130,34 +131,234 @@ mixed 是三任务模型，prompt 必须是训练时用过的三条之一，一�
 
 所以它由 `num_images_in_input` 和 `max_token_len` 决定，跟 action horizon 无关。改相机数量或 `max_token_len` 就得跟着改。preflight 会从 checkpoint 里读出 `rlt_module.encoder.prefix_pos_enc` 的实际长度，不匹配时报错并打印应该填的数字。
 
-## 3. 真机侧需要提供什么
+## 3. Client 侧要改什么（真机人员只看本节）
 
-client 通过 `CobotTransport` 调用你的 adapter。它是既有的 `CobotControlAdapter` 协议，逐步执行：
+GPU / server 侧**不用改代码**。循环、握手、WebSocket、反归一化、训练都已经接好。真机开训前，client 侧只交三样，缺一不可：
 
-```python
-class MyCobotAdapter:
-    action_dim = 14
+1. 填 adapter 骨架里的硬件调用（读相机、发关节、急停、按键）。
+2. 填 `run_cobot_control.sh` 的站点 bring-up（venv、ROS、相机 launch）。
+3. 真机启动时把 `transport.is_dummy` 设成 `false`。
 
-    def reset(self) -> CobotObservation: ...
-    def observe(self) -> CobotObservation: ...
-    def execute(self, action) -> CobotStepResult: ...
-    def stop(self, reason: str) -> None: ...
-    def close(self) -> None: ...
+**不要改这些文件：**
 
-    # 物理回退需要这两个；只做 credit-only 回退可以省略
-    def poll_rewind_event(self) -> CobotRewindEvent | OperatorEvent | None: ...
-    def rewind_chunks(self, count: int) -> CobotObservation: ...
+| 文件 | 为什么不要动 |
+|---|---|
+| `examples/embodiment/rlt_stage2_client.py` | 入口已经 `import` 工厂并跑循环 |
+| `rlinf/envs/realworld/rlt_client/loop.py` | stop-and-go、reward、rewind 请求 |
+| `rlinf/envs/realworld/rlt_client/transport.py` | 数据形状合同 |
+| `rlinf/envs/realworld/rlt_client/cobot.py` | 把 adapter 包成 transport；已支持 yaml 字符串工厂 |
+| `rlinf/serving/**`、`rlt_stage2_server.py` | GPU 侧 |
+
+`cobot.py` 的 `CobotEnv` / 旧 Ray yaml **也不要复用**：那是另一条路径，factory 签名和动作空间都不同。
+
+### 3.1 只要改的三个文件
+
+| 文件 | 改什么 | 不改什么 |
+|---|---|---|
+| `rlinf/envs/realworld/cobot/stage2_hardware_adapter.py` | 每个 `NotImplementedError` 换成你们的控臂 / 读相机；需要时打开键盘监听 | 不要改 `create_adapter` 的函数名和签名 |
+| `examples/embodiment/run_cobot_control.sh` | 解开并填第 1–3 段 “Site-specific setup” | 不要改后面的 `exec run_rlt_stage2_client.sh` |
+| `examples/embodiment/config/cobot_rlt_stage2_ws_client.yaml` | 真机把 `transport.is_dummy` 改成 `false`；确认 `task` 与 server 一致 | `controller_factory` 默认已经指向骨架，一般不用改 |
+
+yaml 真机段应是：
+
+```yaml
+transport:
+  is_dummy: false
+  controller_factory: rlinf.envs.realworld.cobot.stage2_hardware_adapter:create_adapter
+  task: "assemble parts"   # 必须与 server.task_prompt 一致
 ```
 
-与旧版本的三个区别：
+命令行等价写法（`:` 必须加引号，否则 Hydra 会把后半段当成另一个 override）：
 
-**动作是机器人空间的，不是 `[-1, 1]` 归一化的。** server 已经跑完 OpenPI 的反归一化，`execute()` 收到的就是可以直接下发的关节量。相应地 `validate_action` 不再强制 `[-1, 1]`：OpenPI 的分位数归一化把 q01/q99 而不是极值映射到 ±1，合法动作本来就可以越界。
+```bash
+bash examples/embodiment/run_cobot_control.sh cobot_rlt_stage2_ws_client \
+  client.host=<GPU_HEAD_IP> client.port=8000 \
+  transport.is_dummy=false \
+  'transport.controller_factory=rlinf.envs.realworld.cobot.stage2_hardware_adapter:create_adapter' \
+  transport.task="assemble parts"
+```
 
-**`observe()` 必须提供三路相机。** key 为 `image`（cam_high）、`wrist_image`（左腕）、`side_image`（右腕），顺序不能换 —— server 按这个顺序堆成 OpenPI Aloha transform 需要的 `[2, H, W, 3]` 腕部张量，交换两项等于交换两条手臂的视角。缺任何一路，client 直接报错而不是补黑帧。
+`run_cobot_control.sh` 用字符串匹配检查命令行里有没有 `transport.is_dummy=false`。只改 yaml、不在命令行再写一次时，脚本仍会打印 “将跑 Mock” 的警告，但实际会按 yaml 走真机。为免误会，真机启动请**命令行也带上** `transport.is_dummy=false`。
 
-**`poll_rewind_event()` 可以返回 `OperatorEvent`。** `CobotRewindEvent` 只能表达回退，而键盘还要产出成功、失败、中止。返回 `OperatorEvent(kind="success")` 等即可，transport 原样透传。
+client 入口会 `import` 这个字符串并调用：
 
-`execute()` 的返回里，`info["executed_action"]` 必须是**真正发给机器人的动作**。当它与 server 下发的值不同（人工接管、本地限幅），client 会把整条 chunk 回传给 server，由 server 归一化后写入 replay。人工接管时另外置 `info["human_intervention"] = True`。
+```python
+create_adapter(action_dim=14, task="assemble parts")
+```
+
+工厂必须接受这两个**关键字**参数。把 adapter 放到自己的包也可以，把 `controller_factory` 换成 `your_package.controller:create_adapter`，签名保持一样。
+
+已有旧 Ray factory（`factory(cfg, hardware_info)`）时，**不要**把它直接填进 yaml。包一层：
+
+```python
+def create_adapter(*, action_dim: int, task: str):
+    cfg = {"action_dim": action_dim, "task_description": task}
+    old = your_old_factory(cfg, hardware_info=None)
+    # 旧 adapter 的 execute 若仍按 [-1, 1] 理解动作，必须先改成机器人空间，见 3.2
+    return old
+```
+
+### 3.2 对着骨架逐个方法填
+
+打开 `rlinf/envs/realworld/cobot/stage2_hardware_adapter.py`。类型定义在 `rlinf/envs/realworld/cobot/control.py`。读完相机后调用骨架自带的 `_observation(images, state)`，它会检查三路相机和 14 维 state。
+
+#### 动作和状态是什么（不要自己再解一次）
+
+server 已经走完 OpenPI `Unnormalize` + `AbsoluteActions` + Aloha decode。`execute(action)` 收到的是 **机器人空间 14 维绝对量**，不是 `[-1, 1]`，也不是还要再积分的 delta。`CobotControlAdapter` 文档字符串里还写着 normalized，**WebSocket 这条路径以本节为准**。
+
+不要在 adapter 里再做：quantile 反归一化、把前 12 维当 delta 加到当前 q、左右臂符号翻转。那些已经在 GPU 上做完了。adapter 只做本地限幅、滤波、下发、回报实际发出去的值。
+
+14 维约定与 Stage 1 / OpenPI cobot 一致（见 `cobot_dataconfig.py` 的 mask `[T]*6 + [F] + [T]*6 + [F]`）：
+
+```text
+state  : left_joint_0..5, left_gripper, right_joint_0..5, right_gripper
+         机器人单位（弧度 / 夹爪开合）
+action : 同序 14 维绝对目标；12 个臂关节已是绝对 q，两个夹爪已是绝对开合（物理上大约 [0, 1]）
+```
+
+`info["executed_action"]` 必须和 `action` 同一个空间。接管时填人手实际发出的机器人空间值，server 会再映回 normalized 写 replay。
+
+#### `reset()` / `observe()` → `CobotObservation`
+
+```python
+def reset(self) -> CobotObservation:
+    home_both_arms()                 # 回到站点起始位
+    return self.observe()
+
+def observe(self) -> CobotObservation:
+    images = {
+        "image": read_cam_high(),          # uint8 [H, W, 3] RGB，主视角
+        "wrist_image": read_left_wrist(),  # 左腕。和下一张的顺序不能换
+        "side_image": read_right_wrist(),  # 右腕。换了等于交换两条手臂的视角
+    }
+    state = read_qpos_and_grippers()       # 长度 14，float32，机器人单位
+    return self._observation(images, state)
+```
+
+缺任何一路相机立刻报错，**不会补黑帧**。BGR 要转 RGB。分辨率不强制 224，server 会按 OpenPI transform 处理；同一 episode 内三路尺寸不要变。
+
+#### `execute(action)` → `CobotStepResult`
+
+每个 low-level step 调一次，一个 chunk 默认 16 次。骨架里的 docstring 就是应填的结构：
+
+```python
+commanded = np.asarray(action, dtype=np.float32).reshape(-1)
+sent = locally_clipped(commanded)          # 关节限位 / 速度限位之后的值
+intervention = human_is_driving()
+if intervention:
+    sent = human_action_robot_space()
+send_to_arm(sent)
+info = {"executed_action": sent.copy()}
+if intervention:
+    info["human_intervention"] = True
+if collision_or_estop:
+    info["rlt_safety_fault"] = True
+return CobotStepResult(self.observe(), reward=0.0, info=info)
+```
+
+逐步 reward 填 `0.0`。成功 / 失败 / 回退的终止奖励由操作员事件在 chunk 边界写入，不要在 `execute` 里编。
+
+#### `stop(reason)` / `close()`
+
+`stop` 必须在 server 断连时仍然可用：本地抱闸 / 急停，不要等 WebSocket。`RLTRobotLoop` 的 `finally` 会调 `stop` 再 `close`。`close` 释放驱动和相机句柄。
+
+#### 按键：client 不会自己听键盘
+
+yaml 的 `keyboard:` **只是约定**。在 `__init__` 里二选一：
+
+```python
+# 方案 A：本进程占着一个 tty 时，打开骨架自带的 stdin 监听
+self.start_stdin_keyboard_listener()
+
+# 方案 B：ROS / 踏板 / spacemouse 回调里
+self.enqueue_key("s")          # 或 "f" / "b" / "q" / "escape"
+# 或 self.enqueue_operator_event(OperatorEvent(...))
+```
+
+循环在每个 chunk **提交之后**才 `poll_rewind_event()` 一次。按早了会作用在下一列已提交的 chunk 上，这是预期行为。
+
+| 按键 | `enqueue_key` | 效果 |
+|---|---|---|
+| `s` | `"s"` | 本 chunk 记成功，episode 结束 |
+| `f` | `"f"` | 本 chunk 记失败，episode 结束 |
+| `b` | `"b"` | 物理回退 1 个 chunk，终止奖励 -1 |
+| `q` | `"q"` | 只改 replay，机械臂不动 |
+| `escape` | `"escape"` | 停臂，不给判定 |
+
+也可以继续返回旧的 `CobotRewindEvent`（只能表达回退）。成功 / 失败 / 中止必须用 `OperatorEvent`。没有 Stage 2 切换键。
+
+#### `rewind_chunks(count)`（物理回退才需要）
+
+物理回放最近 `count` 个已提交 chunk。不实现或保持 `NotImplementedError`，循环会降级为 credit-only 并打警告。要物理回退：
+
+1. 实现可选钩子 `on_action_chunk_begin` / `on_action_chunk_end`，在 chunk 开始时记下当时的 14 维状态，`committed=True` 时推进历史（最多 `rewind_history_chunks`，默认 12）。
+2. `rewind_chunks` 取出倒数第 `count` 个快照，把臂倒回该位姿，然后 `return self.observe()`。
+
+### 3.3 站点 bring-up
+
+只改 `examples/embodiment/run_cobot_control.sh` 里标注 “Site-specific setup” 的三块，解开注释并换成站点路径：
+
+```bash
+# 1. Python environment holding the Cobot drivers.
+source <your_venv_path>/bin/activate
+
+# 2. ROS workspace for the arm and camera drivers.
+source /opt/ros/noetic/setup.bash
+source <your_catkin_ws>/devel/setup.bash
+
+# 3. Arm and camera bring-up. 确认三路 topic 已在出图再往下走。
+roslaunch cobot_magic bringup.launch &
+sleep 10
+```
+
+client import **不会**再杀掉已有 `roscore` / `rosmaster` / `rosout`，所以先 launch 再启 client 是安全的。相机没起来时会在 `observe()` 失败，而不是用黑图继续跑。
+
+不要在这个脚本里 `ray start`。不要改最后一行 `exec run_rlt_stage2_client.sh`。
+
+### 3.4 填完后的自检
+
+在接 GPU server 之前，在**机械臂那台机器、已经 source 过驱动的环境**里：
+
+```python
+import numpy as np
+from rlinf.envs.realworld.cobot.stage2_hardware_adapter import create_adapter
+
+a = create_adapter(action_dim=14, task="assemble parts")
+obs = a.reset()
+assert set(obs.images) == {"image", "wrist_image", "side_image"}
+assert all(im.dtype == np.uint8 and im.ndim == 3 and im.shape[-1] == 3 for im in obs.images.values())
+assert obs.state.shape == (14,)
+assert obs.task == "assemble parts"
+
+# 再低速 execute 一步：检查量纲、限位，以及 info["executed_action"].shape == (14,)
+# 按 s/f/b/q/escape，随后 a.poll_rewind_event() 应弹出对应事件
+a.stop("self-check")
+a.close()
+```
+
+通过后再按第 11 节：dummy 握手 → dry run → 单条低速 chunk。不要一上来长时间 `is_dummy=false`。
+
+adapter 和 bring-up 还没填时，第 0 节命令 6 会在第一次 `reset()` / `execute()` 上碰到 `NotImplementedError`，这是预期的。
+
+### 3.5 和旧 Ray cobot 路径的区别
+
+| | 旧 Ray `CobotEnv` | 现在这条 WebSocket 路径 |
+|---|---|---|
+| factory 签名 | `factory(cfg, hardware_info)` | `create_adapter(*, action_dim, task)` |
+| `execute` 动作 | 文档按 normalized；站点实现各自为政 | **机器人空间**，server 已 decode |
+| 缺相机 | 曾可能变成黑帧 | 直接报错 |
+| Stage 2 切换键 | 旧版有 | **没有**；warmup / actor 由 server 按 replay 行数决定 |
+| 进程 | Ray worker | 本机一个 client 进程 |
+
+### 3.6 常见漏改
+
+- 忘了 `is_dummy=false`：机械臂不动、相机全黑，replay 全是零。脚本会警告。
+- `controller_factory` 的 `:` 没加引号：Hydra 解析失败或工厂 import 不到。
+- 沿用 Ray factory 签名：启动时报 unexpected argument `action_dim` / `task`。
+- 在 adapter 里再做一次反归一化或 delta→absolute：动作被变换两次，臂会冲。
+- 左右腕 key 对调：策略左右手视角互换，看起来像在胡乱动另一只手。
+- 只接了键盘 yaml、没调用 `enqueue_key`：`s`/`f`/`b` 完全没反应，episode 不会结束。
+- `task` 写成 `"put cube in drawer"` 而 Stage 1 是 `"assemble parts"`：不会报错，动作是错的。
 
 ## 4. 启动
 
@@ -202,13 +403,13 @@ cd /data/gxy/realworldRL/RLinf
 bash examples/embodiment/run_cobot_control.sh cobot_rlt_stage2_ws_client \
   client.host=<GPU_HEAD_IP> client.port=8000 \
   transport.is_dummy=false \
-  transport.controller_factory=your_package.controller:create_adapter \
+  'transport.controller_factory=rlinf.envs.realworld.cobot.stage2_hardware_adapter:create_adapter' \
   transport.task="assemble parts"
 ```
 
-`transport.task` 必须与 server 的 `task_prompt` 一致。
+`transport.task` 必须与 server 的 `task_prompt` 一致。adapter 和 bring-up 还没填时，这条命令会在第一次 `reset()`/`execute()` 上碰到 `NotImplementedError`，这是预期的。
 
-`run_cobot_control.sh` 里预留了站点相关的 ROS/驱动/相机 bring-up 段落，填好之后它会把 adapter 起好再转交给 `run_rlt_stage2_client.sh`。只想跑通链路不动机械臂时，去掉 `transport.is_dummy=false` 即可。
+`run_cobot_control.sh` 里预留了站点相关的 ROS/驱动/相机 bring-up 段落，填好之后它会把 adapter 起好再转交给 `run_rlt_stage2_client.sh`。client 的 import **不会**再杀掉节点上已有的 `roscore`/`rosmaster`/`rosout`，所以先拉起控制栈再启 client 是安全的。只想跑通链路不动机械臂时，去掉 `transport.is_dummy=false` 即可。
 
 client 连上后先校验握手：`action_dim`、chunk 长度、proprio 宽度、相机 key 有任何一项与 transport 不符就拒绝启动。这把本来会在半个 episode 之后表现为奇怪动作的形状错误，变成了启动失败。
 
@@ -297,6 +498,8 @@ client 检测到实际动作与下发动作不一致时，把整条 chunk 连同
 
 ## 8. 操作员按键
 
+`cobot_rlt_stage2_ws_client.yaml` 的 `keyboard:` 只是约定，**client 不会自己装键盘监听器**。这些事件必须由 adapter 的 `poll_rewind_event()` 产出（可以直接返回 `OperatorEvent`）。站点侧自己接 s/f/b/q/escape，或任何能发出同样 `kind` 的设备。
+
 ```text
 s        标记本 episode 成功，终止奖励记在当前 chunk 上，episode 结束
 f        标记失败，episode 结束
@@ -341,10 +544,11 @@ checkpoint 按 `server.save_interval_episodes` 落在 `server.save_dir/episode_<
 **第 1 步：不碰 GPU、不碰机械臂，先验协议和循环。**
 
 ```bash
-.venv/bin/python -m pytest tests/unit_tests/test_rlt_stage2_websocket.py -q
+.venv/bin/python -m pytest tests/unit_tests/test_rlt_stage2_websocket.py \
+  tests/unit_tests/test_rlt_client_import_does_not_kill_roscore.py -q
 ```
 
-其中 `test_full_episode_over_a_real_websocket` 会起一个真 WebSocket server、连一个真 client，用假模型跑完一整个 episode，覆盖 warmup、UTD 预算、成功判定和 rewind。这一步失败就不用往下走了。
+其中 `test_full_episode_over_a_real_websocket` 会起一个真 WebSocket server、连一个真 client，用假模型跑完一整个 episode，覆盖 warmup、UTD 预算、成功判定和 rewind。`test_rlt_client_import_does_not_kill_roscore` 确认按 client 路径 import 不会杀掉已有 roscore。这一步失败就不用往下走了。
 
 **第 2 步：确认 checkpoint 组合是对的。**
 
@@ -373,7 +577,7 @@ bash examples/embodiment/run_rlt_stage2_client.sh cobot_rlt_stage2_ws_client \
 
 默认 `is_dummy: true`，机械臂不动、相机全黑。要看到握手通过、每个 chunk 打出 `mode=warmup`、`episode_end` 正常返回。这一步验证的是网络和形状约定，不验证策略质量（输入是黑图，动作没有意义）。
 
-**第 5 步：校验你自己的 adapter。** observation 三路相机、state 宽度、动作范围、watchdog、stop、fault、rewind。这部分没有通用命令，取决于你的控制栈。
+**第 5 步：按第 3 节填 adapter 和 bring-up，先做 3.4 的本机自检。**
 
 **第 6 步：启动本地控制栈，先禁止真实动作或用最低速度/最小限幅。**
 
@@ -381,7 +585,7 @@ bash examples/embodiment/run_rlt_stage2_client.sh cobot_rlt_stage2_ws_client \
 bash examples/embodiment/run_cobot_control.sh cobot_rlt_stage2_ws_client \
   client.host=<GPU_HEAD_IP> client.port=8000 \
   transport.is_dummy=false \
-  transport.controller_factory=your_package.controller:create_adapter \
+  'transport.controller_factory=rlinf.envs.realworld.cobot.stage2_hardware_adapter:create_adapter' \
   transport.task="assemble parts"
 ```
 

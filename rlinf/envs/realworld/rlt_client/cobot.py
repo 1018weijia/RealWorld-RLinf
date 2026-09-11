@@ -28,6 +28,7 @@ interface and reuses the loop unchanged.
 
 from __future__ import annotations
 
+import importlib
 import logging
 from typing import Any, Callable, Sequence
 
@@ -309,6 +310,39 @@ def _to_operator_event(raw: CobotRewindEvent | OperatorEvent) -> OperatorEvent:
     )
 
 
+def resolve_controller_factory(
+    spec: str,
+) -> Callable[..., CobotControlAdapter]:
+    """Import ``module:function`` or ``module.function`` from a config string.
+
+    Args:
+        spec: Dotted path to a callable that accepts ``action_dim`` and
+            ``task`` and returns a :class:`CobotControlAdapter`.
+
+    Returns:
+        The imported factory.
+
+    Raises:
+        RuntimeError: ``spec`` is empty or does not name a callable.
+    """
+    path = str(spec).strip()
+    if not path or path in {"null", "None", "none"}:
+        raise RuntimeError("controller_factory spec is empty")
+    if ":" in path:
+        module_name, function_name = path.rsplit(":", 1)
+    else:
+        module_name, function_name = path.rsplit(".", 1)
+    try:
+        factory = getattr(importlib.import_module(module_name), function_name)
+    except (ImportError, AttributeError) as error:
+        raise RuntimeError(
+            f"Could not import controller_factory {path!r}: {error}"
+        ) from error
+    if not callable(factory):
+        raise RuntimeError(f"controller_factory {path!r} is not callable")
+    return factory
+
+
 def build_cobot_transport(
     cfg,
     *,
@@ -319,17 +353,17 @@ def build_cobot_transport(
     Args:
         cfg: Client config with a ``transport`` section (``is_dummy``,
             ``action_dim``, ``chunk_len``, ``proprio_dim``, ``task``,
-            ``rewind_history_chunks``).
-        controller_factory: Builds the real adapter. Required whenever
-            ``is_dummy`` is false.
+            ``rewind_history_chunks``, optional ``controller_factory`` string).
+        controller_factory: Builds the real adapter. When omitted, the
+            ``transport.controller_factory`` config string is imported.
 
     Returns:
         A configured transport.
 
     Raises:
-        RuntimeError: A real run was requested with no controller factory.
-            Silently substituting the mock would move nothing while filling
-            replay with zeros, which is far worse than refusing to start.
+        RuntimeError: A real run was requested with no factory. Silently
+            substituting the mock would move nothing while filling replay
+            with zeros, which is far worse than refusing to start.
     """
     transport_cfg = cfg.transport
     is_dummy = bool(transport_cfg.get("is_dummy", False))
@@ -348,13 +382,17 @@ def build_cobot_transport(
             task=str(transport_cfg.get("task", "")),
             history_size=int(transport_cfg.get("rewind_history_chunks", 12)),
         )
-    elif controller_factory is None:
-        raise RuntimeError(
-            "transport.is_dummy=false but no controller_factory was supplied. "
-            "Pass the Cobot controller factory, or set is_dummy=true to run "
-            "the mock explicitly."
-        )
     else:
+        if controller_factory is None:
+            spec = transport_cfg.get("controller_factory")
+            if spec:
+                controller_factory = resolve_controller_factory(str(spec))
+        if controller_factory is None:
+            raise RuntimeError(
+                "transport.is_dummy=false but no controller_factory was "
+                "supplied. Set transport.controller_factory to a "
+                "module:function path, or set is_dummy=true to run the mock."
+            )
         adapter = controller_factory(
             action_dim=action_dim,
             task=str(transport_cfg.get("task", "")),

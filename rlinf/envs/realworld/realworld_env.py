@@ -83,13 +83,16 @@ class RealWorldEnv(gym.Env):
 
     @staticmethod
     def realworld_setup():
-        """Setup RealWorld environment upon env class import.
+        """Kill every ``roscore`` / ``rosmaster`` / ``rosout`` on this node.
 
-        This is for any node-level setup required by RealWorld environments. For example, ROS
-        requires a single roscore instance per node, so we ensure that any existing roscore
-        processes are terminated before starting a new one.
+        This is not called on import. :class:`~rlinf.envs.realworld.common.ros.ros_controller.ROSController`
+        attaches to an existing roscore when one is already running, so a
+        package-level wipe would take down a control stack that the caller
+        started on purpose — including the RLT Stage 2 client, which imports
+        this package after ROS is already up.
 
-        This function is called once when the RealWorldEnv class is first imported.
+        Call this only when you explicitly want a clean-slate roscore, never
+        as a side effect of loading an env class.
         """
         # Concurrency control is needed for multiple processes on the same node
         node_lock_file = "/tmp/.realworld.lock"

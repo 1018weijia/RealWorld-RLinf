@@ -305,6 +305,42 @@ class RLTLossCore(RLTHostHooks):
         metrics["preference_critic_active"] = 1.0
         return loss + weight * preference_loss
 
+    def _add_actor_preference_loss(
+        self, loss: torch.Tensor, metrics: dict[str, float]
+    ) -> torch.Tensor:
+        """Add the rewind Bradley-Terry term to the actor objective.
+
+        Mirrors :meth:`_add_critic_preference_loss`. The pair buffer is filled
+        by rewind recovery; without this term those pairs only move Q and
+        never push the actor toward the recovered chunk.
+        """
+        preference_cfg = self.cfg.algorithm.get("rewind_preference", {}) or {}
+        pair_batch = self._preference_batch()
+        min_pairs = int(preference_cfg.get("min_pairs", 1))
+        if pair_batch is None or len(self.rewind_preference_buffer) < min_pairs:
+            metrics["preference_actor_active"] = 0.0
+            return loss
+        mean_action, _, _ = self.model(
+            forward_type=ForwardType.SAC,
+            obs=pair_batch["curr_obs"],
+            deterministic=True,
+        )
+        preference_loss, preference_metrics = rlt_losses.actor_pairwise_preference_loss(
+            action_mean=mean_action,
+            ref_chunk=pair_batch["ref_chunk"],
+            positive_action=pair_batch["positive_action"],
+            negative_action=pair_batch["negative_action"],
+            action_mask=pair_batch["action_mask"],
+            confidence=pair_batch["confidence"],
+            fixed_std=float(self.cfg.actor.model.actor_noise_sigma),
+            beta=float(preference_cfg.get("actor_beta", 1.0)),
+        )
+        weight = float(preference_cfg.get("actor_weight", 0.0))
+        metrics.update(preference_metrics)
+        metrics["preference_actor_weight"] = weight
+        metrics["preference_actor_active"] = 1.0
+        return loss + weight * preference_loss
+
     def _per_beta(self) -> float:
         replay_cfg = self.cfg.algorithm.replay_buffer
         start = float(replay_cfg.get("per_beta_start", 0.4))
@@ -408,6 +444,7 @@ class RLTLossCore(RLTHostHooks):
             use_crossq=use_crossq,
         )
         metrics.update(weight_metrics)
+        actor_loss = self._add_actor_preference_loss(actor_loss, metrics)
         return actor_loss, entropy, metrics
 
     def forward_alpha(self, batch):

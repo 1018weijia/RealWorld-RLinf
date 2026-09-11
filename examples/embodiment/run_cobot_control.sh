@@ -31,8 +31,8 @@ shift || true
 #    source <your_catkin_ws>/devel/setup.bash
 
 # 3. Arm and camera bring-up. These must be running and publishing before the
-#    client connects; a missing camera surfaces as a black frame the policy
-#    silently conditions on rather than as an error.
+#    client connects. A missing camera now raises in observe(); it is no longer
+#    replaced with a black frame.
 #    roslaunch cobot_magic bringup.launch &
 #    sleep 10
 

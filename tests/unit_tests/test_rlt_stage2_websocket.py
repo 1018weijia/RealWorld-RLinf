@@ -968,3 +968,73 @@ def test_preflight_rejects_a_prompt_that_disagrees_with_stage1():
 
     with pytest.raises(PreflightError, match="disagrees with"):
         check_task_prompt("put cube in drawer", stage1_prompt="assemble parts")
+
+
+def test_build_transport_loads_controller_factory_from_config():
+    """The yaml string is what the robot-side launch command actually sets."""
+    from rlinf.envs.realworld.cobot.stage2_hardware_adapter import (
+        Stage2HardwareAdapter,
+    )
+    from rlinf.envs.realworld.rlt_client.cobot import build_cobot_transport
+
+    cfg = OmegaConf.create(
+        {
+            "transport": {
+                "is_dummy": False,
+                "controller_factory": (
+                    "rlinf.envs.realworld.cobot.stage2_hardware_adapter:create_adapter"
+                ),
+                "action_dim": 14,
+                "chunk_len": 16,
+                "proprio_dim": 14,
+                "task": "assemble parts",
+                "camera_keys": ["image", "wrist_image", "side_image"],
+            }
+        }
+    )
+    transport = build_cobot_transport(cfg)
+    assert isinstance(transport._adapter, Stage2HardwareAdapter)
+    assert transport.action_dim == 14
+
+
+def test_stage2_hardware_adapter_maps_keys_and_checks_observation():
+    from rlinf.envs.realworld.cobot.stage2_hardware_adapter import create_adapter
+    from rlinf.envs.realworld.rlt_client.loop import EVENT_SUCCESS
+
+    adapter = create_adapter(action_dim=14, task="assemble parts")
+    adapter.enqueue_key("s")
+    event = adapter.poll_rewind_event()
+    assert event is not None
+    assert event.kind == EVENT_SUCCESS
+    assert adapter.poll_rewind_event() is None
+
+    images = {
+        "image": np.zeros((8, 8, 3), dtype=np.uint8),
+        "wrist_image": np.zeros((8, 8, 3), dtype=np.uint8),
+        "side_image": np.zeros((8, 8, 3), dtype=np.uint8),
+    }
+    obs = adapter._observation(images, np.zeros(14, dtype=np.float32))
+    assert obs.task == "assemble parts"
+    assert obs.state.shape == (14,)
+
+    with pytest.raises(RuntimeError, match="missing cameras"):
+        adapter._observation({"image": images["image"]}, np.zeros(14))
+    with pytest.raises(RuntimeError, match="expected 14"):
+        adapter._observation(images, np.zeros(7))
+
+
+def test_build_transport_refuses_a_real_run_without_a_factory():
+    from rlinf.envs.realworld.rlt_client.cobot import build_cobot_transport
+
+    cfg = OmegaConf.create(
+        {
+            "transport": {
+                "is_dummy": False,
+                "controller_factory": None,
+                "action_dim": 14,
+                "chunk_len": 16,
+            }
+        }
+    )
+    with pytest.raises(RuntimeError, match="no controller_factory"):
+        build_cobot_transport(cfg)
