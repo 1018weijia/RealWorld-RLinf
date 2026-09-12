@@ -142,13 +142,13 @@ def build_policy(cfg: DictConfig) -> RLTStage2Policy:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     logger.info("Loading Stage 1 from %s", cfg.rlt_feature_model.model_path)
-    feature_model = get_model(cfg.rlt_feature_model, torch_dtype=torch.bfloat16)
+    feature_model = get_model(cfg.rlt_feature_model)
     feature_model.to(device).eval()
     for parameter in feature_model.parameters():
         parameter.requires_grad_(False)
 
     logger.info("Building Stage 2 head (%s)", cfg.actor.model.model_type)
-    model = get_model(cfg.actor.model, torch_dtype=torch.float32).to(device)
+    model = get_model(cfg.actor.model).to(device)
     target_model = copy.deepcopy(model).to(device)
     target_model.requires_grad_(False)
 
@@ -234,6 +234,18 @@ def main(cfg: DictConfig) -> None:
         return
 
     policy = build_policy(cfg)
+    # Log this server's episode/update metrics using the configured backends.
+    from rlinf.utils.metric_logger import MetricLogger
+
+    metrics_logger = MetricLogger(cfg)
+    metric_step = 0
+
+    def log_episode(metrics):
+        nonlocal metric_step
+        metric_step += 1
+        metrics_logger.log(metrics, step=metric_step)
+
+    policy.metric_logger = log_episode
 
     server = RLinfWebsocketPolicyServer(
         policy=policy,
@@ -250,7 +262,10 @@ def main(cfg: DictConfig) -> None:
         policy.warmup_steps,
         policy.utd_ratio,
     )
-    server.serve_forever()
+    try:
+        server.serve_forever()
+    finally:
+        metrics_logger.finish()
 
 
 if __name__ == "__main__":
