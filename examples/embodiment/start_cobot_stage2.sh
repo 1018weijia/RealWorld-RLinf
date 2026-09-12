@@ -33,16 +33,6 @@ umask 077
 mkdir -p "$WANDB_CONFIG_DIR" "$WANDB_CACHE_DIR" "$WANDB_DIR"
 out="${RLT_RUN_DIR:-$root/results/cobot_stage2_${task}/$(date +%Y%m%d_%H%M%S)}"
 args=()
-# remote-franka stage2 reference values, mapped onto the native Cobot policy.
-# Cobot keeps its 14D dual-arm action space and synchronous 50/30 chunk contract.
-actor_noise_sigma="${RLT_COBOT_ACTOR_NOISE_SIGMA:-0.1}"
-residual_scale="${RLT_COBOT_RESIDUAL_SCALE:-0.3}"
-warmup_steps="${RLT_COBOT_WARMUP_STEPS:-200}"
-utd_ratio="${RLT_COBOT_UTD_RATIO:-4}"
-demo_batch_ratio="${RLT_COBOT_DEMO_BATCH_RATIO:-0.45}"
-offline_sample_ratio="${RLT_COBOT_OFFLINE_SAMPLE_RATIO:-0.1}"
-expo_base_candidates="${RLT_COBOT_EXPO_BASE_CANDIDATES:-4}"
-expo_edited_candidates="${RLT_COBOT_EXPO_EDITED_CANDIDATES:-4}"
 if [[ -n "${STAGE2_RESUME_DIR:-}" ]]; then
     test -f "$STAGE2_RESUME_DIR/stage2_state.pt"
     args+=("runner.resume_dir=$STAGE2_RESUME_DIR")
@@ -76,6 +66,22 @@ if [[ "$mode" == "audit" || "$mode" == "convert" || "$mode" == "offline" ]]; the
         "+offline.allow_partial=${ALLOW_PARTIAL_DATASET:-false}"
         "+offline.validation_every=${VALIDATION_EVERY:-500}" "+offline.save_every=${SAVE_EVERY:-5000}")
 fi
+# These overrides belong to the online server config.  The offline Hydra
+# config is intentionally smaller/structured and must not receive them.
+if [[ "$mode" == "train" || "$mode" == "eval" ]]; then
+    actor_noise_sigma="${RLT_COBOT_ACTOR_NOISE_SIGMA:-0.1}"
+    residual_scale="${RLT_COBOT_RESIDUAL_SCALE:-0.3}"
+    warmup_steps="${RLT_COBOT_WARMUP_STEPS:-200}"
+    utd_ratio="${RLT_COBOT_UTD_RATIO:-4}"
+    demo_batch_ratio="${RLT_COBOT_DEMO_BATCH_RATIO:-0.45}"
+    offline_sample_ratio="${RLT_COBOT_OFFLINE_SAMPLE_RATIO:-0.1}"
+    expo_base_candidates="${RLT_COBOT_EXPO_BASE_CANDIDATES:-4}"
+    expo_edited_candidates="${RLT_COBOT_EXPO_EDITED_CANDIDATES:-4}"
+    args+=("actor.model.actor_noise_sigma=$actor_noise_sigma" "actor.model.residual_scale=$residual_scale"
+        "server.warmup_steps=$warmup_steps" "server.utd_ratio=$utd_ratio"
+        "algorithm.demo_batch_ratio=$demo_batch_ratio" "+algorithm.offline_sample_ratio=$offline_sample_ratio"
+        "algorithm.expo.base_candidates=$expo_base_candidates" "algorithm.expo.edited_candidates=$expo_edited_candidates")
+fi
 cd "$root"
 exec "$root/.venv/bin/python" "examples/embodiment/$entry" \
     --config-path "$root/examples/embodiment/config" --config-name cobot_rlt_stage2_ws_server \
@@ -83,10 +89,6 @@ exec "$root/.venv/bin/python" "examples/embodiment/$entry" \
     "server.task_prompt=$prompt" "rlt_feature_model.openpi_data.default_prompt=$prompt" \
     "rlt_feature_model.model_path=$checkpoint" "rlt_feature_model.openpi_data.norm_stats_path=$stats" \
     rlt_feature_model.num_action_chunks=50 actor.model.ref_num_action_chunks=50 actor.model.num_action_chunks=30 \
-    "actor.model.actor_noise_sigma=$actor_noise_sigma" "actor.model.residual_scale=$residual_scale" \
-    "server.warmup_steps=$warmup_steps" "server.utd_ratio=$utd_ratio" \
-    "algorithm.demo_batch_ratio=$demo_batch_ratio" "algorithm.offline_sample_ratio=$offline_sample_ratio" \
-    "algorithm.expo.base_candidates=$expo_base_candidates" "algorithm.expo.edited_candidates=$expo_edited_candidates" \
     "server.save_dir=$out/checkpoints" "runner.logger.log_path=$out" \
     "runner.logger.project_name=$WANDB_PROJECT" "runner.logger.experiment_name=cobot-stage2-$task" \
     'runner.logger.logger_backends=[wandb,tensorboard]' \
