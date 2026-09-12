@@ -94,7 +94,7 @@ def build_official_openpi_sft_dataloader(
     include_failures = bool(
         OmegaConf.select(cfg, "data.include_failure_episodes", default=False)
     )
-    if "cobot" in config_name.lower():
+    if "cobot" in config_name.lower() or "dobot" in config_name.lower():
         if len(repo_ids) > 1:
             prompts = OmegaConf.select(
                 cfg, "actor.model.openpi.task_prompts", default=None
@@ -105,7 +105,7 @@ def build_official_openpi_sft_dataloader(
                 prompts=list(prompts) if prompts is not None else None,
                 include_failures=include_failures,
             )
-        elif not include_failures:
+        elif "cobot" in config_name.lower() and not include_failures:
             _patch_create_torch_dataset_drop_failures(openpi_data_loader)
 
     if "dobot" in config_name.lower():
@@ -164,10 +164,10 @@ def _patch_create_torch_dataset_multi(
     prompts: list[str] | None,
     include_failures: bool,
 ) -> None:
-    """Use LeRobot's concatenated dataset for multi-task Cobot training."""
+    """Use LeRobot's concatenated dataset for multi-task Cobot/Dobot training."""
     if prompts is None or len(prompts) != len(repo_ids):
         raise ValueError(
-            "Multi-task Cobot training requires one actor.model.openpi.task_prompts "
+            "Multi-task Cobot/Dobot training requires one actor.model.openpi.task_prompts "
             "entry per data.train_data_paths entry."
         )
     original = openpi_data_loader.create_torch_dataset
@@ -190,7 +190,7 @@ def _patch_create_torch_dataset_multi(
         metadata = [LeRobotDatasetMetadata(repo_id) for repo_id in repo_ids]
         fps = metadata[0].info["fps"]
         if any(item.info["fps"] != fps for item in metadata[1:]):
-            raise ValueError("Cobot multi-task datasets must have the same fps")
+            raise ValueError("Multi-task datasets must have the same fps")
         episodes = None
         if not include_failures:
             from rlinf.data.datasets.openpi_rlinf.cobot_episode_filter import (
