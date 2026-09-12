@@ -25,3 +25,4 @@ PKG-INFO
 .claude/settings.json
 /toolkits/inference/open_loop/results/
 debug_XRobot/
+/results/

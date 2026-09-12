@@ -7,7 +7,7 @@ private="$root/.private-cobot-stage2"
 task="${1:-assemble_parts}"
 mode="${2:-preflight}"
 shift "$(( $# >= 2 ? 2 : $# ))"
-case "$mode" in preflight|train|eval) ;; *) echo "Expected preflight|train|eval" >&2; exit 2 ;; esac
+case "$mode" in preflight|train|eval|audit|convert|offline) ;; *) echo "Expected preflight|train|eval|audit|convert|offline" >&2; exit 2 ;; esac
 source "$private/paths.env"
 case "$task" in
     assemble_parts) checkpoint="$COBOT_ASSEMBLE_CHECKPOINT"; stats="$COBOT_ASSEMBLE_STATS"; prompt="assemble parts"; port=8000 ;;
@@ -42,8 +42,32 @@ if [[ "$mode" == "eval" ]]; then
     : "${STAGE2_RESUME_DIR:?Evaluation requires a trained Stage2 checkpoint directory}"
     args+=(server.eval_only=True)
 fi
+entry=rlt_stage2_server.py
+if [[ "$mode" == "audit" || "$mode" == "convert" || "$mode" == "offline" ]]; then
+    entry=cobot_offline.py
+    dataset="${COBOT_DATASET_ROOT:-}"
+    if [[ -z "$dataset" ]]; then
+        case "$task" in
+            assemble_parts) dataset="${COBOT_ASSEMBLE_DATASET:-}" ;;
+            cube_into_drawer) dataset="${COBOT_CUBE_DATASET:-}" ;;
+            cook_vegetable) dataset="${COBOT_COOK_DATASET:-}" ;;
+            pack_and_pour_fruit) dataset="${COBOT_PACK_DATASET:-}" ;;
+        esac
+    fi
+    offline_mode="$mode"
+    if [[ "$mode" == "offline" ]]; then offline_mode=train; fi
+    if [[ "$mode" != "offline" ]]; then
+        : "${dataset:?Set COBOT_DATASET_ROOT to a verified LeRobot v3 root}"
+        test -f "$dataset/meta/info.json"
+    fi
+    buffer="${OFFLINE_BUFFER:-$root/results/cobot_offline_${task}/offline_buffer.pt}"
+    args+=("+offline.mode=$offline_mode" "+offline.dataset_root=$dataset" "+offline.buffer=$buffer"
+        "+offline.steps=${NUM_TRAIN_STEPS:-40000}" "+offline.max_episodes=${MAX_EPISODES:-0}"
+        "+offline.allow_partial=${ALLOW_PARTIAL_DATASET:-false}"
+        "+offline.validation_every=${VALIDATION_EVERY:-500}" "+offline.save_every=${SAVE_EVERY:-5000}")
+fi
 cd "$root"
-exec "$root/.venv/bin/python" examples/embodiment/rlt_stage2_server.py \
+exec "$root/.venv/bin/python" "examples/embodiment/$entry" \
     --config-path "$root/examples/embodiment/config" --config-name cobot_rlt_stage2_ws_server \
     "server.host=${RLT_SERVER_BIND:-0.0.0.0}" "server.port=${RLT_SERVER_PORT:-$port}" \
     "server.task_prompt=$prompt" "rlt_feature_model.openpi_data.default_prompt=$prompt" \

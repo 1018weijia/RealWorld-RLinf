@@ -30,6 +30,9 @@ import torch
 from omegaconf import DictConfig, OmegaConf
 
 from rlinf.models import get_model
+from rlinf.serving.rlt.cobot_offline_trainer import (
+    CobotOfflineTrainer as RLTStage2Trainer,
+)
 from rlinf.serving.rlt.inference import (
     CameraLayout,
     RLTObservationRepacker,
@@ -46,7 +49,6 @@ from rlinf.serving.rlt.preflight import (
     resolve_stage1_weights,
 )
 from rlinf.serving.rlt.protocol import ACTION_SPACE_ROBOT, ServerMetadata
-from rlinf.serving.rlt.trainer import RLTStage2Trainer
 from rlinf.serving.websocket_server import RLinfWebsocketPolicyServer
 
 logger = logging.getLogger(__name__)

@@ -186,6 +186,8 @@ class RLTStage2Policy:
         """
         if self.eval_only:
             return False
+        if getattr(self.trainer, "offline_total_updates", 0) > 0:
+            return False
         return self.trainer.replay_buffer.total_samples < self.warmup_steps
 
     # -------------------------------------------------------------- router
@@ -563,6 +565,17 @@ class RLTStage2Policy:
             "total_chunks": self._total_chunks,
             "total_episodes": self._total_episodes,
             "total_updates": int(self.trainer.update_step),
+            "offline_total_updates": int(
+                getattr(self.trainer, "offline_total_updates", 0)
+            ),
+            "offline_buffer_size": int(
+                getattr(getattr(self.trainer, "offline_buffer", None), "size", 0)
+            ),
+            "offline_partial_data": bool(
+                getattr(
+                    getattr(self.trainer, "offline_buffer", None), "payload", {}
+                ).get("partial_conversion", False)
+            ),
             "episode_chunks": self._episode.chunks,
             "episode_train_chunks": self._episode.train_chunks,
             "max_episode_chunks": self.max_episode_chunks,

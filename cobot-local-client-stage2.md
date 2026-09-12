@@ -99,9 +99,10 @@ bash exp/rlinf_client_cobot.sh assemble_parts eval
 评测客户端核对冻结标志和实际 update 数，关闭 HIL/rewind、replay 上传及训练。
 训练默认 200 局，评测默认 30 局，均可用 `NUM_EPISODES` 覆盖。
 
-这些入口目前运行在线 RL；不会自动把 LeRobot 演示填入 buffer，也未实现 Cal-QL
-离线预训练。那需要另外完成 RLinf 的数据转换与训练算法接口，不能用旧项目
-生成的 buffer/actor 直接替换这里的 checkpoint。
+现在支持先将 LeRobot v3 转成 RLinf 原生离线 buffer，使用 Cal-QL 预训练，
+再恢复到在线服务。完整操作见 [离线到在线训练](cobot_calql_offline_to_online.md)。
+Franka 旧项目的 `offline_rl_step*.pt` 仍然不兼容，不能直接替换这里的 checkpoint。
+评测更新门槛统计离线与在线更新之和；两者仍在服务端 status 中分开报告。
 
 ## 验证
 
