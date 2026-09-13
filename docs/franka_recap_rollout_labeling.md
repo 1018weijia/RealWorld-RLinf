@@ -302,6 +302,50 @@ bash examples/offline_rl/policy_optimization/cfg_rl/run_cfg_rl.sh cfg_rl_openpi
 
 产出新的 CFG/RECAP policy checkpoint 后，再回到 amax + pnp 部署流程，每个 task 重新跑 30 次 SR。
 
+### 6.1 2026-09-03 叠碗 recap 数据集整理结果
+
+叠碗任务的已标注 rollout 已单独整理成 LeRobot / RECAP rollout 数据集：
+
+```text
+/home/pnp/桌面/franka_oral_data/stack_bowls_recap_rollout_rc
+```
+
+对应原始标签 CSV：
+
+```text
+/home/pnp/桌面/franka_deploy_0128_ee/franka_deploy/logs/recap_episode_labels.csv
+```
+
+统计：
+
+| 项 | 数量 |
+| --- | ---: |
+| episodes | 34 |
+| successful episodes | 22 |
+| failed episodes | 12 |
+| frames | 196,579 |
+| success frames | 81,863 |
+| fail frames | 114,716 |
+
+已生成 RECAP return sidecar：
+
+```text
+meta/returns_fail300.parquet
+```
+
+这批数据可以单独用于叠碗 task-specific RECAP 训练。完整数据路径、重建命令、`fail300`
+tag、Value SFT / Compute Advantages / CFG Training 命令见：
+
+```text
+docs/realworld_recap_stack_bowls.md
+```
+
+飞书粘贴版见：
+
+```text
+docs/feishu/recap_stack_bowls_feishu.md
+```
+
 ## 7. 切换到 ring 等后续任务
 
 切换任务时必须同时改两处：
