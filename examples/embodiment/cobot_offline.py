@@ -49,9 +49,6 @@ def convert(cfg: DictConfig) -> None:
     rows = data.episodes[:count] if count else data.episodes
     if len(rows) < 2:
         raise ValueError("Select at least two episodes for disjoint train/validation")
-    # Must match RLTStage2Inference.chunk_len, which convert_episode uses to cut
-    # transitions; the chunk_starts default would silently disagree with it.
-    chunk = int(cfg.actor.model.num_action_chunks)
     counts = {
         label: sum(r["episode_success"] == label for r in rows)
         for label in ("success", "failure")
@@ -61,7 +58,7 @@ def convert(cfg: DictConfig) -> None:
         data.root,
         len(rows),
         counts,
-        sum(len(chunk_starts(r["length"], chunk)) for r in rows),
+        sum(len(chunk_starts(r["length"])) for r in rows),
     )
     if cfg.offline.mode == "audit":
         for row in rows:
@@ -85,12 +82,12 @@ def convert(cfg: DictConfig) -> None:
     converted = []
     for row in rows:
         episode = row["episode_index"]
-        if not chunk_starts(row["length"], chunk):
+        if len(chunk_starts(row["length"])) == 0:
             logger.warning(
                 "Skipping episode %d: length=%d has no complete %d-step transition",
                 episode,
                 row["length"],
-                chunk,
+                30,
             )
             continue
         path = shards / f"episode_{episode:06d}.pt"
@@ -134,9 +131,9 @@ def convert(cfg: DictConfig) -> None:
         "source": signature,
         "rows": concatenate(converted),
         "validation_episodes": validation,
-        # Episodes too short for one full chunk are intentionally skipped; that
-        # is not a partial dataset when every source episode was inspected.
-        # Only max_episodes-limited runs are marked partial.
+        # Episodes shorter than one 30-step transition are intentionally
+        # skipped; this is not a partial dataset when every source episode was
+        # inspected.  Only MAX_EPISODES-limited runs are marked partial.
         "partial_conversion": bool(count and count < len(data.episodes)),
         "reward_rule": "success=1/failure=0 at final observed transition; both are terminal",
         "tail_rule": "terminal-aligned full chunks, drop prefix remainder and final action without next observation",
@@ -160,8 +157,23 @@ def train(cfg: DictConfig) -> None:
         trainer.load(str(cfg.runner.resume_dir))
     else:
         trainer.attach_offline_buffer(
-            torch.load(cfg.offline.buffer, map_location="cpu", weights_only=False)
+            torch.load(cfg.offline.buffer, map_location="cpu", weights_only=False),
+            allow_actor_reconfiguration=bool(
+                cfg.offline.get("allow_actor_reconfiguration", False)
+            ),
         )
+    logger.info(
+        "Effective actor: noise_sigma=%s residual_scale=%s; execute=%s reference=%s action_dim=%s",
+        model.actor.sigma,
+        model.actor.edit_scale,
+        cfg.actor.model.num_action_chunks,
+        cfg.actor.model.ref_num_action_chunks,
+        cfg.actor.model.action_dim,
+    )
+    Path(cfg.server.save_dir).parent.mkdir(parents=True, exist_ok=True)
+    OmegaConf.save(
+        cfg, Path(cfg.server.save_dir).parent / "effective_config.yaml", resolve=True
+    )
     if trainer.offline_buffer.payload.get("partial_conversion") and not cfg.offline.get(
         "allow_partial", False
     ):

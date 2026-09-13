@@ -182,7 +182,8 @@ def test_calql_only_calibrates_policy_and_has_finite_gradients():
     assert data.grad.sum() == -1
 
 
-def test_native_offline_train_resume_and_online_update(dataset, tmp_path):
+@pytest.mark.parametrize("reconfigure", [False, True])
+def test_native_offline_train_resume_and_online_update(dataset, tmp_path, reconfigure):
     torch.set_num_threads(1)
     root = Path(__file__).resolve().parents[2]
     cfg = OmegaConf.load(
@@ -200,6 +201,10 @@ def test_native_offline_train_resume_and_online_update(dataset, tmp_path):
     cfg.actor.model.z_dim = 8
     cfg.actor.global_batch_size = 4
     cfg.runner.logger.log_path = str(tmp_path / "logs")
+    original_contract = contract(cfg)
+    if reconfigure:
+        cfg.actor.model.actor_noise_sigma = 0.1
+        cfg.actor.model.residual_scale = 0.3
     model = RLTTD3MLPPolicy(
         z_dim=8,
         proprio_dim=14,
@@ -207,6 +212,8 @@ def test_native_offline_train_resume_and_online_update(dataset, tmp_path):
         num_action_chunks=30,
         ref_num_action_chunks=50,
         mlp_hidden_dim=32,
+        actor_noise_sigma=cfg.actor.model.actor_noise_sigma,
+        residual_scale=cfg.actor.model.residual_scale,
     )
 
     def make():
@@ -222,7 +229,7 @@ def test_native_offline_train_resume_and_online_update(dataset, tmp_path):
     ]
     payload = {
         "format": FORMAT,
-        "contract": contract(cfg),
+        "contract": original_contract,
         "rows": concatenate(rows),
         "validation_episodes": [1],
     }
@@ -234,8 +241,20 @@ def test_native_offline_train_resume_and_online_update(dataset, tmp_path):
         ].tolist()
     ) == {1}
     trainer = make()
-    trainer.attach_offline_buffer(payload)
     trainer.offline_mode = True
+    assert trainer.model.actor.sigma == cfg.actor.model.actor_noise_sigma
+    assert trainer.model.actor.edit_scale == cfg.actor.model.residual_scale
+    if reconfigure:
+        with pytest.raises(ValueError, match="differs"):
+            trainer.attach_offline_buffer(payload)
+    trainer.attach_offline_buffer(payload, allow_actor_reconfiguration=reconfigure)
+    assert payload["contract"] == original_contract
+    assert trainer.offline_buffer.payload["contract"] == contract(cfg)
+    if reconfigure:
+        assert (
+            trainer.offline_buffer.payload["conversion_contract"] == original_contract
+        )
+        assert trainer.offline_buffer.payload["rows"] is payload["rows"]
     before = copy.deepcopy(trainer.model.state_dict())
     metrics = trainer.update_once(train_actor=True)
     assert all(np.isfinite(v) for v in metrics.values())
@@ -258,6 +277,11 @@ def test_native_offline_train_resume_and_online_update(dataset, tmp_path):
     assert restored.offline_buffer.size == 4
     for key, value in trainer.model.state_dict().items():
         torch.testing.assert_close(restored.model.state_dict()[key], value)
+    if reconfigure:
+        cfg.actor.model.residual_scale = 0.2
+        with pytest.raises(ValueError, match="differs"):
+            make().load(str(destination))
+        cfg.actor.model.residual_scale = 0.3
     sample = buffer.sample(1, torch.device("cpu"))
     restored.add_transition(
         curr_obs=sample["curr_obs"],
@@ -279,3 +303,13 @@ def test_native_offline_train_resume_and_online_update(dataset, tmp_path):
     bad["contract"]["task"] = "wrong task"
     with pytest.raises(ValueError, match="differs"):
         make().attach_offline_buffer(bad)
+    for field in ("task", "gamma", "norm_sha256", "feature_model", "actor_model"):
+        bad = copy.deepcopy(payload)
+        if field == "actor_model":
+            bad["contract"][field]["num_action_chunks"] = 8
+        else:
+            bad["contract"][field] = "incompatible"
+        fresh = make()
+        fresh.offline_mode = True
+        with pytest.raises(ValueError, match="differs"):
+            fresh.attach_offline_buffer(bad, allow_actor_reconfiguration=True)

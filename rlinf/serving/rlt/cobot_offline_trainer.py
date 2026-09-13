@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import copy
 import math
 import os
 import tempfile
@@ -58,12 +59,34 @@ class CobotOfflineTrainer(RLTStage2Trainer):
             [self.log_alpha], lr=float(self.cfg.actor.critic_optim.lr)
         )
 
-    def attach_offline_buffer(self, payload: dict) -> None:
+    def attach_offline_buffer(
+        self, payload: dict, *, allow_actor_reconfiguration: bool = False
+    ) -> None:
         """Reject data encoded with another task, model, normalization or horizon."""
-        if payload["contract"] != contract(self.cfg):
+        expected = contract(self.cfg)
+        actual = payload["contract"]
+        if allow_actor_reconfiguration:
+            if not self.offline_mode:
+                raise ValueError(
+                    "Actor reconfiguration requires fresh offline training"
+                )
+            # Only these two scalars are independent of the cached features,
+            # reference candidates, measured actions, and MC returns.
+            adjusted = copy.deepcopy(actual)
+            for key in ("actor_noise_sigma", "residual_scale"):
+                adjusted["actor_model"][key] = expected["actor_model"][key]
+        else:
+            adjusted = actual
+        if adjusted != expected:
             raise ValueError(
                 "Offline buffer differs from current task/Stage1/norm stats/Stage2 configuration"
             )
+        if actual != expected:
+            # Keep the source contract and arrays untouched. Checkpoint copies
+            # carry the training contract so online resume stays strict.
+            payload = dict(payload)
+            payload["conversion_contract"] = payload.get("conversion_contract", actual)
+            payload["contract"] = expected
         self.offline_buffer = OfflineBuffer(payload)
 
     def _sample_batch(self):

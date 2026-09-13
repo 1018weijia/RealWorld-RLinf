@@ -64,21 +64,23 @@ if [[ "$mode" == "audit" || "$mode" == "convert" || "$mode" == "offline" ]]; the
     args+=("+offline.mode=$offline_mode" "+offline.dataset_root=$dataset" "+offline.buffer=$buffer"
         "+offline.steps=${NUM_TRAIN_STEPS:-40000}" "+offline.max_episodes=${MAX_EPISODES:-0}"
         "+offline.allow_partial=${ALLOW_PARTIAL_DATASET:-false}"
+        "+offline.allow_actor_reconfiguration=${RLT_COBOT_ALLOW_ACTOR_RECONFIGURATION:-false}"
         "+offline.validation_every=${VALIDATION_EVERY:-500}" "+offline.save_every=${SAVE_EVERY:-5000}")
 fi
-# These overrides belong to the online server config.  The offline Hydra
-# config is intentionally smaller/structured and must not receive them.
+# Training and serving must instantiate the same actor. Conversion keeps the
+# original feature contract; fresh training can explicitly reuse that cache.
+if [[ "$mode" == "offline" || "$mode" == "train" || "$mode" == "eval" || "$mode" == "preflight" ]]; then
+    args+=("actor.model.actor_noise_sigma=${RLT_COBOT_ACTOR_NOISE_SIGMA:-0.1}"
+        "actor.model.residual_scale=${RLT_COBOT_RESIDUAL_SCALE:-0.3}")
+fi
 if [[ "$mode" == "train" || "$mode" == "eval" ]]; then
-    actor_noise_sigma="${RLT_COBOT_ACTOR_NOISE_SIGMA:-0.1}"
-    residual_scale="${RLT_COBOT_RESIDUAL_SCALE:-0.3}"
     warmup_steps="${RLT_COBOT_WARMUP_STEPS:-200}"
     utd_ratio="${RLT_COBOT_UTD_RATIO:-4}"
     demo_batch_ratio="${RLT_COBOT_DEMO_BATCH_RATIO:-0.45}"
     offline_sample_ratio="${RLT_COBOT_OFFLINE_SAMPLE_RATIO:-0.1}"
     expo_base_candidates="${RLT_COBOT_EXPO_BASE_CANDIDATES:-4}"
     expo_edited_candidates="${RLT_COBOT_EXPO_EDITED_CANDIDATES:-4}"
-    args+=("actor.model.actor_noise_sigma=$actor_noise_sigma" "actor.model.residual_scale=$residual_scale"
-        "server.warmup_steps=$warmup_steps" "server.utd_ratio=$utd_ratio"
+    args+=("server.warmup_steps=$warmup_steps" "server.utd_ratio=$utd_ratio"
         "algorithm.demo_batch_ratio=$demo_batch_ratio" "+algorithm.offline_sample_ratio=$offline_sample_ratio"
         "algorithm.expo.base_candidates=$expo_base_candidates" "algorithm.expo.edited_candidates=$expo_edited_candidates")
 fi

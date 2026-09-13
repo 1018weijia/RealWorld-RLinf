@@ -42,7 +42,8 @@ ROOT = Path(__file__).resolve().parents[2]
         ),
     ],
 )
-def test_task_launcher_argv_and_private_key(tmp_path, task, prompt, port, model):
+@pytest.mark.parametrize("mode", ["preflight", "train", "eval", "offline"])
+def test_task_launcher_argv_and_private_key(tmp_path, task, prompt, port, model, mode):
     scripts = tmp_path / "examples/embodiment"
     scripts.mkdir(parents=True)
     launcher = scripts / "start_cobot_stage2.sh"
@@ -73,8 +74,15 @@ def test_task_launcher_argv_and_private_key(tmp_path, task, prompt, port, model)
     python.chmod(0o700)
     env = {k: v for k, v in os.environ.items() if not k.startswith(("RLT_", "STAGE2_"))}
     env["WANDB_ENTITY"] = "another-shared-user-project"
+    env["RLT_COBOT_ACTOR_NOISE_SIGMA"] = "0.1"
+    env["RLT_COBOT_RESIDUAL_SCALE"] = "0.3"
+    if mode == "eval":
+        resume = tmp_path / "resume"
+        resume.mkdir()
+        (resume / "stage2_state.pt").touch()
+        env["STAGE2_RESUME_DIR"] = str(resume)
     result = subprocess.run(
-        ["bash", str(launcher), task, "preflight"],
+        ["bash", str(launcher), task, mode],
         env=env,
         text=True,
         capture_output=True,
@@ -87,6 +95,15 @@ def test_task_launcher_argv_and_private_key(tmp_path, task, prompt, port, model)
     assert "actor.model.num_action_chunks=30" in args
     assert "rlt_feature_model.num_action_chunks=50" in args
     assert "test-private-key" not in result.stdout
+    assert "actor.model.actor_noise_sigma=0.1" in args
+    assert "actor.model.residual_scale=0.3" in args
+    if mode == "offline":
+        assert "+offline.allow_actor_reconfiguration=false" in args
+        assert not any(
+            arg.startswith("+algorithm.offline_sample_ratio=") for arg in args
+        )
+    if mode in ("train", "eval"):
+        assert "+algorithm.offline_sample_ratio=0.1" in args
 
 
 def test_build_policy_uses_registry_signature():
