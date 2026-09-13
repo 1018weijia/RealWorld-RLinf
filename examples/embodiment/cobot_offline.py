@@ -49,6 +49,9 @@ def convert(cfg: DictConfig) -> None:
     rows = data.episodes[:count] if count else data.episodes
     if len(rows) < 2:
         raise ValueError("Select at least two episodes for disjoint train/validation")
+    # Must match RLTStage2Inference.chunk_len, which convert_episode uses to cut
+    # transitions; the chunk_starts default would silently disagree with it.
+    chunk = int(cfg.actor.model.num_action_chunks)
     counts = {
         label: sum(r["episode_success"] == label for r in rows)
         for label in ("success", "failure")
@@ -58,7 +61,7 @@ def convert(cfg: DictConfig) -> None:
         data.root,
         len(rows),
         counts,
-        sum(len(chunk_starts(r["length"])) for r in rows),
+        sum(len(chunk_starts(r["length"], chunk)) for r in rows),
     )
     if cfg.offline.mode == "audit":
         for row in rows:
@@ -82,6 +85,14 @@ def convert(cfg: DictConfig) -> None:
     converted = []
     for row in rows:
         episode = row["episode_index"]
+        if not chunk_starts(row["length"], chunk):
+            logger.warning(
+                "Skipping episode %d: length=%d has no complete %d-step transition",
+                episode,
+                row["length"],
+                chunk,
+            )
+            continue
         path = shards / f"episode_{episode:06d}.pt"
         if path.exists():
             payload = torch.load(path, map_location="cpu", weights_only=False)
@@ -113,15 +124,20 @@ def convert(cfg: DictConfig) -> None:
         rng.shuffle(ids)
         if len(ids) > 1:
             validation.extend(ids[: max(1, round(len(ids) * 0.1))])
+    converted_ids = {int(r["episode_index"][0]) for r in converted}
+    validation = [episode for episode in validation if episode in converted_ids]
     if not validation:
-        validation = [rows[-1]["episode_index"]]
+        validation = [int(converted[-1]["episode_index"][0])]
     payload = {
         "format": FORMAT,
         "contract": identity,
         "source": signature,
         "rows": concatenate(converted),
         "validation_episodes": validation,
-        "partial_conversion": len(rows) != len(data.episodes),
+        # Episodes too short for one full chunk are intentionally skipped; that
+        # is not a partial dataset when every source episode was inspected.
+        # Only max_episodes-limited runs are marked partial.
+        "partial_conversion": bool(count and count < len(data.episodes)),
         "reward_rule": "success=1/failure=0 at final observed transition; both are terminal",
         "tail_rule": "terminal-aligned full chunks, drop prefix remainder and final action without next observation",
     }
