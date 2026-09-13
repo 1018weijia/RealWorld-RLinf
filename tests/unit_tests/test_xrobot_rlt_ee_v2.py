@@ -24,11 +24,16 @@ import unittest
 
 import cv2
 import numpy as np
+import pytest
 
 try:
     import websockets  # noqa: F401
 except ImportError:
     sys.modules["websockets"] = types.SimpleNamespace(ConnectionClosed=Exception)
+
+# The bridge speaks the vendor client's msgpack-numpy wire format. That package
+# only ships on the robot, so skip rather than fail collection elsewhere.
+pytest.importorskip("msgpack_numpy")
 
 from toolkits.inference.xrobot_rlt_ee import codec
 from toolkits.inference.xrobot_rlt_ee.bridge import (
