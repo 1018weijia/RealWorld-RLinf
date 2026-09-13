@@ -23,7 +23,8 @@ target、优化器和离线 buffer。没有启动真机或训练服务。
 
 服务器命令在 origin 的 **RLinf 项目根目录**执行，不是在本地 rlt-openpi。
 建议另开 zellij tab 用于在线服务，不占用仍在训练的离线 tab。
-GPU 0 在检查时约剩余 156 GiB，但与其他任务共享；每次启动前重新检查。
+本站优先使用 GPU 6、7，资源不足时再考虑 0、1、2。以下使用 GPU 6，
+启动检查时约剩余 170 GiB，但与其他任务共享；每次启动前重新检查。
 8000 在检查时被 XRobot 服务占用，以下使用空闲的 8010，不停止其他服务。
 
 ```bash
@@ -36,7 +37,7 @@ ss -ltnp 'sport = :8010'
 以下整个代码块在同一个服务器终端运行。路径拆成数条短命令，避免复制时在引号内插入换行。
 
 ```bash
-export CUDA_VISIBLE_DEVICES=0
+export CUDA_VISIBLE_DEVICES=6
 export RLT_SERVER_PORT=8010
 export RLT_COBOT_ACTOR_NOISE_SIGMA=0.1
 export RLT_COBOT_RESIDUAL_SCALE=0.3
@@ -59,6 +60,8 @@ bash examples/embodiment/start_cobot_stage2.sh assemble_parts train
 
 等待 Stage1 加载、Stage2 恢复和 WebSocket 服务监听。在线服务需要加载冻结 Stage1，
 其显存与启动耗时高于只用缓存特征的离线训练。
+当前 preflight 的历史参考值仍可能提示 residual_scale、warmup、UTD 偏离；
+应核对当前 checkpoint 和实际配置，而不是为了消除警告改回旧参数。
 WandB key 由项目私有文件自动加载，无需 `wandb login`，不修改共享用户的全局登录。
 `RLT_WANDB_ENTITY` 可选，不设置时使用该账号默认 entity。
 
@@ -137,6 +140,15 @@ bash exp/rlinf_client_cobot.sh assemble_parts train
 相邻 replay transition 复用相同边界观测，不代表录制视频的相邻帧必须逐像素相同。
 
 ## 5. 保存与后续恢复
+
+2026-09-13 已在 `cobot-calql-v2` 会话原装配 tab 启动在线服务，tab 名为
+`assemble-server-gpu6`，端口 8010。服务器执行 `zellij attach cobot-calql-v2` 查看。
+其输出目录是 `results/cobot_stage2_assemble_parts/online_noise01_residual03_20260913_213156`，
+包含 `server.log`。再次使用前检查进程和日志，记录不表示服务永久在线。
+
+离线命令完成后，zellij 可能保留已退出的命令窗口；此时按 Enter 是重跑原命令，
+不是打开 shell。`Run directory already exists` 是输出目录防覆盖保护，并非训练卡住。
+切换用途时应在该 tab 中打开普通 shell 再运行在线命令，不能反复按 Enter 重跑离线任务。
 
 服务端默认每 10 个 episode 保存一次到：
 

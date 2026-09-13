@@ -140,7 +140,7 @@ export STAGE2_RESUME_DIR="$STAGE2_RESUME_DIR/checkpoints/offline_step_40000"
 export RLT_COBOT_ACTOR_NOISE_SIGMA=0.1
 export RLT_COBOT_RESIDUAL_SCALE=0.3
 export RLT_SERVER_PORT=8010
-export CUDA_VISIBLE_DEVICES=0
+export CUDA_VISIBLE_DEVICES=6
 unset RLT_RUN_DIR
 test -f "$STAGE2_RESUME_DIR/offline_state.pt" &&
 bash examples/embodiment/start_cobot_assemble_parts.sh train
