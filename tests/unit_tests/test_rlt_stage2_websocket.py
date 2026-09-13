@@ -298,6 +298,37 @@ def test_handshake_validation_rejects_every_shape_mismatch():
         validate_server_metadata(metadata, camera_keys=("image", "wrist_image"))
 
 
+def test_xrobot_handshake_metadata_identifies_the_embodiment_and_action_schema():
+    import dataclasses
+
+    base = build_policy()[0]._metadata
+    metadata = dataclasses.replace(
+        base, robot_type="x2robot", action_schema="x2robot-ee14-v1"
+    ).to_payload()
+
+    assert metadata["robot_type"] == "x2robot"
+    assert metadata["action_schema"] == "x2robot-ee14-v1"
+
+
+def test_xrobot_stage2_server_config_matches_the_current_ee_contract(monkeypatch):
+    monkeypatch.setenv("XROBOT_RLT_STAGE1_CHECKPOINT", "/weights/global_step_30000")
+    monkeypatch.setenv("XROBOT_NORM_STATS", "/weights/assets/norm_stats.json")
+    config = OmegaConf.load(
+        "examples/embodiment/config/xrobot_ee_rlt_stage2_ws_server.yaml"
+    )
+
+    assert config.server.robot_type == "x2robot"
+    assert config.server.action_schema == "x2robot-ee14-v1"
+    assert config.server.camera_keys == ["image", "wrist_image", "side_image"]
+    assert config.actor.model.action_dim == 14
+    assert config.actor.model.proprio_dim == 14
+    assert config.actor.model.num_action_chunks == 50
+    resolved = OmegaConf.to_container(config, resolve=True)
+    assert resolved["rlt_feature_model"]["openpi_data"]["norm_stats_path"] == (
+        "/weights/assets/norm_stats.json"
+    )
+
+
 # -------------------------------------------------------------- pending map
 
 

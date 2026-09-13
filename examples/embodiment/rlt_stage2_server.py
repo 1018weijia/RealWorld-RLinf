@@ -202,6 +202,8 @@ def build_policy(cfg: DictConfig) -> RLTStage2Policy:
         task_prompt=str(cfg.server.task_prompt),
         eval_only=bool(cfg.server.eval_only),
         use_preference_loss=bool(cfg.algorithm.rewind_preference.enable),
+        robot_type=str(cfg.server.get("robot_type", "")),
+        action_schema=str(cfg.server.get("action_schema", "")),
     )
 
     return RLTStage2Policy(
