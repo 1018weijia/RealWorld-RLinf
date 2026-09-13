@@ -418,6 +418,9 @@ class ServerMetadata:
     eval_only: bool = False
     vla_only: bool = False
     use_preference_loss: bool = False
+    # Disambiguate embodiments that happen to share tensor sizes.
+    robot_type: str = ""
+    action_schema: str = ""
     protocol: str = PROTOCOL_VERSION
     transition_action_spaces: tuple[str, ...] = ACTION_SPACES
 
@@ -445,6 +448,8 @@ class ServerMetadata:
             "eval_only": bool(self.eval_only),
             "vla_only": bool(self.vla_only),
             "use_preference_loss": bool(self.use_preference_loss),
+            "robot_type": str(self.robot_type),
+            "action_schema": str(self.action_schema),
         }
 
 

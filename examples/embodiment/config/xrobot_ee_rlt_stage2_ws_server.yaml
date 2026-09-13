@@ -1,0 +1,48 @@
+# X2Robot dual-arm end-effector RLT Stage 2 server.
+#
+# The generic learner/server is shared with Cobot; only the embodiment
+# contract, Stage-1 checkpoint/data config and chunk horizon are overridden.
+# Launch:
+#   XROBOT_RLT_STAGE1_CHECKPOINT=/path/to/global_step_30000 \
+#   bash examples/embodiment/run_rlt_stage2_server.sh \
+#     xrobot_ee_rlt_stage2_ws_server
+
+defaults:
+  - cobot_rlt_stage2_ws_server
+  - _self_
+
+server:
+  robot_type: x2robot
+  action_schema: x2robot-ee14-v1
+  task_prompt: "put ring on the rod"
+  camera_keys: [image, wrist_image, side_image]
+  save_dir: "../results/xrobot_ee_rlt_stage2_ws/checkpoints"
+
+runner:
+  logger:
+    experiment_name: "xrobot_ee_rlt_stage2_ws"
+
+rlt_feature_model:
+  num_action_chunks: 50
+  action_dim: 14
+  model_path: ${oc.env:XROBOT_RLT_STAGE1_CHECKPOINT}
+  openpi_data:
+    repo_id: "xrobot/put_ring_on_the_rod"
+    # Required explicitly so a shared server cannot silently load another
+    # user's or another task's normalization statistics.
+    norm_stats_path: ${oc.env:XROBOT_NORM_STATS}
+    default_prompt: "put ring on the rod"
+  openpi:
+    config_name: "pi05_xrobot"
+    num_images_in_input: 3
+    action_chunk: ${actor.model.ref_num_action_chunks}
+    action_horizon: ${rlt_feature_model.num_action_chunks}
+    action_env_dim: ${rlt_feature_model.action_dim}
+
+actor:
+  model:
+    proprio_dim: 14
+    action_dim: 14
+    # Keep the current X2Robot/DesktopClient execution horizon unchanged.
+    num_action_chunks: 50
+    ref_num_action_chunks: 50
