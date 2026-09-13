@@ -3,6 +3,10 @@
 以下服务器命令均在 origin 的 RLinf 根目录执行，本地命令在 rlt-openpi 根目录执行。
 入口适配当前 RLinf 原生双臂模型，不调用 Franka 的旧训练器。
 
+零件装配新参数模型已完成 40000 步。当前可直接执行的完整流程见
+[零件装配在线训练手册](cobot_assemble_parts_online.md)，包括实际 checkpoint、
+8010 端口、GPU、ROS2 runtime、本地检查、录制和在线恢复。
+
 ## 站点配置
 
 服务器 `.private-cobot-stage2/paths.env` 已保存经过核实的装配 Stage1 30k、
@@ -127,29 +131,40 @@ results/cobot_offline_assemble_parts/pretrain_run1/checkpoints/offline_step_4000
 
 ## 4. 带着离线权重启动在线服务
 
-完成第 3 步后，服务器执行：
+以下接续 2026-09-13 已验证的零件装配新参数 checkpoint。在 origin 的 RLinf 根目录执行：
 
 ```bash
-export STAGE2_RESUME_DIR="$PWD/results/cobot_offline_assemble_parts/pretrain_run1/checkpoints/offline_step_40000"
-export RLT_COBOT_ACTOR_NOISE_SIGMA=0.2
-export RLT_COBOT_RESIDUAL_SCALE=0.2
-test -f "$STAGE2_RESUME_DIR/offline_state.pt"
-CUDA_VISIBLE_DEVICES=3 \
-  bash examples/embodiment/start_cobot_assemble_parts.sh train
+export STAGE2_RESUME_DIR="$PWD/results/cobot_offline_assemble_parts"
+export STAGE2_RESUME_DIR="$STAGE2_RESUME_DIR/pretrain_noise01_residual03_restart_20260913_203655"
+export STAGE2_RESUME_DIR="$STAGE2_RESUME_DIR/checkpoints/offline_step_40000"
+export RLT_COBOT_ACTOR_NOISE_SIGMA=0.1
+export RLT_COBOT_RESIDUAL_SCALE=0.3
+export RLT_SERVER_PORT=8010
+export CUDA_VISIBLE_DEVICES=0
+unset RLT_RUN_DIR
+test -f "$STAGE2_RESUME_DIR/offline_state.pt" &&
+bash examples/embodiment/start_cobot_assemble_parts.sh train
 ```
 
 恢复同一 actor/critic、target 和优化器。离线更新数独立记录，在线环境计数从 0 开始。
-有已训练离线 checkpoint 时不再强制执行 250 个纯 VLA warmup chunk。
+有已训练离线 checkpoint 时不再强制执行纯 VLA warmup chunk。
 在线阶段恢复原有 TD3/EXPO 目标，Cal-QL 和离线 BC 不继续开启。
 默认约 10% 的 batch 来自离线训练分区，其余来自原在线/HIL 采样；
-可追加 `+algorithm.offline_sample_ratio=0.1` 调整，取值为 [0,1)。
+可设置 `RLT_COBOT_OFFLINE_SAMPLE_RATIO=0.1` 调整，取值为 [0,1)。
 后续在线 checkpoint 会继续携带离线 buffer；不需要重新转换或重新预训练。
 
 本地先启动既有 Evo-RL ROS2 policy runtime，再执行：
 
 ```bash
-bash exp/rlinf_client_cobot.sh assemble_parts check
+unset RLT_SERVER_HOST
+export RLT_SERVER_PORT=8010
+bash exp/rlinf_client_cobot.sh assemble_parts check &&
 bash exp/rlinf_client_cobot.sh assemble_parts dry-run
+```
+
+上方检查通过、操作员确认安全后，在同一个本地终端执行：
+
+```bash
 RLT_REQUIRED_OFFLINE_UPDATES=40000 \
   bash exp/rlinf_client_cobot.sh assemble_parts train
 ```
@@ -178,4 +193,5 @@ CPU 测试覆盖 v3 共享视频、双臂索引、失败奖励、MC 折扣、边
 
 部署验证已使用真实装配 Stage1 30k 转换前两条轨迹（137 个 transition），完成
 20 次 Cal-QL 更新并恢复在线服务。这是小样本工程验证，未执行真机动作，
-不属于全量预训练或正式效果评测。全量数据转换与 40000 步训练仍需按上面的命令启动。
+不属于正式效果评测。随后已完成装配全量 6728 条 transition 的新参数 40000 步训练，
+最终 checkpoint 的在线配置匹配和 CPU 恢复验证通过；真机效果仍需在线实验确认。
