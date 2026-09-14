@@ -12,7 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""LeRobot v3 Cobot episodes and portable, native RLT feature buffers."""
+"""Offline episodes to portable, native RLT feature buffers.
+
+The conversion, the buffer and the dataset fingerprint are robot-agnostic;
+what a given robot stores in a recorded episode is not. That split is
+:class:`OfflineEpisodeSource`, with :class:`CobotLeRobotV3` as the LeRobot v3
+Cobot reader and the model for any robot added later.
+"""
 
 from __future__ import annotations
 
@@ -20,10 +26,40 @@ import hashlib
 import json
 import os
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 import numpy as np
 import torch
+
+
+class OfflineEpisodeSource(Protocol):
+    """A recorded dataset that :func:`convert_episode` can replay into features.
+
+    Everything robot-specific about offline conversion lives behind this:
+    which joints or pose components a row holds, how the frames are stored and
+    what the dataset calls its cameras. A new robot supplies its own reader --
+    see :class:`CobotLeRobotV3` -- and reuses the conversion untouched.
+    """
+
+    prompt: str
+    """Task instruction to condition the frozen Stage 1 VLA with."""
+
+    episodes: list[dict]
+    """One row per episode, carrying at least ``episode_index``, ``length``
+    and ``episode_success``."""
+
+    cameras: dict[str, str]
+    """Dataset feature name to client camera key, in the embodiment's camera
+    order. The values must be the server's ``embodiment.camera_keys``."""
+
+    def table(self, row: dict) -> tuple[np.ndarray, np.ndarray]:
+        """Return the ``(state, action)`` arrays of one episode."""
+        ...
+
+    def frames(self, row: dict, name: str, indices: list[int]) -> dict[int, np.ndarray]:
+        """Decode the requested frames of one camera, keyed by index."""
+        ...
+
 
 JOINT_NAMES = [
     name
@@ -89,6 +125,7 @@ class CobotLeRobotV3:
                 "Cobot online execution and offline data must both use 30 Hz"
             )
         self.prompt = prompt
+        self.cameras = CAMERAS
         features = self.info["features"]
         self.state_indices = [
             features["observation.state"]["names"].index(n) for n in JOINT_NAMES
@@ -212,7 +249,9 @@ def chunk_starts(length: int, chunk: int = 30) -> list[int]:
     )
 
 
-def convert_episode(data: CobotLeRobotV3, row: dict, inference, gamma: float) -> dict:
+def convert_episode(
+    data: OfflineEpisodeSource, row: dict, inference, gamma: float
+) -> dict:
     """Encode each boundary once, sharing the exact feature between adjacent chunks."""
     state, actions = data.table(row)
     chunk = inference.chunk_len
@@ -220,13 +259,13 @@ def convert_episode(data: CobotLeRobotV3, row: dict, inference, gamma: float) ->
     if not starts:
         raise ValueError(f"Episode {row['episode_index']} has no complete transition")
     endpoints = [*starts, starts[-1] + chunk]
-    videos = {name: data.frames(row, name, endpoints) for name in CAMERAS}
+    videos = {name: data.frames(row, name, endpoints) for name in data.cameras}
     features = []
     normalized = []
     for position, index in enumerate(endpoints):
         observation = {"state": state[index], "prompt": data.prompt}
         observation.update(
-            {target: videos[name].pop(index) for name, target in CAMERAS.items()}
+            {target: videos[name].pop(index) for name, target in data.cameras.items()}
         )
         encoded = inference.encode(observation)
         features.append(

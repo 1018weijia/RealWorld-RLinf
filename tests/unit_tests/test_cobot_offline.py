@@ -32,8 +32,8 @@ from rlinf.serving.rlt.cobot_offline_data import (
     contract,
     convert_episode,
 )
-from rlinf.serving.rlt.cobot_offline_trainer import (
-    CobotOfflineTrainer,
+from rlinf.serving.rlt.offline_trainer import (
+    RLTOfflineTrainer,
     conservative_gap,
 )
 from rlinf.serving.rlt.protocol import ChunkIdentity
@@ -214,7 +214,7 @@ def test_native_offline_train_resume_and_online_update(
     )
 
     def make():
-        return CobotOfflineTrainer(
+        return RLTOfflineTrainer(
             cfg,
             model=copy.deepcopy(model),
             target_model=copy.deepcopy(model),

@@ -181,7 +181,7 @@ RLT_REQUIRED_OFFLINE_UPDATES=40000 \
 
 ## 代码与验证
 
-服务端新增 `rlinf/serving/rlt/cobot_offline_data.py`、`cobot_offline_trainer.py` 和
+服务端新增 `rlinf/serving/rlt/cobot_offline_data.py`、`offline_trainer.py` 和
 `examples/embodiment/cobot_offline.py`；在线入口使用兼容的 trainer 子类。
 rlt-openpi 仓库的 `deployment/rlinf/` 保存部署副本；已有服务端入口的接线补丁位于
 `deployment/rlinf/cobot_offline_server.patch`，安装后运行 RLinf 的 Ruff 格式化。

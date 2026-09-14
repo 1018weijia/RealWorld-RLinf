@@ -41,7 +41,7 @@ from hydra import compose, initialize_config_dir
 from omegaconf import OmegaConf
 
 from rlinf.models import get_model
-from rlinf.serving.rlt.cobot_offline_trainer import CobotOfflineTrainer
+from rlinf.serving.rlt.offline_trainer import RLTOfflineTrainer
 
 DEFAULT_CONFIG_DIR = (
     Path(__file__).resolve().parents[2] / "examples" / "embodiment" / "config"
@@ -89,7 +89,7 @@ def summarize(
     }
 
 
-def build_trainer(config_dir: Path, config_name: str) -> CobotOfflineTrainer:
+def build_trainer(config_dir: Path, config_name: str) -> RLTOfflineTrainer:
     """Build a Stage 2 trainer without loading the frozen Stage 1 VLA."""
     with initialize_config_dir(config_dir=str(config_dir), version_base="1.3"):
         cfg = compose(config_name=config_name)
@@ -99,7 +99,7 @@ def build_trainer(config_dir: Path, config_name: str) -> CobotOfflineTrainer:
     model = get_model(cfg.actor.model).to(device)
     target_model = copy.deepcopy(model).to(device)
     target_model.requires_grad_(False)
-    return CobotOfflineTrainer(
+    return RLTOfflineTrainer(
         cfg=cfg,
         model=model,
         target_model=target_model,

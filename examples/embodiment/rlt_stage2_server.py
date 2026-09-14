@@ -30,15 +30,13 @@ import torch
 from omegaconf import DictConfig, OmegaConf
 
 from rlinf.models import get_model
-from rlinf.serving.rlt.cobot_offline_trainer import (
-    CobotOfflineTrainer as RLTStage2Trainer,
-)
 from rlinf.serving.rlt.embodiment import EmbodimentProfile
 from rlinf.serving.rlt.inference import (
     CameraLayout,
     RLTObservationRepacker,
     RLTStage2Inference,
 )
+from rlinf.serving.rlt.offline_trainer import RLTOfflineTrainer as RLTStage2Trainer
 from rlinf.serving.rlt.policy import RLTStage2Policy, Stage1EvaluationState
 from rlinf.serving.rlt.preflight import (
     check_camera_layout,

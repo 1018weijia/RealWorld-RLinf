@@ -40,7 +40,7 @@ def conservative_gap(policy_q, other_q, data_q, returns, temperature: float = 1.
     return (partition - data_q).mean()
 
 
-class CobotOfflineTrainer(RLTStage2Trainer):
+class RLTOfflineTrainer(RLTStage2Trainer):
     """Use the identical actor/critic and checkpoint for offline and online RL.
 
     Offline data stays separate from online/HIL replay, so PER and rewind can

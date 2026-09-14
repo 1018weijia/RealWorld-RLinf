@@ -23,7 +23,6 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
-from omegaconf import OmegaConf
 
 ROOT = Path(__file__).resolve().parents[2]
 

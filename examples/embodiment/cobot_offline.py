@@ -35,7 +35,7 @@ from rlinf.serving.rlt.cobot_offline_data import (
     contract,
     convert_episode,
 )
-from rlinf.serving.rlt.cobot_offline_trainer import CobotOfflineTrainer
+from rlinf.serving.rlt.offline_trainer import RLTOfflineTrainer
 
 logger = logging.getLogger(__name__)
 
@@ -149,7 +149,7 @@ def train(cfg: DictConfig) -> None:
     torch.manual_seed(int(cfg.actor.seed))
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = get_model(cfg.actor.model).to(device)
-    trainer = CobotOfflineTrainer(
+    trainer = RLTOfflineTrainer(
         cfg, model=model, target_model=copy.deepcopy(model), device=device
     )
     trainer.offline_mode = True
