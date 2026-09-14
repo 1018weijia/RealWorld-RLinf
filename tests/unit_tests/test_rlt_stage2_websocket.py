@@ -252,9 +252,6 @@ def test_act_and_transition_payloads_round_trip():
     request = ActRequest.from_payload(payload)
     assert request.exploration_noise_sigma == pytest.approx(0.05)
     assert request.identity == identity
-    # chunk_id is intentionally not part of the key: RLTRewindCore groups all
-    # of an episode's rows under one key and orders them by chunk_id inside.
-    assert identity.row_key == (3, 7, 1)
 
     transition = TransitionRequest.from_payload(
         {
@@ -310,21 +307,20 @@ def test_xrobot_handshake_metadata_identifies_the_embodiment_and_action_schema()
     assert metadata["action_schema"] == "x2robot-ee14-v1"
 
 
-def test_xrobot_stage2_server_config_matches_the_current_ee_contract(monkeypatch):
+def test_xrobot_stage2_server_reads_its_assets_from_the_environment(
+    monkeypatch, server_config
+):
+    # The embodiment contract itself is pinned in test_rlt_embodiment.py; what
+    # is specific to this config is that a shared server takes the checkpoint
+    # and the norm statistics from the environment rather than a baked path.
     monkeypatch.setenv("XROBOT_RLT_STAGE1_CHECKPOINT", "/weights/global_step_30000")
     monkeypatch.setenv("XROBOT_NORM_STATS", "/weights/assets/norm_stats.json")
-    config = OmegaConf.load(
-        "examples/embodiment/config/xrobot_ee_rlt_stage2_ws_server.yaml"
-    )
+    config = server_config("xrobot_ee_rlt_stage2_ws_server")
 
-    assert config.server.robot_type == "x2robot"
-    assert config.server.action_schema == "x2robot-ee14-v1"
-    assert config.server.camera_keys == ["image", "wrist_image", "side_image"]
-    assert config.actor.model.action_dim == 14
-    assert config.actor.model.proprio_dim == 14
-    assert config.actor.model.num_action_chunks == 50
     resolved = OmegaConf.to_container(config, resolve=True)
-    assert resolved["rlt_feature_model"]["openpi_data"]["norm_stats_path"] == (
+    feature_model = resolved["rlt_feature_model"]
+    assert feature_model["model_path"] == "/weights/global_step_30000"
+    assert feature_model["openpi_data"]["norm_stats_path"] == (
         "/weights/assets/norm_stats.json"
     )
 

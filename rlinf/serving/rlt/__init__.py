@@ -12,46 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Single-process RLT Stage 2 server: protocol, inference, and policy router."""
+"""Single-process RLT Stage 2 server: protocol, inference, and policy router.
 
-from rlinf.serving.rlt.inference import (
-    ActionSelection,
-    CameraLayout,
-    RLTObservationRepacker,
-    RLTStage2Inference,
-)
-from rlinf.serving.rlt.protocol import (
-    PROTOCOL_VERSION,
-    REQUEST_KEY,
-    REQUEST_TYPES,
-    ActRequest,
-    ChunkIdentity,
-    DiscardRequest,
-    EpisodeEndRequest,
-    RewindCreditRequest,
-    RewindExitRequest,
-    ServerMetadata,
-    TransitionRequest,
-    decode_request_type,
-    validate_server_metadata,
-)
-
-__all__ = [
-    "PROTOCOL_VERSION",
-    "REQUEST_KEY",
-    "REQUEST_TYPES",
-    "ActRequest",
-    "ActionSelection",
-    "CameraLayout",
-    "ChunkIdentity",
-    "DiscardRequest",
-    "EpisodeEndRequest",
-    "RLTObservationRepacker",
-    "RLTStage2Inference",
-    "RewindCreditRequest",
-    "RewindExitRequest",
-    "ServerMetadata",
-    "TransitionRequest",
-    "decode_request_type",
-    "validate_server_metadata",
-]
+Import the submodules directly, which is what every call site already does.
+Re-exporting them here only meant that importing ``protocol`` -- plain
+dataclasses over the wire format -- also built ``inference``, which reaches
+the model registry.
+"""

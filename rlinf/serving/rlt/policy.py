@@ -33,7 +33,7 @@ import logging
 import os
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any
 
@@ -85,7 +85,6 @@ class PendingTransition:
         robot_chunk: Same chunk in robot units, i.e. what the client executed
             absent an intervention.
         mode: ``"warmup"``, ``"actor"`` or ``"eval"``.
-        created_at: Monotonic timestamp, used only for stale-pending logging.
     """
 
     transition_id: str
@@ -94,7 +93,6 @@ class PendingTransition:
     normalized_chunk: np.ndarray
     robot_chunk: np.ndarray
     mode: str
-    created_at: float = field(default_factory=time.monotonic)
 
 
 @dataclass

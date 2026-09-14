@@ -64,10 +64,6 @@ ACTION_SPACE_ROBOT = "robot"
 ACTION_SPACE_NORMALIZED = "normalized"
 ACTION_SPACES = (ACTION_SPACE_NORMALIZED, ACTION_SPACE_ROBOT)
 
-MODE_WARMUP = "warmup"
-MODE_ACTOR = "actor"
-MODE_EVAL = "eval"
-
 
 class ProtocolError(ValueError):
     """A frame violated the RLT protocol and cannot be handled."""
@@ -153,11 +149,6 @@ class ChunkIdentity:
             "env_id": self.env_id,
             "chunk_id": self.chunk_id,
         }
-
-    @property
-    def row_key(self) -> tuple[int, int, int]:
-        """Session-level key used to group replay rows."""
-        return (self.episode_id, self.session_id, self.env_id)
 
 
 @dataclass(frozen=True)

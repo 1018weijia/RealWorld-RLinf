@@ -844,6 +844,9 @@ class RLTRewindCore(RLTHostHooks):
 
     @staticmethod
     def _row_key(episode_id: int, session_id: int, env_id: int) -> tuple[int, int, int]:
+        # chunk_id is intentionally absent: all of an episode's rows share one
+        # key and are ordered by chunk_id within it, which is what lets rewind
+        # address a prefix of the episode.
         return (episode_id, session_id, env_id)
 
     def _append_replay_rows(self, trajectory: Trajectory, trajectory_id: int) -> None:

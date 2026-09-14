@@ -41,10 +41,8 @@ from rlinf.envs.realworld.cobot.control import (
 )
 from rlinf.envs.realworld.rlt_client.loop import (
     EVENT_ABORT,
-    EVENT_FAILURE,
     EVENT_REWIND_CREDIT,
     EVENT_REWIND_EXIT,
-    EVENT_SUCCESS,
 )
 from rlinf.envs.realworld.rlt_client.transport import (
     ChunkExecutionResult,
@@ -406,93 +404,3 @@ def build_cobot_transport(
         rewind_history_chunks=int(transport_cfg.get("rewind_history_chunks", 12)),
         stop_on_safety_fault=bool(transport_cfg.get("stop_on_safety_fault", True)),
     )
-
-
-class FrankaTransport:
-    """Skeleton transport for a remote Franka arm.
-
-    Franka shares the RLT data contract with Cobot but not its control
-    protocol: chunks are streamed to a separate real-time control process
-    rather than stepped locally, and rewind is driven by that process. Filling
-    in the methods below is enough to reuse
-    :class:`~rlinf.envs.realworld.rlt_client.loop.RLTRobotLoop` unchanged.
-
-    Args:
-        chunk_len: Steps per chunk.
-        action_dim: Action coordinates per step.
-        proprio_dim: Proprioception width.
-        camera_keys: Camera keys the Franka stack publishes.
-    """
-
-    def __init__(
-        self,
-        *,
-        chunk_len: int,
-        action_dim: int = 8,
-        proprio_dim: int = 8,
-        camera_keys: Sequence[str] = ("image", "wrist_image"),
-    ) -> None:
-        self._chunk_len = int(chunk_len)
-        self._action_dim = int(action_dim)
-        self._proprio_dim = int(proprio_dim)
-        self._camera_keys = tuple(camera_keys)
-
-    @property
-    def action_dim(self) -> int:
-        """Action coordinates per step."""
-        return self._action_dim
-
-    @property
-    def chunk_len(self) -> int:
-        """Steps per action chunk."""
-        return self._chunk_len
-
-    @property
-    def proprio_dim(self) -> int:
-        """Proprioception width."""
-        return self._proprio_dim
-
-    @property
-    def camera_keys(self) -> tuple[str, ...]:
-        """Camera keys published in each observation."""
-        return self._camera_keys
-
-    def reset(self) -> RobotObservation:
-        """Move to the start pose and observe."""
-        raise NotImplementedError(_FRANKA_TODO.format(method="reset"))
-
-    def observe(self) -> RobotObservation:
-        """Observe without moving."""
-        raise NotImplementedError(_FRANKA_TODO.format(method="observe"))
-
-    def execute_chunk(
-        self, action_chunk: np.ndarray, identity: ChunkIdentity
-    ) -> ChunkExecutionResult:
-        """Stream one chunk to the Franka control process."""
-        raise NotImplementedError(_FRANKA_TODO.format(method="execute_chunk"))
-
-    def poll_operator_event(self) -> OperatorEvent | None:
-        """Read one operator decision from the Franka teleoperation stack."""
-        raise NotImplementedError(_FRANKA_TODO.format(method="poll_operator_event"))
-
-    def rewind_chunks(self, count: int) -> RobotObservation:
-        """Reverse-play chunks through the Franka control process."""
-        raise NotImplementedError(_FRANKA_TODO.format(method="rewind_chunks"))
-
-    def stop(self, reason: str) -> None:
-        """Halt the arm immediately."""
-        raise NotImplementedError(_FRANKA_TODO.format(method="stop"))
-
-    def close(self) -> None:
-        """Release the connection."""
-        raise NotImplementedError(_FRANKA_TODO.format(method="close"))
-
-
-_FRANKA_TODO = (
-    "FrankaTransport.{method} is a skeleton. TODO(agent): wire it to the "
-    "Franka real-time control process; the RLT loop and server need no changes."
-)
-
-
-_EVENT_KINDS = (EVENT_SUCCESS, EVENT_FAILURE, EVENT_REWIND_EXIT, EVENT_REWIND_CREDIT)
-"""Operator event kinds a Cobot keyboard mapping is expected to produce."""
