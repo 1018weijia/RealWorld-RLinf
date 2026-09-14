@@ -83,6 +83,24 @@ runner:
   resume_dir: null
 
 algorithm:
+  # This section is shared with cobot_rlt_stage2_td3_mlp.yaml so the two stay
+  # diffable, but that config drives Ray TD3 workers and this one is a single
+  # process that never builds them. The keys below are read only by those
+  # workers, so setting them here changes nothing -- and unlike a typo, a
+  # wrong value raises nothing, because this server does not run the
+  # `validate_cfg` assertions that pin them on the Ray path:
+  #
+  #   adv_type, loss_type, loss_agg_func, agg_q, actor_update_action_noise,
+  #   critic_subsample_size, backup_entropy, entropy_tuning.*
+  #
+  # Three more have no reader anywhere in the repository:
+  # rewind_preference.rewind_exit_terminal_reward,
+  # .rewind_credit_terminal_reward and .rewind_credit_prefix_reward. The rest
+  # of the rewind_preference block is live.
+  #
+  # Updates per episode are budgeted here as train_chunks * server.utd_ratio,
+  # which is why rlt_schedule.utd_ratio interpolates from that key rather than
+  # carrying its own number.
   group_size: 1
   agg_q: min
   actor_agg_q: min
@@ -99,6 +117,10 @@ algorithm:
   reference_dropout_prob: 0.0
   actor_update_action_noise: True
 
+  # Inert here, and the easiest of these to misread: EXPO on this path is
+  # switched by actor.model.action_selection_mode and sized by
+  # actor.model.expo_num_base_samples / expo_num_edit_samples, which carry the
+  # same 4/4 further down. Setting enable: False below leaves EXPO running.
   expo:
     enable: True
     base_candidates: 4
