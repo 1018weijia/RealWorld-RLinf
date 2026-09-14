@@ -7,7 +7,11 @@ private="$root/.private-cobot-stage2"
 task="${1:-assemble_parts}"
 mode="${2:-preflight}"
 shift "$(( $# >= 2 ? 2 : $# ))"
-case "$mode" in preflight|train|eval|audit|convert|offline) ;; *) echo "Expected preflight|train|eval|audit|convert|offline" >&2; exit 2 ;; esac
+case "$mode" in preflight|train|eval|eval-stage1|audit|convert|offline) ;; *) echo "Expected preflight|train|eval|eval-stage1|audit|convert|offline" >&2; exit 2 ;; esac
+if [[ "$mode" == "eval-stage1" && -n "${STAGE2_RESUME_DIR:-}" ]]; then
+    echo "Pure Stage1 evaluation must not restore Stage2: unset STAGE2_RESUME_DIR" >&2
+    exit 2
+fi
 source "$private/paths.env"
 case "$task" in
     assemble_parts) checkpoint="$COBOT_ASSEMBLE_CHECKPOINT"; stats="$COBOT_ASSEMBLE_STATS"; prompt="assemble parts"; port=8000 ;;
@@ -42,6 +46,9 @@ if [[ "$mode" == "eval" ]]; then
     : "${STAGE2_RESUME_DIR:?Evaluation requires a trained Stage2 checkpoint directory}"
     args+=(server.eval_only=True)
 fi
+if [[ "$mode" == "eval-stage1" ]]; then
+    args+=(server.eval_only=True +server.vla_only=True)
+fi
 entry=rlt_stage2_server.py
 if [[ "$mode" == "audit" || "$mode" == "convert" || "$mode" == "offline" ]]; then
     entry=cobot_offline.py
@@ -69,7 +76,7 @@ if [[ "$mode" == "audit" || "$mode" == "convert" || "$mode" == "offline" ]]; the
 fi
 # Training and serving must instantiate the same actor. Conversion keeps the
 # original feature contract; fresh training can explicitly reuse that cache.
-if [[ "$mode" == "offline" || "$mode" == "train" || "$mode" == "eval" || "$mode" == "preflight" ]]; then
+if [[ "$mode" == "offline" || "$mode" == "train" || "$mode" == "eval" || "$mode" == "eval-stage1" || "$mode" == "preflight" ]]; then
     args+=("actor.model.actor_noise_sigma=${RLT_COBOT_ACTOR_NOISE_SIGMA:-0.1}"
         "actor.model.residual_scale=${RLT_COBOT_RESIDUAL_SCALE:-0.3}")
 fi

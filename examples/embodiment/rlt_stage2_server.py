@@ -38,7 +38,7 @@ from rlinf.serving.rlt.inference import (
     RLTObservationRepacker,
     RLTStage2Inference,
 )
-from rlinf.serving.rlt.policy import RLTStage2Policy
+from rlinf.serving.rlt.policy import RLTStage2Policy, Stage1EvaluationState
 from rlinf.serving.rlt.preflight import (
     check_camera_layout,
     check_norm_stats,
@@ -52,6 +52,17 @@ from rlinf.serving.rlt.protocol import ACTION_SPACE_ROBOT, ServerMetadata
 from rlinf.serving.websocket_server import RLinfWebsocketPolicyServer
 
 logger = logging.getLogger(__name__)
+
+
+def validate_vla_only_config(cfg: DictConfig) -> bool:
+    """Reject training or Stage2 restoration in a pure Stage1 evaluation."""
+    vla_only = bool(cfg.server.get("vla_only", False))
+    if vla_only and (not bool(cfg.server.eval_only) or cfg.runner.get("resume_dir")):
+        raise ValueError(
+            "VLA-only evaluation requires eval_only=True and no runner.resume_dir"
+        )
+    return vla_only
+
 
 REFERENCE_HYPERPARAMETERS = {
     "actor_lr": 3e-5,
@@ -105,6 +116,7 @@ def run_preflight(cfg: DictConfig) -> None:
     Args:
         cfg: Full server config.
     """
+    validate_vla_only_config(cfg)
     feature_cfg = cfg.rlt_feature_model
     weights_path = resolve_stage1_weights(str(feature_cfg.model_path))
 
@@ -141,6 +153,7 @@ def build_policy(cfg: DictConfig) -> RLTStage2Policy:
     Returns:
         A policy ready to serve.
     """
+    vla_only = validate_vla_only_config(cfg)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     logger.info("Loading Stage 1 from %s", cfg.rlt_feature_model.model_path)
@@ -149,21 +162,30 @@ def build_policy(cfg: DictConfig) -> RLTStage2Policy:
     for parameter in feature_model.parameters():
         parameter.requires_grad_(False)
 
-    logger.info("Building Stage 2 head (%s)", cfg.actor.model.model_type)
-    model = get_model(cfg.actor.model).to(device)
-    target_model = copy.deepcopy(model).to(device)
-    target_model.requires_grad_(False)
+    if vla_only:
+        logger.info(
+            "Stage1-only evaluation: no Stage2 model, optimizer or offline replay loaded"
+        )
+        model = None
+        trainer = Stage1EvaluationState(
+            int(cfg.actor.model.num_action_chunks), int(cfg.actor.model.action_dim)
+        )
+    else:
+        logger.info("Building Stage 2 head (%s)", cfg.actor.model.model_type)
+        model = get_model(cfg.actor.model).to(device)
+        target_model = copy.deepcopy(model).to(device)
+        target_model.requires_grad_(False)
 
-    trainer = RLTStage2Trainer(
-        cfg=cfg,
-        model=model,
-        target_model=target_model,
-        device=device,
-        torch_dtype=torch.float32,
-    )
-    if cfg.runner.get("resume_dir"):
-        logger.info("Resuming Stage 2 state from %s", cfg.runner.resume_dir)
-        trainer.load(cfg.runner.resume_dir)
+        trainer = RLTStage2Trainer(
+            cfg=cfg,
+            model=model,
+            target_model=target_model,
+            device=device,
+            torch_dtype=torch.float32,
+        )
+        if cfg.runner.get("resume_dir"):
+            logger.info("Resuming Stage 2 state from %s", cfg.runner.resume_dir)
+            trainer.load(cfg.runner.resume_dir)
 
     camera_keys = tuple(cfg.server.camera_keys)
     repacker = RLTObservationRepacker(
@@ -177,7 +199,9 @@ def build_policy(cfg: DictConfig) -> RLTStage2Policy:
         repacker=repacker,
         chunk_len=int(cfg.actor.model.num_action_chunks),
         action_dim=int(cfg.actor.model.action_dim),
-        num_ref_candidates=int(cfg.actor.model.expo_num_base_samples),
+        num_ref_candidates=1
+        if vla_only
+        else int(cfg.actor.model.expo_num_base_samples),
         device=device,
     )
 
@@ -191,16 +215,23 @@ def build_policy(cfg: DictConfig) -> RLTStage2Policy:
         # only describes what the buffer stores.
         action_space=ACTION_SPACE_ROBOT,
         replay_action_space=str(cfg.server.replay_action_space),
-        action_selection_mode=str(cfg.actor.model.action_selection_mode),
-        edit_scale=float(cfg.actor.model.residual_scale),
-        expo_num_base_samples=int(cfg.actor.model.expo_num_base_samples),
-        expo_num_edit_samples=int(cfg.actor.model.expo_num_edit_samples),
+        action_selection_mode="vla"
+        if vla_only
+        else str(cfg.actor.model.action_selection_mode),
+        edit_scale=0.0 if vla_only else float(cfg.actor.model.residual_scale),
+        expo_num_base_samples=1
+        if vla_only
+        else int(cfg.actor.model.expo_num_base_samples),
+        expo_num_edit_samples=0
+        if vla_only
+        else int(cfg.actor.model.expo_num_edit_samples),
         actor_action_clip_min=float(cfg.actor.model.get("action_clip_min", -1.4)),
         actor_action_clip_max=float(cfg.actor.model.get("action_clip_max", 1.4)),
         max_episode_chunks=int(cfg.server.max_episode_chunks),
         camera_keys=camera_keys,
         task_prompt=str(cfg.server.task_prompt),
         eval_only=bool(cfg.server.eval_only),
+        vla_only=vla_only,
         use_preference_loss=bool(cfg.algorithm.rewind_preference.enable),
         robot_type=str(cfg.server.get("robot_type", "")),
         action_schema=str(cfg.server.get("action_schema", "")),

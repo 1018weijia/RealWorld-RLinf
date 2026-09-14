@@ -42,7 +42,9 @@ ROOT = Path(__file__).resolve().parents[2]
         ),
     ],
 )
-@pytest.mark.parametrize("mode", ["preflight", "train", "eval", "offline"])
+@pytest.mark.parametrize(
+    "mode", ["preflight", "train", "eval", "eval-stage1", "offline"]
+)
 def test_task_launcher_argv_and_private_key(tmp_path, task, prompt, port, model, mode):
     scripts = tmp_path / "examples/embodiment"
     scripts.mkdir(parents=True)
@@ -104,6 +106,10 @@ def test_task_launcher_argv_and_private_key(tmp_path, task, prompt, port, model,
         )
     if mode in ("train", "eval"):
         assert "+algorithm.offline_sample_ratio=0.1" in args
+    if mode == "eval-stage1":
+        assert "server.eval_only=True" in args
+        assert "+server.vla_only=True" in args
+        assert not any(arg.startswith("runner.resume_dir=") for arg in args)
 
 
 def test_build_policy_uses_registry_signature():

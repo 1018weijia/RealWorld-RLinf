@@ -34,6 +34,7 @@ import os
 import threading
 import time
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
@@ -113,6 +114,21 @@ class EpisodeAccumulator:
         self.interventions = 0
 
 
+class Stage1EvaluationState:
+    """Read-only protocol counters without a Stage2 model, optimizer or replay."""
+
+    def __init__(self, chunk_length: int, action_dim: int) -> None:
+        self.replay_buffer = SimpleNamespace(total_samples=0)
+        self.demo_buffer = None
+        self.rewind_preference_buffer = ()
+        self.update_step = 0
+        self.chunk_length = int(chunk_length)
+        self.action_dim = int(action_dim)
+
+    def _chunk_shape(self) -> tuple[int, int]:
+        return self.chunk_length, self.action_dim
+
+
 class RLTStage2Policy:
     """Expose an :class:`RLTStage2Trainer` over the RLT WebSocket protocol.
 
@@ -135,7 +151,7 @@ class RLTStage2Policy:
     def __init__(
         self,
         *,
-        trainer: RLTStage2Trainer,
+        trainer: RLTStage2Trainer | Stage1EvaluationState,
         inference: RLTStage2Inference,
         metadata: ServerMetadata,
         warmup_steps: int,
@@ -159,6 +175,9 @@ class RLTStage2Policy:
         self.save_dir = save_dir
         self.save_interval_episodes = max(1, int(save_interval_episodes))
         self.eval_only = bool(eval_only)
+        self.vla_only = bool(metadata.vla_only)
+        if self.vla_only and not self.eval_only:
+            raise ValueError("VLA-only serving requires eval_only=True")
         self.replay_action_space = replay_action_space
         self.metric_logger = metric_logger
 
@@ -262,7 +281,9 @@ class RLTStage2Policy:
     # ----------------------------------------------------------------- act
 
     def _act(self, request: ActRequest) -> dict[str, Any]:
-        warmup = self.in_warmup
+        # Reuse the reference-only path, but never turn evaluation into warmup
+        # collection or allow a random/untrained critic to select an action.
+        warmup = self.in_warmup or self.vla_only
         rlt_obs = self.inference.encode(request.observation)
         selection = self.inference.select_action(
             rlt_obs,
@@ -270,6 +291,7 @@ class RLTStage2Policy:
             deterministic=self.eval_only,
             exploration_noise_sigma=request.exploration_noise_sigma,
         )
+        mode = "eval" if self.vla_only else selection.mode
 
         self._chunk_id += 1
         identity = ChunkIdentity(
@@ -286,14 +308,14 @@ class RLTStage2Policy:
             rlt_obs=rlt_obs,
             normalized_chunk=selection.normalized_chunk,
             robot_chunk=selection.robot_chunk,
-            mode=selection.mode,
+            mode=mode,
         )
 
         response = {
             "actions": selection.robot_chunk,
             "reference_actions": selection.reference_chunk,
             "transition_id": transition_id,
-            "mode": selection.mode,
+            "mode": mode,
             "action_chunk_space": ACTION_SPACE_ROBOT,
             "replay_action_space": self.replay_action_space,
             **identity.to_payload(),
