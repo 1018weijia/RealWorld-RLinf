@@ -16,12 +16,10 @@
 
 import copy
 import json
-from pathlib import Path
 
 import numpy as np
 import pytest
 import torch
-from omegaconf import OmegaConf
 
 from rlinf.models.embodiment.mlp_policy.rlt_td3_mlp_policy import RLTTD3MLPPolicy
 from rlinf.serving.rlt.cobot_offline_data import (
@@ -183,12 +181,11 @@ def test_calql_only_calibrates_policy_and_has_finite_gradients():
 
 
 @pytest.mark.parametrize("reconfigure", [False, True])
-def test_native_offline_train_resume_and_online_update(dataset, tmp_path, reconfigure):
+def test_native_offline_train_resume_and_online_update(
+    dataset, tmp_path, reconfigure, server_config
+):
     torch.set_num_threads(1)
-    root = Path(__file__).resolve().parents[2]
-    cfg = OmegaConf.load(
-        root / "examples/embodiment/config/cobot_rlt_stage2_ws_server.yaml"
-    )
+    cfg = server_config()
     weights = tmp_path / "weights.pt"
     weights.write_bytes(b"fixture")
     stats = tmp_path / "stats.json"

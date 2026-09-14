@@ -1,0 +1,27 @@
+# X2Robot dual-arm end-effector embodiment.
+#
+# The action vector is a 14-wide dual-arm end-effector pose (position,
+# rotation and gripper per arm), not joint angles. Nothing on the server
+# decodes that: `openpi_config_name` selects the OpenPI transform pipeline
+# that owns the whole robot-specific chain (camera repack, delta/absolute
+# masks, Aloha decode, un-normalization).
+#
+# Task-level settings -- prompt, norm statistics, Stage 1 checkpoint -- are
+# deliberately not here, so one embodiment serves every X2Robot skill.
+
+name: x2robot
+robot_type: x2robot
+action_schema: x2robot-ee14-v1
+
+action_dim: 14
+proprio_dim: 14
+
+# X2Robot executes the full proposed horizon, so the two agree.
+chunk_length: 50
+ref_chunk_length: 50
+
+# Main view first, then wrist views in Aloha left-then-right order.
+# Swapping the wrist entries mirrors the robot without raising.
+camera_keys: [image, wrist_image, side_image]
+
+openpi_config_name: pi05_xrobot

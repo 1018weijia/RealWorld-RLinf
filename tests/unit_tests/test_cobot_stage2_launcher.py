@@ -112,11 +112,9 @@ def test_task_launcher_argv_and_private_key(tmp_path, task, prompt, port, model,
         assert not any(arg.startswith("runner.resume_dir=") for arg in args)
 
 
-def test_build_policy_uses_registry_signature():
+def test_build_policy_uses_registry_signature(server_config):
     main = runpy.run_path(str(ROOT / "examples/embodiment/rlt_stage2_server.py"))
-    cfg = OmegaConf.load(
-        ROOT / "examples/embodiment/config/cobot_rlt_stage2_ws_server.yaml"
-    )
+    cfg = server_config()
     built = []
 
     def factory(config):
@@ -138,7 +136,7 @@ def test_build_policy_uses_registry_signature():
     assert policy.metadata["action_space"] == "robot"
 
 
-def test_real_trainer_updates_with_horizon50_execute30(tmp_path):
+def test_real_trainer_updates_with_horizon50_execute30(tmp_path, server_config):
     import copy
 
     import numpy as np
@@ -147,9 +145,7 @@ def test_real_trainer_updates_with_horizon50_execute30(tmp_path):
     from rlinf.serving.rlt.protocol import ChunkIdentity
     from rlinf.serving.rlt.trainer import RLTStage2Trainer
 
-    cfg = OmegaConf.load(
-        ROOT / "examples/embodiment/config/cobot_rlt_stage2_ws_server.yaml"
-    )
+    cfg = server_config()
     cfg.actor.model.num_action_chunks = 30
     cfg.actor.model.ref_num_action_chunks = 50
     cfg.actor.global_batch_size = 2

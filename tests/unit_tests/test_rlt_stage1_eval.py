@@ -85,11 +85,9 @@ def test_stage1_reference_bypasses_actor_critic_and_never_trains():
         )
 
 
-def test_build_stage1_loads_only_feature_model():
+def test_build_stage1_loads_only_feature_model(server_config):
     entry = runpy.run_path(str(ROOT / "examples/embodiment/rlt_stage2_server.py"))
-    cfg = OmegaConf.load(
-        ROOT / "examples/embodiment/config/cobot_rlt_stage2_ws_server.yaml"
-    )
+    cfg = server_config()
     cfg.server.vla_only = True
     cfg.server.eval_only = True
     cfg.runner.resume_dir = None

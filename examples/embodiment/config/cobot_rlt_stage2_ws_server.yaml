@@ -10,6 +10,10 @@
 # Launch:  bash examples/embodiment/run_rlt_stage2_server.sh cobot_rlt_stage2_ws_server
 
 defaults:
+  # The per-robot contract (tensor widths, chunk horizon, cameras, OpenPI
+  # pipeline) lives in one file under config/embodiment/. Serving a different
+  # robot means overriding this entry, not editing the sections below.
+  - embodiment: cobot_magic
   - override hydra/job_logging: stdout
   - _self_
 
@@ -35,7 +39,13 @@ server:
 
   # Client camera keys, main view first. Must match the client transport and
   # openpi.num_images_in_input.
-  camera_keys: [image, wrist_image, side_image]
+  camera_keys: ${embodiment.camera_keys}
+
+  # Reported in the handshake so a client can refuse a server built for
+  # another robot. Two embodiments can share every tensor width above and
+  # still be incompatible, which is what action_schema disambiguates.
+  robot_type: ${embodiment.robot_type}
+  action_schema: ${embodiment.action_schema}
 
   # Chunk budget per episode. Reported in the handshake; the client takes the
   # smaller of this and its own.
@@ -173,8 +183,8 @@ rlt_feature_model:
   model_type: "openpi_rlinf"
   precision: bf16
   is_lora: False
-  num_action_chunks: 20
-  action_dim: 14
+  num_action_chunks: ${embodiment.ref_chunk_length}
+  action_dim: ${embodiment.action_dim}
   num_steps: 4
   add_value_head: False
   # Stage 1 checkpoint directory produced by the Stage 1 SFT config. Override
@@ -197,7 +207,9 @@ rlt_feature_model:
     default_prompt: "assemble parts"
   openpi:
     task: eval
-    config_name: "pi05_cobot_magic"
+    config_name: ${embodiment.openpi_config_name}
+    # Kept static rather than derived: preflight checks it against the length
+    # of embodiment.camera_keys, so a disagreement is a startup error.
     num_images_in_input: 3
     action_chunk: ${actor.model.ref_num_action_chunks}
     action_horizon: ${rlt_feature_model.num_action_chunks}
@@ -239,10 +251,10 @@ actor:
     is_lora: False
 
     z_dim: 2048
-    proprio_dim: 14
-    action_dim: 14
-    num_action_chunks: 16
-    ref_num_action_chunks: 20
+    proprio_dim: ${embodiment.proprio_dim}
+    action_dim: ${embodiment.action_dim}
+    num_action_chunks: ${embodiment.chunk_length}
+    ref_num_action_chunks: ${embodiment.ref_chunk_length}
     actor_noise_sigma: 0.2
     residual_scale: 0.2
     action_selection_mode: expo

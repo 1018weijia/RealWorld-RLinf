@@ -33,6 +33,7 @@ from rlinf.models import get_model
 from rlinf.serving.rlt.cobot_offline_trainer import (
     CobotOfflineTrainer as RLTStage2Trainer,
 )
+from rlinf.serving.rlt.embodiment import EmbodimentProfile
 from rlinf.serving.rlt.inference import (
     CameraLayout,
     RLTObservationRepacker,
@@ -117,6 +118,21 @@ def run_preflight(cfg: DictConfig) -> None:
         cfg: Full server config.
     """
     validate_vla_only_config(cfg)
+
+    # First: every later check reads embodiment numbers out of some config
+    # section, and those sections are only trustworthy once they agree with
+    # the selected embodiment.
+    embodiment = EmbodimentProfile.from_config(cfg)
+    embodiment.check_config(cfg)
+    logger.info(
+        "Preflight: embodiment %s (%s), %d-D actions, %d-step chunks of %d proposed",
+        embodiment.name,
+        embodiment.action_schema,
+        embodiment.action_dim,
+        embodiment.chunk_length,
+        embodiment.ref_chunk_length,
+    )
+
     feature_cfg = cfg.rlt_feature_model
     weights_path = resolve_stage1_weights(str(feature_cfg.model_path))
 
@@ -132,7 +148,7 @@ def run_preflight(cfg: DictConfig) -> None:
         stage1_prompt=openpi_data.get("default_prompt") if openpi_data else None,
     )
     check_camera_layout(
-        tuple(cfg.server.camera_keys),
+        embodiment.camera_keys,
         int(feature_cfg.openpi.num_images_in_input),
     )
 
@@ -154,6 +170,7 @@ def build_policy(cfg: DictConfig) -> RLTStage2Policy:
         A policy ready to serve.
     """
     vla_only = validate_vla_only_config(cfg)
+    embodiment = EmbodimentProfile.from_config(cfg)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     logger.info("Loading Stage 1 from %s", cfg.rlt_feature_model.model_path)
@@ -167,9 +184,7 @@ def build_policy(cfg: DictConfig) -> RLTStage2Policy:
             "Stage1-only evaluation: no Stage2 model, optimizer or offline replay loaded"
         )
         model = None
-        trainer = Stage1EvaluationState(
-            int(cfg.actor.model.num_action_chunks), int(cfg.actor.model.action_dim)
-        )
+        trainer = Stage1EvaluationState(embodiment.chunk_length, embodiment.action_dim)
     else:
         logger.info("Building Stage 2 head (%s)", cfg.actor.model.model_type)
         model = get_model(cfg.actor.model).to(device)
@@ -187,18 +202,19 @@ def build_policy(cfg: DictConfig) -> RLTStage2Policy:
             logger.info("Resuming Stage 2 state from %s", cfg.runner.resume_dir)
             trainer.load(cfg.runner.resume_dir)
 
-    camera_keys = tuple(cfg.server.camera_keys)
     repacker = RLTObservationRepacker(
-        camera_layout=CameraLayout(main=camera_keys[0], wrist=camera_keys[1:]),
-        proprio_dim=int(cfg.actor.model.proprio_dim),
+        camera_layout=CameraLayout(
+            main=embodiment.main_camera, wrist=embodiment.wrist_cameras
+        ),
+        proprio_dim=embodiment.proprio_dim,
         default_prompt=str(cfg.server.task_prompt),
     )
     inference = RLTStage2Inference(
         feature_model=feature_model,
         policy_model=model,
         repacker=repacker,
-        chunk_len=int(cfg.actor.model.num_action_chunks),
-        action_dim=int(cfg.actor.model.action_dim),
+        chunk_len=embodiment.chunk_length,
+        action_dim=embodiment.action_dim,
         num_ref_candidates=1
         if vla_only
         else int(cfg.actor.model.expo_num_base_samples),
@@ -206,9 +222,9 @@ def build_policy(cfg: DictConfig) -> RLTStage2Policy:
     )
 
     metadata = ServerMetadata(
-        action_dim=int(cfg.actor.model.action_dim),
-        chunk_length=int(cfg.actor.model.num_action_chunks),
-        proprio_dim=int(cfg.actor.model.proprio_dim),
+        action_dim=embodiment.action_dim,
+        chunk_length=embodiment.chunk_length,
+        proprio_dim=embodiment.proprio_dim,
         warmup_steps=int(cfg.server.warmup_steps),
         run_name=str(cfg.runner.logger.experiment_name),
         # Chunks always leave the server in robot units; `replay_action_space`
@@ -228,13 +244,13 @@ def build_policy(cfg: DictConfig) -> RLTStage2Policy:
         actor_action_clip_min=float(cfg.actor.model.get("action_clip_min", -1.4)),
         actor_action_clip_max=float(cfg.actor.model.get("action_clip_max", 1.4)),
         max_episode_chunks=int(cfg.server.max_episode_chunks),
-        camera_keys=camera_keys,
+        camera_keys=embodiment.camera_keys,
         task_prompt=str(cfg.server.task_prompt),
         eval_only=bool(cfg.server.eval_only),
         vla_only=vla_only,
         use_preference_loss=bool(cfg.algorithm.rewind_preference.enable),
-        robot_type=str(cfg.server.get("robot_type", "")),
-        action_schema=str(cfg.server.get("action_schema", "")),
+        robot_type=embodiment.robot_type,
+        action_schema=embodiment.action_schema,
     )
 
     return RLTStage2Policy(

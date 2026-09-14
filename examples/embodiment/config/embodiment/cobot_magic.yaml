@@ -1,0 +1,26 @@
+# Cobot Magic dual-arm joint-angle embodiment.
+#
+# The action vector is 14 joint angles (6 joints plus a gripper per arm).
+# `openpi_config_name` selects the OpenPI transform pipeline that slices the
+# raw 28-wide Cobot vector down to these 14 and applies the Aloha decode.
+#
+# Task-level settings -- prompt, norm statistics, Stage 1 checkpoint -- are
+# deliberately not here, so one embodiment serves every Cobot skill.
+
+name: cobot_magic
+robot_type: cobot_magic
+action_schema: cobot-joint14-v1
+
+action_dim: 14
+proprio_dim: 14
+
+# Stage 1 proposes 20 actions and the robot executes the first 16: the tail of
+# a chunk is the least accurate part of the horizon.
+chunk_length: 16
+ref_chunk_length: 20
+
+# Main view first, then wrist views in Aloha left-then-right order.
+# Swapping the wrist entries mirrors the robot without raising.
+camera_keys: [image, wrist_image, side_image]
+
+openpi_config_name: pi05_cobot_magic
