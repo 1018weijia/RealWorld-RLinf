@@ -170,11 +170,14 @@ class EmbodimentProfile:
     def check_config(self, cfg: Any) -> None:
         """Verify the rest of the config agrees with this profile.
 
-        The learner, the Stage 1 wrapper and the handshake each read the
-        embodiment numbers from their own config section. They are expected to
-        interpolate from ``embodiment``, but a hand-written override can quietly
-        break that link, and the resulting mismatch degrades the policy instead
-        of raising.
+        The learner and the Stage 1 wrapper read the embodiment numbers from
+        their own config section, which is expected to interpolate from
+        ``embodiment``. A hand-written override can quietly break that link,
+        and the resulting mismatch degrades the policy instead of raising.
+
+        Only sections that something actually consumes are checked. The
+        handshake is not among them: it is built from this profile directly, so
+        verifying a config copy of it would be a tautology.
 
         Args:
             cfg: Full server config.
@@ -203,13 +206,6 @@ class EmbodimentProfile:
                 f"  rlt_feature_model.openpi.config_name={config_name!r} but "
                 f"embodiment {self.name!r} declares "
                 f"{self.openpi_config_name!r}"
-            )
-
-        camera_keys = tuple(str(key) for key in _require(cfg, "server.camera_keys"))
-        if camera_keys != self.camera_keys:
-            mismatches.append(
-                f"  server.camera_keys={list(camera_keys)} but embodiment "
-                f"{self.name!r} declares {list(self.camera_keys)}"
             )
 
         if mismatches:

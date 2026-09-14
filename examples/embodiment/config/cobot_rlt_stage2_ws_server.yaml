@@ -37,15 +37,10 @@ server:
   # yields confident but wrong actions with no error.
   task_prompt: "assemble parts"
 
-  # Client camera keys, main view first. Must match the client transport and
-  # openpi.num_images_in_input.
-  camera_keys: ${embodiment.camera_keys}
-
-  # Reported in the handshake so a client can refuse a server built for
-  # another robot. Two embodiments can share every tensor width above and
-  # still be incompatible, which is what action_schema disambiguates.
-  robot_type: ${embodiment.robot_type}
-  action_schema: ${embodiment.action_schema}
+  # The camera keys and the robot/schema identifiers a client sees in the
+  # handshake are not repeated here: the server entry point reads them from
+  # `embodiment` directly. Mirroring them into `server.*` produced keys that
+  # looked overridable but were never read.
 
   # Chunk budget per episode. Reported in the handshake; the client takes the
   # smaller of this and its own.

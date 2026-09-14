@@ -108,18 +108,6 @@ def test_config_drifting_from_its_profile_is_rejected(path, server_config):
         parsed.check_config(cfg)
 
 
-def test_camera_keys_drifting_from_the_profile_are_rejected(server_config):
-    cfg = server_config("xrobot_ee_rlt_stage2_ws_server")
-    parsed = EmbodimentProfile.from_config(cfg)
-
-    # Reordering is as damaging as renaming: the wrist views feed the Aloha
-    # transform as left then right, so a swap mirrors the robot.
-    cfg.server.camera_keys = [CAMERAS[0], CAMERAS[2], CAMERAS[1]]
-
-    with pytest.raises(EmbodimentError, match="server.camera_keys"):
-        parsed.check_config(cfg)
-
-
 def test_openpi_pipeline_drifting_from_the_profile_is_rejected(server_config):
     cfg = server_config("xrobot_ee_rlt_stage2_ws_server")
     parsed = EmbodimentProfile.from_config(cfg)
