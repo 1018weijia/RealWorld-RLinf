@@ -32,6 +32,17 @@ CAMERAS = ("image", "wrist_image", "side_image")
 # Golden contracts. x2robot is the combination validated end-to-end on the real
 # robot; changing any number here changes what a deployed client must send.
 SHIPPED = {
+    "xrobot_usb_plug_rlt_stage2_ws_server": {
+        "name": "x2robot",
+        "robot_type": "x2robot",
+        "action_schema": "x2robot-ee14-v1",
+        "action_dim": 14,
+        "proprio_dim": 14,
+        "chunk_length": 50,
+        "ref_chunk_length": 50,
+        "camera_keys": CAMERAS,
+        "openpi_config_name": "pi05_xrobot",
+    },
     "xrobot_ee_rlt_stage2_ws_server": {
         "name": "x2robot",
         "robot_type": "x2robot",

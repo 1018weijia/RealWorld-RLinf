@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Audit/convert LeRobot v3, then pretrain the native Cobot Stage2 head."""
+"""Audit/convert LeRobot v3, then pretrain the native Stage 2 head."""
 
 from __future__ import annotations
 
@@ -28,12 +28,12 @@ from omegaconf import DictConfig, OmegaConf
 from rlinf.models import get_model
 from rlinf.serving.rlt.cobot_offline_data import (
     FORMAT,
-    CobotLeRobotV3,
     atomic_save,
     chunk_starts,
     concatenate,
     contract,
     convert_episode,
+    episode_source,
 )
 from rlinf.serving.rlt.offline_trainer import RLTOfflineTrainer
 
@@ -44,7 +44,8 @@ def convert(cfg: DictConfig) -> None:
     """Resume completed episode shards only when source/config identity matches."""
     from rlt_stage2_server import build_policy, run_preflight
 
-    data = CobotLeRobotV3(cfg.offline.dataset_root, str(cfg.server.task_prompt))
+    data = episode_source(cfg)
+    chunk = int(cfg.embodiment.chunk_length)
     count = int(cfg.offline.get("max_episodes", 0))
     rows = data.episodes[:count] if count else data.episodes
     if len(rows) < 2:
@@ -54,11 +55,12 @@ def convert(cfg: DictConfig) -> None:
         for label in ("success", "failure")
     }
     logger.info(
-        "Dataset: %s; episodes=%d labels=%s transitions=%d",
+        "Dataset: %s; episodes=%d labels=%s transitions=%d chunk=%d",
         data.root,
         len(rows),
         counts,
-        sum(len(chunk_starts(r["length"])) for r in rows),
+        sum(len(chunk_starts(r["length"], chunk)) for r in rows),
+        chunk,
     )
     if cfg.offline.mode == "audit":
         for row in rows:
@@ -82,12 +84,12 @@ def convert(cfg: DictConfig) -> None:
     converted = []
     for row in rows:
         episode = row["episode_index"]
-        if len(chunk_starts(row["length"])) == 0:
+        if len(chunk_starts(row["length"], chunk)) == 0:
             logger.warning(
                 "Skipping episode %d: length=%d has no complete %d-step transition",
                 episode,
                 row["length"],
-                30,
+                chunk,
             )
             continue
         path = shards / f"episode_{episode:06d}.pt"
@@ -131,9 +133,10 @@ def convert(cfg: DictConfig) -> None:
         "source": signature,
         "rows": concatenate(converted),
         "validation_episodes": validation,
-        # Episodes shorter than one 30-step transition are intentionally
-        # skipped; this is not a partial dataset when every source episode was
-        # inspected.  Only MAX_EPISODES-limited runs are marked partial.
+        # Episodes shorter than one execute-horizon transition are
+        # intentionally skipped; this is not a partial dataset when every
+        # source episode was inspected.  Only MAX_EPISODES-limited runs are
+        # marked partial.
         "partial_conversion": bool(count and count < len(data.episodes)),
         "reward_rule": "success=1/failure=0 at final observed transition; both are terminal",
         "tail_rule": "terminal-aligned full chunks, drop prefix remainder and final action without next observation",

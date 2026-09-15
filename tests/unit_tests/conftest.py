@@ -14,6 +14,7 @@
 
 """Shared fixtures for the unit tests."""
 
+import os
 from pathlib import Path
 
 import pytest
@@ -21,6 +22,13 @@ from hydra import compose, initialize_config_dir
 from omegaconf import DictConfig, OmegaConf
 
 CONFIG_DIR = Path(__file__).resolve().parents[2] / "examples" / "embodiment" / "config"
+
+# XRobot overlays resolve checkpoint/norm paths from the environment at compose
+# time. Tests that do not care about the site paths still need the keys set.
+os.environ.setdefault("XROBOT_RLT_STAGE1_CHECKPOINT", "/tmp/xrobot_stage1")
+os.environ.setdefault("XROBOT_NORM_STATS", "/tmp/xrobot_norm_stats.json")
+os.environ.setdefault("XROBOT_USB_STAGE1_CHECKPOINT", "/tmp/xrobot_usb_stage1")
+os.environ.setdefault("XROBOT_USB_NORM_STATS", "/tmp/xrobot_usb_norm_stats.json")
 
 
 @pytest.fixture

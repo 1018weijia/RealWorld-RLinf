@@ -120,3 +120,82 @@ bash examples/embodiment/run_rlt_stage2_server.sh xrobot_ee_rlt_stage2_ws_server
 residual 输出层是零初始化的，所以 Stage 2 刚启动时的动作应与 Stage 1 reference
 **逐元素相同**。第一次真机运行务必核对这一点；不一致说明链路上有地方变换错了，
 先停下来查，不要继续跑。
+
+## 9. USB 插拔：离线 Cal-QL
+
+套环走上面的 `xrobot_ee_rlt_stage2_ws_server`。插 USB 用独立 overlay 和启动器，
+不要改 residual 或 chunk（YAML 已是 `0.4` / `50`）。
+
+在 `.private-xrobot-stage2/paths.env` 写（目录已 gitignore）：
+
+```bash
+XROBOT_USB_STAGE1_CHECKPOINT=/data/gxy/realworldRL/RLinf/logs/20260911-012744-xrobot_rlt_stage1_sft_openpi_pi05_usb_plug_franka_legacy_action_expert_base-gpu6/xrobot_usb_plug_franka_legacy_actionexpert_base_fp32master_bf16compute_30k/checkpoints/global_step_20000
+XROBOT_USB_NORM_STATS=/data/gxy/realworldRL/checkpoints/assets/xrobot/usb_plug/norm_stats.json
+XROBOT_USB_DATASET=/data/gxy/realworldRL/datasets/XRobot_USB_v30/XRobot_USB
+XROBOT_OFFLINE_BUFFER_ROOT=/data/gxy/realworldRL/offline_rl_buffers
+XROBOT_USB_OFFLINE_BUFFER=/data/gxy/realworldRL/offline_rl_buffers/xrobot_usb_plug/offline_buffer.pt
+```
+
+`model_path` 指向最新 USB **RLT** `global_step_*` 目录本身，且 `full_weights.pt` 必须含 `rlt_module.*`。不要用 `20260829` 那份无 RLT 的 SFT。prompt 必须是 `Bimanual usb pick and insert`。
+
+What this does: 1. 核对合同 2. 抽查数据 3. 冻 Stage 1 写成 buffer 4. Cal-QL 4 万步 5. resume 到在线（不再采 250 行 warmup）。
+
+```bash
+bash examples/embodiment/start_xrobot_stage2.sh usb_plug preflight
+
+MAX_EPISODES=2 bash examples/embodiment/start_xrobot_stage2.sh usb_plug audit
+CUDA_VISIBLE_DEVICES=? MAX_EPISODES=2 \
+  bash examples/embodiment/start_xrobot_stage2.sh usb_plug convert
+
+CUDA_VISIBLE_DEVICES=4 bash examples/embodiment/start_xrobot_stage2.sh usb_plug convert
+
+CUDA_VISIBLE_DEVICES=4 bash examples/embodiment/start_xrobot_stage2.sh usb_plug offline
+
+STAGE2_RESUME_DIR=/data/gxy/realworldRL/offline_rl_buffers/xrobot_usb_plug/pretrain_20260915_101150/checkpoints/offline_step_40000 \
+  bash examples/embodiment/start_xrobot_stage2.sh usb_plug train
+```
+
+转换输出默认 `/data/gxy/realworldRL/offline_rl_buffers/xrobot_usb_plug/offline_buffer.pt`。Cal-QL 日志在同目录 `pretrain_*`。WandB project 是 `xrobot-usb-offline`（需要 `.private-xrobot-stage2/wandb_api_key`）。数据集没有 `episode_success` 时全部当成功。round-trip 失败或 `demo_reachable_fraction` 过低先停，不要只看 BC loss。不要用 GPU 6（Stage 1 还在跑）。
+
+## 10. USB 在线联调（Cal-QL 之后）
+
+套环仍用上面第 3 节的 `xrobot_ee_rlt_stage2_ws_server`（端口 **8000**、prompt `put ring on the rod`）。USB 用独立启动器和端口 **8016**，prompt 必须是 `Bimanual usb pick and insert`。
+
+Cal-QL 已经写进 `offline_total_updates`，resume 后**不会**再采 250 行 warmup，第一回合就是 residual actor。第 8 节「与 Stage 1 逐元素相同」只适用于零初始化 residual，**这次对不上是正常的**。
+
+GPU 侧（先 `nvidia-smi` 选空闲卡，避开 GPU 6）：
+
+```bash
+cd /data/gxy/realworldRL/RLinf
+source .venv/bin/activate
+
+STAGE2_RESUME_DIR=/data/gxy/realworldRL/offline_rl_buffers/xrobot_usb_plug/pretrain_20260915_101150/checkpoints/offline_step_40000 \
+  CUDA_VISIBLE_DEVICES=? \
+  bash examples/embodiment/start_xrobot_stage2.sh usb_plug train
+```
+
+等到这行再让机器人连：
+
+```text
+RLT Stage 2 server ready on 0.0.0.0:8016
+Resuming Stage 2 state from .../offline_step_40000
+```
+
+机器人侧顺序不变（先 probe，再 V2 适配器，再允许动作），但上游和任务必须改成 USB：
+
+```bash
+RLT_UPSTREAM_URI=ws://<GPU_IP>:8016 \
+  RLT_TASK_PROMPT="Bimanual usb pick and insert" \
+  bash toolkits/inference/run_xrobot_rlt_ee_bridge.sh
+```
+
+真机动作：
+
+```bash
+RLT_EE_ALLOW_MOTION=true \
+  RLT_UPSTREAM_URI=ws://<GPU_IP>:8016 \
+  RLT_TASK_PROMPT="Bimanual usb pick and insert" \
+  bash toolkits/inference/run_xrobot_rlt_ee_bridge.sh
+```
+
+DesktopClient 模型地址仍是 `127.0.0.1:33057`。V2 按键与套环相同：`s` 是接管，`f` 是成功。先 probe 一轮确认没有 `ProtocolError`，再放动作；第一、二条看夹爪和动作是否还像插 USB。

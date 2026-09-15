@@ -16,15 +16,29 @@ Cobot RLT:  s = 成功    f = 失败
 V2:         s = 接管    f = 成功
 ```
 
+套环默认连 `ws://<GPU_IP>:8000`、任务 `put ring on the rod`。USB 插拔改连
+**8016**，并显式设任务，否则 handshake 的 prompt 会对不上：
+
+```bash
+RLT_UPSTREAM_URI=ws://<GPU_IP>:8016 \
+  RLT_TASK_PROMPT="Bimanual usb pick and insert" \
+  bash toolkits/inference/run_xrobot_rlt_ee_bridge.sh
+```
+
+USB 若 resume 了 Cal-QL，第一回合就是 residual，不要用套环第 8 节那条
+「必须与 Stage 1 逐元素相同」当验收。
+
 ## 1. 启动顺序
 
-GPU 侧的 server 要先起来（`ws://<GPU_IP>:8000`）。下面三步在机器人上执行。
+GPU 侧的 server 要先起来（套环 `ws://<GPU_IP>:8000`，USB `ws://<GPU_IP>:8016`）。下面三步在机器人上执行。
 
 **① 先 probe，动作不会下发到机械臂**
 
 ```bash
 cd /home/xr/lfwj/RealWorld-RLinf
 RLT_UPSTREAM_URI=ws://<GPU_IP>:8000 bash toolkits/inference/run_xrobot_rlt_ee_bridge.sh
+# USB: 加上 RLT_UPSTREAM_URI=ws://<GPU_IP>:8016 和
+#      RLT_TASK_PROMPT="Bimanual usb pick and insert"
 ```
 
 把 X2Robot 客户端的模型地址指向 `127.0.0.1:33057`，跑一次。probe 模式下 bridge
@@ -49,6 +63,7 @@ bash toolkits/inference/run_xrobot_rlt_ee_v2_adapter.sh
 bash toolkits/inference/run_xrobot_rlt_ee_bridge.sh --stop
 RLT_EE_ALLOW_MOTION=true RLT_UPSTREAM_URI=ws://<GPU_IP>:8000 \
   bash toolkits/inference/run_xrobot_rlt_ee_bridge.sh
+# USB: 同样改成 8016，并设 RLT_TASK_PROMPT="Bimanual usb pick and insert"
 
 cd /home/xr/lfwj
 env -u HISTORY_DRY_RUN MODEL_ADDRESS=127.0.0.1:33057 \
@@ -130,5 +145,6 @@ chunk，所以你手动操作的那一段进的是 V2 的 bag 和 Traj_A/B（离
 ```text
 127.0.0.1:33057   bridge <- DesktopClient（模型地址填这个）
 127.0.0.1:33058   bridge 的 operator 控制口（operator_cli / V2 适配器用）
-<GPU_IP>:8000     RLT Stage 2 server
+<GPU_IP>:8000     RLT Stage 2 server（套环）
+<GPU_IP>:8016     RLT Stage 2 server（USB）
 ```

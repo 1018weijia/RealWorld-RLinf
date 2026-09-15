@@ -9,6 +9,8 @@ Stage 2 的文档都放在本目录（`examples/embodiment/`），与它们描�
 | --- | --- |
 | 接入一台新机器人 | [rlt_add_robot.md](rlt_add_robot.md)（英文） |
 | XRobot 上手：GPU 侧 | [xrobot-stage2-gpu-quickstart.md](xrobot-stage2-gpu-quickstart.md) |
+| XRobot USB 离线 Cal-QL | [xrobot-stage2-gpu-quickstart.md](xrobot-stage2-gpu-quickstart.md) 第 9 节 |
+| XRobot USB 在线联调 | [xrobot-stage2-gpu-quickstart.md](xrobot-stage2-gpu-quickstart.md) 第 10 节；机器人侧同一份速查里改 8016 / USB prompt |
 | XRobot 上手：机器人侧 | [xrobot-stage2-robot-quickstart.md](xrobot-stage2-robot-quickstart.md) |
 | Cobot 客户端部署 | [cobot-local-client-stage2.md](cobot-local-client-stage2.md) |
 | 现场操作：rollout、接管、回滚 | [cobot-stage2-rollout-online-training-guide.md](cobot-stage2-rollout-online-training-guide.md) |

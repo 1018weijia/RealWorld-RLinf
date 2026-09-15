@@ -1,4 +1,5 @@
 /.private-cobot-stage2/
+/.private-xrobot-stage2/
 __pycache__
 .vscode
 *.log

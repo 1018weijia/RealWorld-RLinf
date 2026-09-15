@@ -124,9 +124,10 @@ Without offline pretraining the Stage 2 head starts randomly initialized and
 the server collects `warmup_steps` transitions on the Stage 1 reference policy
 before it begins training. To pretrain instead, supply a reader implementing
 `OfflineEpisodeSource` in `rlinf/serving/rlt/cobot_offline_data.py`: `prompt`,
-`episodes`, `cameras`, `table()` and `frames()`. `CobotLeRobotV3` is the
-reference implementation. Everything downstream of it — conversion, the buffer
-and the Cal-QL trainer — is robot-agnostic and needs no changes.
+`episodes`, `cameras`, `table()` and `frames()`. `CobotLeRobotV3` and
+`XRobotLeRobotV3` are the reference implementations. Everything downstream of
+them — conversion, the buffer and the Cal-QL trainer — is robot-agnostic and
+needs no changes.
 
 ## What you do not touch
 

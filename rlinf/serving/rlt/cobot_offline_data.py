@@ -16,20 +16,24 @@
 
 The conversion, the buffer and the dataset fingerprint are robot-agnostic;
 what a given robot stores in a recorded episode is not. That split is
-:class:`OfflineEpisodeSource`, with :class:`CobotLeRobotV3` as the LeRobot v3
-Cobot reader and the model for any robot added later.
+:class:`OfflineEpisodeSource`. :class:`CobotLeRobotV3` and
+:class:`XRobotLeRobotV3` are the LeRobot v3 readers; add another robot by
+implementing the same protocol.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 from pathlib import Path
 from typing import Any, Protocol
 
 import numpy as np
 import torch
+
+logger = logging.getLogger(__name__)
 
 
 class OfflineEpisodeSource(Protocol):
@@ -71,7 +75,139 @@ CAMERAS = {
     "observation.images.cam_left_wrist": "wrist_image",
     "observation.images.cam_right_wrist": "side_image",
 }
+XROBOT_CAMERAS = {
+    "observation.images.head": "image",
+    "observation.images.left_arm": "wrist_image",
+    "observation.images.right_arm": "side_image",
+}
+XROBOT_EE_NAMES = [
+    "left_x",
+    "left_y",
+    "left_z",
+    "left_roll",
+    "left_pitch",
+    "left_yaw",
+    "left_gripper",
+    "right_x",
+    "right_y",
+    "right_z",
+    "right_roll",
+    "right_pitch",
+    "right_yaw",
+    "right_gripper",
+]
 FORMAT = "cobot_rlinf_offline_v1"
+
+
+def flatten_feature_names(names: Any) -> list[str]:
+    """Unwrap LeRobot's optional nested ``[[dim, ...]]`` name lists."""
+    if not names:
+        return []
+    if len(names) == 1 and isinstance(names[0], (list, tuple)):
+        return [str(name) for name in names[0]]
+    return [str(name) for name in names]
+
+
+def load_lerobot_v3_info(root: Path) -> dict:
+    """Read and require a LeRobot v3.0 ``meta/info.json``."""
+    info = json.loads((root / "meta/info.json").read_text())
+    if info["codebase_version"] != "v3.0":
+        raise ValueError("This converter requires LeRobot v3.0")
+    return info
+
+
+def load_lerobot_v3_episodes(root: Path, info: dict) -> list[dict]:
+    """Load every episode row, excluding per-column ``stats/`` prefixes."""
+    import pyarrow.parquet as pq
+
+    episodes = []
+    for path in sorted((root / "meta/episodes").rglob("*.parquet")):
+        columns = [n for n in pq.read_schema(path).names if not n.startswith("stats/")]
+        episodes.extend(pq.read_table(path, columns=columns).to_pylist())
+    episodes.sort(key=lambda row: row["episode_index"])
+    if [row["episode_index"] for row in episodes] != list(
+        range(info["total_episodes"])
+    ):
+        raise ValueError("Episode metadata is incomplete or duplicated")
+    return episodes
+
+
+def decode_lerobot_v3_frames(
+    root: Path,
+    info: dict,
+    fps: float,
+    row: dict,
+    camera: str,
+    indices: list[int],
+) -> dict[int, np.ndarray]:
+    """Decode selected frames using v3 video timestamps, never file-local guesses."""
+    import av
+
+    prefix = f"videos/{camera}"
+    path = root / info["video_path"].format(
+        video_key=camera,
+        chunk_index=row[f"{prefix}/chunk_index"],
+        file_index=row[f"{prefix}/file_index"],
+    )
+    offset = float(row[f"{prefix}/from_timestamp"])
+    result = {}
+    cursor = 0
+    with av.open(str(path)) as container:
+        stream = container.streams.video[0]
+        container.seek(int(max(0, offset - 1) / stream.time_base), stream=stream)
+        for frame in container.decode(stream):
+            if cursor == len(indices):
+                break
+            target = offset + indices[cursor] / fps
+            timestamp = float(frame.pts * frame.time_base)
+            if timestamp < target - 0.51 / fps:
+                continue
+            if abs(timestamp - target) > 0.51 / fps:
+                raise ValueError(
+                    f"Video frame missing: {path}, wanted timestamp {target}, "
+                    f"got {timestamp}"
+                )
+            result[indices[cursor]] = frame.to_ndarray(format="rgb24")
+            cursor += 1
+    if len(result) != len(indices):
+        raise ValueError(f"Truncated video: {path}")
+    return result
+
+
+def dataset_fingerprint(root: Path) -> str:
+    """Content hash enables safe reuse of expensive per-episode feature shards."""
+    digest = hashlib.sha256()
+    for path in sorted(root.rglob("*")):
+        if path.is_file() and path.suffix in (".json", ".parquet", ".mp4"):
+            digest.update(str(path.relative_to(root)).encode())
+            digest.update(sha256(path).encode())
+    return digest.hexdigest()
+
+
+def _episode_tasks(row: dict) -> list[str] | None:
+    tasks = row.get("tasks")
+    if tasks is None:
+        return None
+    if isinstance(tasks, str):
+        return [tasks]
+    return [str(task) for task in tasks]
+
+
+def _require_prompt(row: dict, prompt: str) -> None:
+    tasks = _episode_tasks(row)
+    if tasks is not None and tasks != [prompt]:
+        raise ValueError(f"Task mismatch in episode {row['episode_index']}: {tasks}")
+
+
+def _labeled_or_success(row: dict) -> str:
+    label = row.get("episode_success")
+    if label in ("success", "failure"):
+        return label
+    if label in (None, ""):
+        return "success"
+    raise ValueError(
+        f"Episode {row['episode_index']} has invalid episode_success={label!r}"
+    )
 
 
 def atomic_save(value: Any, path: Path) -> None:
@@ -113,12 +249,8 @@ class CobotLeRobotV3:
     """Read named dual-arm joints and per-episode video offsets from v3 shards."""
 
     def __init__(self, root: str | Path, prompt: str):
-        import pyarrow.parquet as pq
-
         self.root = Path(root).resolve()
-        self.info = json.loads((self.root / "meta/info.json").read_text())
-        if self.info["codebase_version"] != "v3.0":
-            raise ValueError("This converter requires LeRobot v3.0")
+        self.info = load_lerobot_v3_info(self.root)
         self.fps = float(self.info["fps"])
         if self.fps != 30:
             raise ValueError(
@@ -127,31 +259,16 @@ class CobotLeRobotV3:
         self.prompt = prompt
         self.cameras = CAMERAS
         features = self.info["features"]
-        self.state_indices = [
-            features["observation.state"]["names"].index(n) for n in JOINT_NAMES
-        ]
-        self.action_indices = [
-            features["action"]["names"].index(n) for n in JOINT_NAMES
-        ]
+        state_names = flatten_feature_names(features["observation.state"]["names"])
+        action_names = flatten_feature_names(features["action"]["names"])
+        self.state_indices = [state_names.index(n) for n in JOINT_NAMES]
+        self.action_indices = [action_names.index(n) for n in JOINT_NAMES]
         for name in CAMERAS:
             if features[name]["dtype"] != "video":
                 raise ValueError(f"Missing video feature {name}")
-        self.episodes = []
-        for path in sorted((self.root / "meta/episodes").rglob("*.parquet")):
-            columns = [
-                n for n in pq.read_schema(path).names if not n.startswith("stats/")
-            ]
-            self.episodes.extend(pq.read_table(path, columns=columns).to_pylist())
-        self.episodes.sort(key=lambda row: row["episode_index"])
-        if [r["episode_index"] for r in self.episodes] != list(
-            range(self.info["total_episodes"])
-        ):
-            raise ValueError("Episode metadata is incomplete or duplicated")
+        self.episodes = load_lerobot_v3_episodes(self.root, self.info)
         for row in self.episodes:
-            if row["tasks"] != [prompt]:
-                raise ValueError(
-                    f"Task mismatch in episode {row['episode_index']}: {row['tasks']}"
-                )
+            _require_prompt(row, prompt)
             if row.get("episode_success") not in ("success", "failure"):
                 raise ValueError(
                     "Every episode needs an explicit success/failure label"
@@ -199,49 +316,135 @@ class CobotLeRobotV3:
         self, row: dict, camera: str, indices: list[int]
     ) -> dict[int, np.ndarray]:
         """Decode selected frames using v3's video timestamps, never file-local row guesses."""
-        import av
-
-        prefix = f"videos/{camera}"
-        path = self.root / self.info["video_path"].format(
-            video_key=camera,
-            chunk_index=row[f"{prefix}/chunk_index"],
-            file_index=row[f"{prefix}/file_index"],
+        return decode_lerobot_v3_frames(
+            self.root, self.info, self.fps, row, camera, indices
         )
-        offset = float(row[f"{prefix}/from_timestamp"])
-        result = {}
-        cursor = 0
-        with av.open(str(path)) as container:
-            stream = container.streams.video[0]
-            container.seek(int(max(0, offset - 1) / stream.time_base), stream=stream)
-            for frame in container.decode(stream):
-                if cursor == len(indices):
-                    break
-                target = offset + indices[cursor] / self.fps
-                timestamp = float(frame.pts * frame.time_base)
-                if timestamp < target - 0.51 / self.fps:
-                    continue
-                if abs(timestamp - target) > 0.51 / self.fps:
-                    raise ValueError(
-                        f"Video frame missing: {path}, wanted timestamp {target}, got {timestamp}"
-                    )
-                result[indices[cursor]] = frame.to_ndarray(format="rgb24")
-                cursor += 1
-        if len(result) != len(indices):
-            raise ValueError(f"Truncated video: {path}")
-        return result
 
     def fingerprint(self) -> str:
         """Content hash enables safe reuse of expensive per-episode feature shards."""
-        digest = hashlib.sha256()
-        for path in sorted(self.root.rglob("*")):
-            if path.is_file() and path.suffix in (".json", ".parquet", ".mp4"):
-                digest.update(str(path.relative_to(self.root)).encode())
-                digest.update(sha256(path).encode())
-        return digest.hexdigest()
+        return dataset_fingerprint(self.root)
 
 
-def chunk_starts(length: int, chunk: int = 30) -> list[int]:
-    """Terminal-aligned full chunks; reserve the last recorded observation as endpoint."""
+class XRobotLeRobotV3:
+    """Read 14-D dual-arm end-effector pose and Aloha camera names from v3 shards."""
+
+    def __init__(self, root: str | Path, prompt: str):
+        self.root = Path(root).resolve()
+        self.info = load_lerobot_v3_info(self.root)
+        self.fps = float(self.info["fps"])
+        if self.fps != 30:
+            raise ValueError(
+                "XRobot online execution and offline data must both use 30 Hz"
+            )
+        self.prompt = prompt
+        self.cameras = XROBOT_CAMERAS
+        features = self.info["features"]
+        state_names = flatten_feature_names(features["observation.state"]["names"])
+        action_names = flatten_feature_names(features["action"]["names"])
+        if state_names != XROBOT_EE_NAMES:
+            raise ValueError(
+                "XRobot observation.state names must be the 14 EE pose "
+                f"components, got {state_names}"
+            )
+        if action_names != XROBOT_EE_NAMES:
+            raise ValueError(
+                f"XRobot action names must be the 14 EE pose components, got {action_names}"
+            )
+        for name in XROBOT_CAMERAS:
+            if features[name]["dtype"] != "video":
+                raise ValueError(f"Missing video feature {name}")
+        raw = load_lerobot_v3_episodes(self.root, self.info)
+        unlabeled = 0
+        self.episodes = []
+        for row in raw:
+            _require_prompt(row, prompt)
+            labeled = dict(row)
+            if labeled.get("episode_success") not in ("success", "failure"):
+                unlabeled += 1
+            labeled["episode_success"] = _labeled_or_success(row)
+            self.episodes.append(labeled)
+        if unlabeled:
+            logger.info(
+                "USB dataset has no episode_success on %d/%d episodes; "
+                "treating those as success",
+                unlabeled,
+                len(self.episodes),
+            )
+
+    def table(self, row: dict) -> tuple[np.ndarray, np.ndarray]:
+        """Read this episode's 14-D EE state and action, never joint names."""
+        import pyarrow.parquet as pq
+
+        path = self.root / self.info["data_path"].format(
+            chunk_index=row["data/chunk_index"], file_index=row["data/file_index"]
+        )
+        table = pq.read_table(
+            path,
+            columns=[
+                "observation.state",
+                "action",
+                "frame_index",
+                "index",
+                "timestamp",
+            ],
+            filters=[("episode_index", "=", row["episode_index"])],
+        ).to_pydict()
+        length = int(row["length"])
+        if table["frame_index"] != list(range(length)):
+            raise ValueError(
+                f"Missing or unordered frames in episode {row['episode_index']}"
+            )
+        if table["index"] != list(
+            range(row["dataset_from_index"], row["dataset_to_index"])
+        ):
+            raise ValueError("Parquet global indices disagree with episode metadata")
+        np.testing.assert_allclose(
+            table["timestamp"], np.arange(length) / self.fps, atol=1e-4
+        )
+        state = np.asarray(table["observation.state"], np.float32)
+        actions = np.asarray(table["action"], np.float32)
+        if state.shape[1] != 14 or actions.shape[1] != 14:
+            raise ValueError(
+                f"XRobot state/action must be 14-D, got {state.shape} / {actions.shape}"
+            )
+        if not np.isfinite(state).all() or not np.isfinite(actions).all():
+            raise ValueError("Non-finite robot state/action")
+        return state, actions
+
+    def frames(
+        self, row: dict, camera: str, indices: list[int]
+    ) -> dict[int, np.ndarray]:
+        """Decode selected frames using v3 video timestamps."""
+        return decode_lerobot_v3_frames(
+            self.root, self.info, self.fps, row, camera, indices
+        )
+
+    def fingerprint(self) -> str:
+        """Content hash enables safe reuse of expensive per-episode feature shards."""
+        return dataset_fingerprint(self.root)
+
+
+def episode_source(cfg) -> OfflineEpisodeSource:
+    """Select the LeRobot reader that matches the composed embodiment."""
+    name = str(cfg.embodiment.name)
+    root = cfg.offline.dataset_root
+    prompt = str(cfg.server.task_prompt)
+    if name == "cobot_magic":
+        return CobotLeRobotV3(root, prompt)
+    if name == "x2robot":
+        return XRobotLeRobotV3(root, prompt)
+    raise ValueError(
+        f"No OfflineEpisodeSource for embodiment {name!r}; implement one in "
+        "rlinf/serving/rlt/cobot_offline_data.py"
+    )
+
+
+def chunk_starts(length: int, chunk: int) -> list[int]:
+    """Terminal-aligned full chunks; reserve the last recorded observation as endpoint.
+
+    ``chunk`` is the embodiment execute horizon (Cobot 30, XRobot 50). Callers
+    must pass it; a default of 30 would silently drop XRobot transitions.
+    """
     return (
         list(range((length - 1) % chunk, length - chunk, chunk))
         if length > chunk

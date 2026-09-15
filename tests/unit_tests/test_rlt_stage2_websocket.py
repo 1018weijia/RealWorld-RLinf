@@ -326,6 +326,24 @@ def test_xrobot_stage2_server_reads_its_assets_from_the_environment(
     )
 
 
+def test_xrobot_usb_overlay_reads_its_assets_from_the_environment(
+    monkeypatch, server_config
+):
+    monkeypatch.setenv("XROBOT_USB_STAGE1_CHECKPOINT", "/weights/usb/global_step_20000")
+    monkeypatch.setenv(
+        "XROBOT_USB_NORM_STATS", "/weights/assets/usb_plug/norm_stats.json"
+    )
+    config = server_config("xrobot_usb_plug_rlt_stage2_ws_server")
+
+    resolved = OmegaConf.to_container(config, resolve=True)
+    feature_model = resolved["rlt_feature_model"]
+    assert feature_model["model_path"] == "/weights/usb/global_step_20000"
+    assert feature_model["openpi_data"]["norm_stats_path"] == (
+        "/weights/assets/usb_plug/norm_stats.json"
+    )
+    assert resolved["server"]["task_prompt"] == "Bimanual usb pick and insert"
+
+
 # -------------------------------------------------------------- pending map
 
 

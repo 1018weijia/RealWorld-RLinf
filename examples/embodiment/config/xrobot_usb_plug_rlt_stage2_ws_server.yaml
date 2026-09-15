@@ -1,0 +1,29 @@
+# X2Robot dual-arm end-effector RLT Stage 2 server, "Bimanual usb pick and insert".
+#
+# Same embodiment and A–E algorithm as the put-ring overlay; only the task
+# assets change. Conversion, Cal-QL and the online server must share this file.
+#
+# Launch:
+#   XROBOT_USB_STAGE1_CHECKPOINT=/path/to/global_step_* \
+#   XROBOT_USB_NORM_STATS=/path/to/usb_plug/norm_stats.json \
+#   bash examples/embodiment/start_xrobot_stage2.sh usb_plug preflight
+
+defaults:
+  - cobot_rlt_stage2_ws_server
+  - override embodiment: x2robot
+  - _self_
+
+server:
+  task_prompt: "Bimanual usb pick and insert"
+  save_dir: "../results/xrobot_usb_plug_rlt_stage2_ws/checkpoints"
+
+runner:
+  logger:
+    experiment_name: "xrobot_usb_plug_rlt_stage2_ws"
+
+rlt_feature_model:
+  model_path: ${oc.env:XROBOT_USB_STAGE1_CHECKPOINT}
+  openpi_data:
+    repo_id: "xrobot/usb_plug"
+    norm_stats_path: ${oc.env:XROBOT_USB_NORM_STATS}
+    default_prompt: "Bimanual usb pick and insert"
