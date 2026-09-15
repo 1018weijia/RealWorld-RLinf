@@ -46,14 +46,95 @@ def _make_td3_mlp(
 
 DEFAULT_ACTION_CLIP_MIN = -1.4
 DEFAULT_ACTION_CLIP_MAX = 1.4
+DEFAULT_GRIPPER_CLIP_MIN = -1.0
+DEFAULT_GRIPPER_CLIP_MAX = 1.0
 """Default residual-action bounds in OpenPI normalized space.
 
 OpenPI quantile normalization maps ``q01``/``q99`` to ``-1``/``+1``, so a
 legitimate demonstration action can sit outside ``[-1, 1]``. Clipping the
 residual output to ``[-1, 1]`` would also clip the frozen VLA reference
 ``a_tilde`` it is added to, silently deleting reachable actions. ``+/-1.4``
-matches the remote-franka reference deployment.
+matches the remote-franka arm range; grippers use a tighter ``+/-1.0``.
 """
+
+
+def gripper_dim_indices(action_dim: int) -> tuple[int, ...]:
+    """Gripper slots inside one robot-space action.
+
+    14-D bimanual layouts are ``[arm(6), gripper(1)] x 2``. Anything else
+    that is at least 2-D puts a single gripper last.
+    """
+    if action_dim == 14:
+        return (6, 13)
+    if action_dim >= 2:
+        return (action_dim - 1,)
+    return ()
+
+
+def flat_gripper_indices(action_chunk_dim: int, action_dim: int) -> tuple[int, ...]:
+    """Gripper positions inside a flattened time-major action chunk."""
+    if action_dim <= 0 or action_chunk_dim % action_dim != 0:
+        return ()
+    per_step = gripper_dim_indices(action_dim)
+    return tuple(
+        t * action_dim + dim
+        for t in range(action_chunk_dim // action_dim)
+        for dim in per_step
+    )
+
+
+class _InwardGradientClamp(torch.autograd.Function):
+    """Hard forward clamp; backward only keeps gradients that move inward."""
+
+    @staticmethod
+    def forward(ctx, action: torch.Tensor, lo: torch.Tensor, hi: torch.Tensor):
+        ctx.save_for_backward(action, lo, hi)
+        return torch.clamp(action, min=lo, max=hi)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        action, lo, hi = ctx.saved_tensors
+        outward = ((action >= hi) & (grad_output < 0)) | (
+            (action <= lo) & (grad_output > 0)
+        )
+        return grad_output.masked_fill(outward, 0.0), None, None
+
+
+def clip_action(
+    action: torch.Tensor,
+    action_clip_min: float,
+    action_clip_max: float,
+    *,
+    action_dim: int | None = None,
+    gripper_clip_min: float | None = None,
+    gripper_clip_max: float | None = None,
+    gradient_mode: str = "hard",
+) -> torch.Tensor:
+    """Clip an action, optionally with a tighter gripper range.
+
+    ``inward`` keeps the same forward value as ``hard`` but lets a gradient
+    through when it would move a saturated coordinate back inside the box.
+    A binary gripper sitting on ±1 otherwise has no gradient under a hard
+    clamp.
+    """
+    lo = torch.full_like(action, float(action_clip_min))
+    hi = torch.full_like(action, float(action_clip_max))
+    if action_dim is not None and (
+        gripper_clip_min is not None or gripper_clip_max is not None
+    ):
+        gripper = flat_gripper_indices(action.shape[-1], int(action_dim))
+        if gripper:
+            idx = list(gripper)
+            if gripper_clip_min is not None:
+                lo[..., idx] = float(gripper_clip_min)
+            if gripper_clip_max is not None:
+                hi[..., idx] = float(gripper_clip_max)
+    mode = str(gradient_mode).lower()
+    if mode == "hard":
+        return torch.clamp(action, min=lo, max=hi)
+    if mode == "inward":
+        return _InwardGradientClamp.apply(action, lo, hi)
+    raise ValueError("gradient_mode must be 'hard' or 'inward'")
 
 
 class DirectGaussianActor(nn.Module):
@@ -74,6 +155,14 @@ class DirectGaussianActor(nn.Module):
         edit_scale: float = 0.2,
         action_clip_min: float = DEFAULT_ACTION_CLIP_MIN,
         action_clip_max: float = DEFAULT_ACTION_CLIP_MAX,
+        *,
+        action_dim: int | None = None,
+        gripper_edit_scale: float | None = None,
+        gripper_absolute_output: bool = False,
+        gripper_output_scale: float = 1.0,
+        action_clip_gripper_min: float | None = None,
+        action_clip_gripper_max: float | None = None,
+        action_clip_gradient_mode: str = "hard",
     ) -> None:
         super().__init__()
         self.sigma = float(sigma)
@@ -81,6 +170,12 @@ class DirectGaussianActor(nn.Module):
         self.edit_scale = float(edit_scale)
         self.action_clip_min = float(action_clip_min)
         self.action_clip_max = float(action_clip_max)
+        self.step_action_dim = None if action_dim is None else int(action_dim)
+        self.action_clip_gripper_min = action_clip_gripper_min
+        self.action_clip_gripper_max = action_clip_gripper_max
+        self.action_clip_gradient_mode = str(action_clip_gradient_mode).lower()
+        if self.action_clip_gradient_mode not in ("hard", "inward"):
+            raise ValueError("action_clip_gradient_mode must be 'hard' or 'inward'")
         if self.action_clip_min >= self.action_clip_max:
             raise ValueError(
                 "action_clip_min must be < action_clip_max, got "
@@ -88,6 +183,25 @@ class DirectGaussianActor(nn.Module):
             )
         if self.edit_scale <= 0.0:
             raise ValueError("edit_scale must be positive")
+        scale = torch.full((int(action_chunk_dim),), self.edit_scale)
+        mask = torch.ones((int(action_chunk_dim),))
+        if gripper_edit_scale is not None or gripper_absolute_output:
+            if self.step_action_dim is None:
+                raise ValueError("action_dim is required to locate gripper dimensions")
+            gripper = flat_gripper_indices(int(action_chunk_dim), self.step_action_dim)
+            if not gripper:
+                raise ValueError("gripper output needs resolvable gripper dimensions")
+            if gripper_edit_scale is not None:
+                if float(gripper_edit_scale) <= 0.0:
+                    raise ValueError("gripper_edit_scale must be positive when set")
+                scale[list(gripper)] = float(gripper_edit_scale)
+            if gripper_absolute_output:
+                if float(gripper_output_scale) <= 0.0:
+                    raise ValueError("gripper_output_scale must be positive")
+                mask[list(gripper)] = 0.0
+                scale[list(gripper)] = float(gripper_output_scale)
+        self.register_buffer("edit_scale_vec", scale)
+        self.register_buffer("reference_mask_vec", mask)
         self.mlp = _make_td3_mlp(
             input_dim=int(state_dim) + int(action_chunk_dim),
             output_dim=int(action_chunk_dim),
@@ -134,8 +248,18 @@ class DirectGaussianActor(nn.Module):
         residual = self.mlp(torch.cat([x, reference], dim=-1))
         if apply_action_noise and self.sigma > 0.0:
             residual = residual + torch.randn_like(residual) * self.sigma
-        action = a_tilde + self.edit_scale * torch.tanh(residual)
-        return action.clamp(self.action_clip_min, self.action_clip_max)
+        scale = self.edit_scale_vec.to(device=residual.device, dtype=residual.dtype)
+        mask = self.reference_mask_vec.to(device=a_tilde.device, dtype=a_tilde.dtype)
+        action = mask * a_tilde + scale * torch.tanh(residual)
+        return clip_action(
+            action,
+            self.action_clip_min,
+            self.action_clip_max,
+            action_dim=self.step_action_dim,
+            gripper_clip_min=self.action_clip_gripper_min,
+            gripper_clip_max=self.action_clip_gripper_max,
+            gradient_mode=self.action_clip_gradient_mode,
+        )
 
     def mean(self, x: torch.Tensor, a_tilde: torch.Tensor) -> torch.Tensor:
         return self.forward(
@@ -171,8 +295,69 @@ class QNetwork(nn.Module):
         return self.mlp(torch.cat([x, action], dim=-1))
 
 
-class TwinQCritic(nn.Module):
-    """Twin-Q critic matching the ablation TD3 MLP structure."""
+class EnsembleQCritic(nn.Module):
+    """REDQ-style Q ensemble. ``q1``/``q2`` names keep 2-head checkpoints loadable."""
+
+    def __init__(
+        self,
+        state_dim: int,
+        action_chunk_dim: int,
+        hidden_dim: int = 256,
+        num_hidden_layers: int = 2,
+        use_layer_norm: bool = False,
+        num_qs: int = 2,
+        num_min_qs: int = 2,
+    ) -> None:
+        super().__init__()
+        if int(num_qs) < 2:
+            raise ValueError("num_qs must be at least 2")
+        if not 1 <= int(num_min_qs) <= int(num_qs):
+            raise ValueError("num_min_qs must be in [1, num_qs]")
+        self.num_qs = int(num_qs)
+        self.num_min_qs = int(num_min_qs)
+        kwargs = {
+            "state_dim": state_dim,
+            "action_chunk_dim": action_chunk_dim,
+            "hidden_dim": hidden_dim,
+            "num_hidden_layers": num_hidden_layers,
+            "use_layer_norm": use_layer_norm,
+        }
+        self.q1 = QNetwork(**kwargs)
+        self.q2 = QNetwork(**kwargs)
+        self.extra_qs = nn.ModuleList(
+            QNetwork(**kwargs) for _ in range(self.num_qs - 2)
+        )
+
+    @property
+    def online_networks(self) -> tuple[QNetwork, ...]:
+        return (self.q1, self.q2, *self.extra_qs)
+
+    def forward(self, x: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
+        return torch.cat([q(x, action) for q in self.online_networks], dim=-1)
+
+    def sample_q_indices(self) -> list[int]:
+        if self.num_min_qs == self.num_qs:
+            return list(range(self.num_qs))
+        return torch.randperm(self.num_qs)[: self.num_min_qs].tolist()
+
+    def sample_disjoint_q_indices(self, num_groups: int = 2) -> list[list[int]]:
+        needed = int(num_groups) * self.num_min_qs
+        if num_groups < 1:
+            raise ValueError("num_groups must be positive")
+        if needed > self.num_qs:
+            raise ValueError(
+                f"cannot draw {num_groups} disjoint subsets of {self.num_min_qs} "
+                f"from {self.num_qs} critics; need num_qs >= {needed}"
+            )
+        perm = torch.randperm(self.num_qs).tolist()
+        return [
+            perm[g * self.num_min_qs : (g + 1) * self.num_min_qs]
+            for g in range(int(num_groups))
+        ]
+
+
+class TwinQCritic(EnsembleQCritic):
+    """Two-head TD3 critic, kept as a name existing tests and checkpoints use."""
 
     def __init__(
         self,
@@ -182,24 +367,15 @@ class TwinQCritic(nn.Module):
         num_hidden_layers: int = 2,
         use_layer_norm: bool = False,
     ) -> None:
-        super().__init__()
-        self.q1 = QNetwork(
+        super().__init__(
             state_dim=state_dim,
             action_chunk_dim=action_chunk_dim,
             hidden_dim=hidden_dim,
             num_hidden_layers=num_hidden_layers,
             use_layer_norm=use_layer_norm,
+            num_qs=2,
+            num_min_qs=2,
         )
-        self.q2 = QNetwork(
-            state_dim=state_dim,
-            action_chunk_dim=action_chunk_dim,
-            hidden_dim=hidden_dim,
-            num_hidden_layers=num_hidden_layers,
-            use_layer_norm=use_layer_norm,
-        )
-
-    def forward(self, x: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
-        return torch.cat([self.q1(x, action), self.q2(x, action)], dim=-1)
 
 
 class RLTTD3MLPPolicy(nn.Module, BasePolicy):
@@ -233,6 +409,14 @@ class RLTTD3MLPPolicy(nn.Module, BasePolicy):
         action_clip_min: float = DEFAULT_ACTION_CLIP_MIN,
         action_clip_max: float = DEFAULT_ACTION_CLIP_MAX,
         critic_use_layer_norm: bool = False,
+        critic_num_qs: int = 2,
+        critic_num_min_qs: int = 2,
+        gripper_edit_scale: float | None = None,
+        gripper_absolute_output: bool = False,
+        gripper_output_scale: float = 1.0,
+        action_clip_gripper_min: float | None = None,
+        action_clip_gripper_max: float | None = None,
+        action_clip_gradient_mode: str = "hard",
     ) -> None:
         super().__init__()
         if not add_q_head:
@@ -287,15 +471,24 @@ class RLTTD3MLPPolicy(nn.Module, BasePolicy):
             edit_scale=residual_scale,
             action_clip_min=action_clip_min,
             action_clip_max=action_clip_max,
+            action_dim=self.step_action_dim,
+            gripper_edit_scale=gripper_edit_scale,
+            gripper_absolute_output=gripper_absolute_output,
+            gripper_output_scale=gripper_output_scale,
+            action_clip_gripper_min=action_clip_gripper_min,
+            action_clip_gripper_max=action_clip_gripper_max,
+            action_clip_gradient_mode=action_clip_gradient_mode,
         )
         # Name this q_head so existing SAC/RLT optimizer filtering keeps actor
         # and critic optimizers separate.
-        self.q_head = TwinQCritic(
+        self.q_head = EnsembleQCritic(
             state_dim=self.state_dim,
             action_chunk_dim=self.flat_action_dim,
             hidden_dim=mlp_hidden_dim,
             num_hidden_layers=mlp_num_hidden_layers,
             use_layer_norm=critic_use_layer_norm,
+            num_qs=critic_num_qs,
+            num_min_qs=critic_num_min_qs,
         )
         # Rollout workers need the target critic for EXPO selection. This frozen
         # shadow is refreshed by the learner before normal RLinf weight sync.
@@ -428,7 +621,9 @@ class RLTTD3MLPPolicy(nn.Module, BasePolicy):
             candidate_state.reshape(-1, state.shape[-1]),
             candidates.reshape(-1, self.flat_action_dim),
         ).reshape(state.shape[0], candidates.shape[1], -1)
-        best = torch.min(q_values[..., 0], q_values[..., 1]).argmax(dim=1)
+        indices = self.q_head.sample_q_indices()
+        conservative = q_values[..., indices].min(dim=-1).values
+        best = conservative.argmax(dim=1)
         batch = torch.arange(state.shape[0], device=state.device)
         action = candidates[batch, best]
         selected_base = self._get_ref_candidates(obs)[batch, base_indices[best]]

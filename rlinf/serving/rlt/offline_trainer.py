@@ -25,6 +25,7 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 
+from rlinf.algorithms.rlt.learner import _optional_float
 from rlinf.algorithms.rlt.losses import compute_rlt_critic_loss
 from rlinf.serving.rlt.cobot_offline_data import OfflineBuffer, atomic_save, contract
 from rlinf.serving.rlt.trainer import RLTStage2Trainer
@@ -126,6 +127,14 @@ class RLTOfflineTrainer(RLTStage2Trainer):
             next_actions_fn=self._next_actions_for_critic_target,
             critic_loss_type=str(self.cfg.algorithm.critic_loss),
             critic_huber_delta=float(self.cfg.algorithm.critic_huber_delta),
+            td_backup=self._rl_algo_td_backup(),
+            critic_num_min_qs=int(self.cfg.actor.model.get("critic_num_min_qs", 2)),
+            td_target_clip_min=_optional_float(
+                self.cfg.algorithm.get("td_target_clip_min")
+            ),
+            td_target_clip_max=_optional_float(
+                self.cfg.algorithm.get("td_target_clip_max")
+            ),
             **self._action_clip_bounds(),
         )[0]
 

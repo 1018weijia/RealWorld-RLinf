@@ -39,7 +39,54 @@ def require_twin_q(all_q_values: Tensor) -> None:
 
 def min_twin_q(all_q_values: Tensor) -> Tensor:
     require_twin_q(all_q_values)
-    return torch.minimum(all_q_values[..., 0:1], all_q_values[..., 1:2])
+    return all_q_values.min(dim=-1, keepdim=True).values
+
+
+def sample_q_indices(num_qs: int, num_min_qs: int) -> list[int]:
+    """Draw a conservative subset without replacement."""
+    if num_min_qs >= num_qs:
+        return list(range(num_qs))
+    return torch.randperm(int(num_qs))[: int(num_min_qs)].tolist()
+
+
+def sample_disjoint_q_indices(
+    num_qs: int, num_min_qs: int, num_groups: int = 2
+) -> list[list[int]]:
+    """Draw mutually disjoint conservative subsets (Double-DQN style)."""
+    needed = int(num_groups) * int(num_min_qs)
+    if num_groups < 1:
+        raise ValueError("num_groups must be positive")
+    if needed > num_qs:
+        raise ValueError(
+            f"cannot draw {num_groups} disjoint subsets of {num_min_qs} "
+            f"from {num_qs} critics; need num_qs >= {needed}"
+        )
+    perm = torch.randperm(int(num_qs)).tolist()
+    return [
+        perm[group * num_min_qs : (group + 1) * num_min_qs]
+        for group in range(int(num_groups))
+    ]
+
+
+def conservative_q(all_q_values: Tensor, indices: list[int] | None = None) -> Tensor:
+    """Minimum over ``indices``, or over every head when ``indices`` is None."""
+    require_twin_q(all_q_values)
+    if indices is None:
+        return all_q_values.min(dim=-1, keepdim=True).values
+    selected = all_q_values[..., list(indices)]
+    return selected.min(dim=-1, keepdim=True).values
+
+
+def mean_q(all_q_values: Tensor) -> Tensor:
+    """Mean over every Q head (EXPO/REDQ actor objective)."""
+    require_twin_q(all_q_values)
+    return all_q_values.mean(dim=-1, keepdim=True)
+
+
+def pairwise_action_distance(positive: Tensor, negative: Tensor) -> Tensor:
+    """Per-row RMS distance between two flattened action chunks."""
+    delta = flatten_chunk(positive) - flatten_chunk(negative)
+    return delta.square().mean(dim=-1).sqrt()
 
 
 def q1(all_q_values: Tensor) -> Tensor:
@@ -143,8 +190,13 @@ def compute_rlt_critic_loss(
     rewind_noise_clip: float = 0.0,
     action_clip_min: float = -1.0,
     action_clip_max: float = 1.0,
+    td_backup: str = "td3",
+    critic_num_min_qs: int = 2,
+    expo_backup_num_edit_samples: int | None = None,
+    td_target_clip_min: float | None = None,
+    td_target_clip_max: float | None = None,
 ) -> tuple[Tensor, dict[str, Any]]:
-    """Twin-Q TD loss with EXPO expected-max and optional PER weights."""
+    """Ensemble TD loss with optional EXPO Expected-Max / decoupled backup."""
     from rlinf.models.embodiment.base_policy import ForwardType
 
     curr_obs = batch["curr_obs"]
@@ -182,6 +234,14 @@ def compute_rlt_critic_loss(
                 .bool()
             )
 
+        backup = str(td_backup).lower()
+        if backup not in ("td3", "expo", "expo_decoupled"):
+            raise ValueError(
+                "td_backup must be 'td3', 'expo' or 'expo_decoupled', "
+                f"got {td_backup!r}"
+            )
+        del expo_backup_num_edit_samples
+
         if next_actions.dim() == 3:
             if use_crossq:
                 raise ValueError("EXPO candidate targets do not support CrossQ")
@@ -199,11 +259,30 @@ def compute_rlt_critic_loss(
                 obs=candidate_obs,
                 actions=next_actions.reshape(-1, action_size),
             ).reshape(batch_size, candidate_count, -1)
-            q_next = (
-                torch.minimum(candidate_q[..., 0], candidate_q[..., 1])
-                .max(dim=1, keepdim=True)
-                .values
-            )
+            num_qs = int(candidate_q.shape[-1])
+            if backup == "expo_decoupled":
+                select_idx, eval_idx = sample_disjoint_q_indices(
+                    num_qs, int(critic_num_min_qs), 2
+                )
+                select_q = conservative_q(candidate_q, select_idx).squeeze(-1)
+                best = select_q.argmax(dim=1)
+                batch_ix = torch.arange(batch_size, device=candidate_q.device)
+                chosen = candidate_q[batch_ix, best]
+                coupled = conservative_q(chosen.unsqueeze(1), select_idx).reshape(
+                    batch_size, 1
+                )
+                q_next = conservative_q(chosen.unsqueeze(1), eval_idx).reshape(
+                    batch_size, 1
+                )
+                optimism_gap = coupled - q_next
+            else:
+                indices = sample_q_indices(num_qs, int(critic_num_min_qs))
+                # Drop the candidate axis. ``keepdim=True`` here becomes
+                # ``[B, 1, 1]`` and broadcasts against ``[B, 1]`` rewards into
+                # ``[B, B, 1]``.
+                q_next = conservative_q(candidate_q, indices).max(dim=1).values
+                optimism_gap = None
+            q_next = q_next.reshape(batch_size, 1)
             if override is not None and mask is not None:
                 if override.shape != (batch_size, action_size):
                     raise ValueError(
@@ -229,7 +308,11 @@ def compute_rlt_critic_loss(
                 obs=next_obs,
                 actions=next_actions,
             )
-            q_next = min_twin_q(all_qf_next_target)
+            indices = sample_q_indices(
+                int(all_qf_next_target.shape[-1]), int(critic_num_min_qs)
+            )
+            q_next = conservative_q(all_qf_next_target, indices)
+            optimism_gap = None
         else:
             _, all_qf_next = model(
                 forward_type=ForwardType.CROSSQ_Q,
@@ -239,6 +322,7 @@ def compute_rlt_critic_loss(
                 next_actions=next_actions,
             )
             q_next = min_twin_q(all_qf_next.detach())
+            optimism_gap = None
 
         reward_target = discounted_chunk_rewards(rewards, gamma)
         reward_horizon = int(rewards.reshape(rewards.shape[0], -1).shape[-1])
@@ -256,6 +340,11 @@ def compute_rlt_critic_loss(
         else:
             raise NotImplementedError(f"{bootstrap_type=} is not supported!")
         target_q_values = reward_target + bootstrap_gate * bootstrap_discount * q_next
+        unclipped_target = target_q_values
+        if td_target_clip_min is not None or td_target_clip_max is not None:
+            target_q_values = target_q_values.clamp(
+                min=td_target_clip_min, max=td_target_clip_max
+            )
 
     critic_actions = flatten_chunk(actions)
 
@@ -355,8 +444,17 @@ def compute_rlt_critic_loss(
         "expo_candidate_count": float(
             next_actions.shape[1] if next_actions.dim() == 3 else 1
         ),
+        "td_backup": {"td3": 0.0, "expo": 1.0, "expo_decoupled": 2.0}.get(
+            str(td_backup).lower(), -1.0
+        ),
         "_td_errors": td_errors,
     }
+    if td_target_clip_min is not None or td_target_clip_max is not None:
+        clipped = (unclipped_target - target_q_values).abs() > 0
+        metrics["td_target_clipped_frac"] = float(clipped.float().mean().item())
+        metrics["td_target_unclipped"] = float(unclipped_target.mean().item())
+    if optimism_gap is not None:
+        metrics["expo_backup_optimism_gap_mean"] = float(optimism_gap.mean().item())
     return critic_loss, metrics
 
 
@@ -370,8 +468,13 @@ def compute_rlt_actor_loss(
     bc_weight: float = 1.0,
     reference_dropout_prob: float = 0.0,
     use_crossq: bool = False,
+    actor_q_aggregation: str = "min",
 ) -> tuple[Tensor, Tensor, dict[str, float]]:
-    """Actor objective: ``-q_weight * Q1(pi) + bc_weight * BC``."""
+    """Actor objective: ``-q_weight * Q(pi) + bc_weight * BC``.
+
+    ``actor_q_aggregation`` is ``min`` (legacy Twin-Q, default) or ``mean``
+    (REDQ/EXPO ensemble; the WebSocket YAML sets this).
+    """
     from rlinf.models.embodiment.base_policy import ForwardType
 
     curr_obs = batch["curr_obs"]
@@ -407,8 +510,15 @@ def compute_rlt_actor_loss(
         f"q_value_{q_id}": all_qf_pi[..., q_id].mean().item()
         for q_id in range(num_q_values)
     }
-    qf_pi = q1(all_qf_pi)
+    aggregation = str(actor_q_aggregation).lower()
+    if aggregation == "mean":
+        qf_pi = mean_q(all_qf_pi)
+    elif aggregation == "min":
+        qf_pi = conservative_q(all_qf_pi)
+    else:
+        raise ValueError("actor_q_aggregation must be 'mean' or 'min'")
     metrics["q_pi"] = qf_pi.mean().item()
+    metrics["actor_q_aggregation"] = 1.0 if aggregation == "mean" else 0.0
 
     ref_chunk = (
         flatten_chunk(curr_obs["ref_chunk"])
@@ -503,27 +613,131 @@ def critic_pairwise_rank_loss(
     action_mask: Tensor,
     confidence: Tensor,
     margin: float,
+    rank_slope: float = 0.0,
 ) -> tuple[Tensor, dict[str, float]]:
-    """Per-head hinge ranking matching remote-franka rewind preference."""
+    """Per-head hinge ranking. ``rank_slope>0`` sizes the margin by action RMS."""
     from rlinf.models.embodiment.base_policy import ForwardType
 
     if margin < 0.0:
         raise ValueError("margin must be non-negative")
+    if rank_slope < 0.0:
+        raise ValueError("rank_slope must be non-negative")
     positive = _masked_preference_actions(ref_chunk, positive_action, action_mask)
     negative = _masked_preference_actions(ref_chunk, negative_action, action_mask)
     q_positive = model(forward_type=ForwardType.SAC_Q, obs=curr_obs, actions=positive)
     q_negative = model(forward_type=ForwardType.SAC_Q, obs=curr_obs, actions=negative)
     if q_positive.shape != q_negative.shape or q_positive.shape[-1] < 2:
-        raise ValueError("preference ranking requires matching twin-Q outputs")
+        raise ValueError("preference ranking requires matching ensemble Q outputs")
     weights = _preference_weights(action_mask, confidence).to(q_positive.device)
-    per_head = F.relu(float(margin) - q_positive + q_negative)
+    if rank_slope > 0.0:
+        pair_margin = (rank_slope * pairwise_action_distance(positive, negative)).to(
+            device=q_positive.device, dtype=q_positive.dtype
+        )
+    else:
+        pair_margin = torch.full(
+            (q_positive.shape[0],),
+            float(margin),
+            device=q_positive.device,
+            dtype=q_positive.dtype,
+        )
+    per_head = F.relu(pair_margin[:, None] - q_positive + q_negative)
     per_pair = per_head.reshape(per_head.shape[0], -1).mean(dim=-1)
     loss = torch.sum(per_pair * weights) / torch.clamp(weights.sum(), min=1.0)
     return loss, {
         "preference_critic_loss": float(loss.detach().item()),
         "preference_q_gap": float((q_positive - q_negative).mean().detach().item()),
         "preference_pair_count": float(weights.numel()),
+        "preference_margin_mean": float(pair_margin.mean().detach().item()),
+        "preference_pair_distance_mean": float(
+            pairwise_action_distance(positive, negative).mean().detach().item()
+        ),
     }
+
+
+def critic_intervention_rank_loss(
+    *,
+    model: Any,
+    curr_obs: dict[str, Tensor],
+    human_action: Tensor,
+    negative_action: Tensor,
+    intervene_flags: Tensor,
+    slope: float,
+    min_distance: float = 0.0,
+    local_steps: tuple[float, ...] = (),
+    local_weight: float = 1.0,
+) -> tuple[Tensor, dict[str, float]]:
+    """Rank Q(human) above Q(neg) on intervention rows; optional local probes."""
+    from rlinf.models.embodiment.base_policy import ForwardType
+
+    if slope < 0.0:
+        raise ValueError("slope must be non-negative")
+    human = flatten_chunk(human_action)
+    negative = flatten_chunk(negative_action)
+    if human.shape != negative.shape:
+        raise ValueError("human and negative actions must match")
+    flags = flatten_chunk(intervene_flags).to(device=human.device)
+    if flags.dim() > 1:
+        flags = flags.any(dim=-1)
+    distance = pairwise_action_distance(human, negative)
+    selected = (flags.reshape(-1) > 0) & (distance > float(min_distance))
+    rows = torch.nonzero(selected, as_tuple=False).reshape(-1)
+    empty = {
+        "intervention_rank_active": 0.0,
+        "intervention_rank_pairs": 0.0,
+    }
+    if rows.numel() == 0:
+        zero = human.new_zeros(())
+        return zero, empty
+
+    def _hinge(
+        obs: dict[str, Tensor], pos: Tensor, neg: Tensor, margins: Tensor
+    ) -> Tensor:
+        q_pos = model(forward_type=ForwardType.SAC_Q, obs=obs, actions=pos)
+        q_neg = model(forward_type=ForwardType.SAC_Q, obs=obs, actions=neg)
+        per_head = F.relu(margins[:, None] - q_pos + q_neg)
+        return per_head.mean()
+
+    # Index the observation dict so unused rows don't leak into the mean.
+    def _index_obs(obs: dict[str, Tensor], index: Tensor) -> dict[str, Tensor]:
+        out = {}
+        for key, value in obs.items():
+            if torch.is_tensor(value) and value.shape[0] == human.shape[0]:
+                out[key] = value.index_select(0, index)
+            else:
+                out[key] = value
+        return out
+
+    idx = rows
+    obs = _index_obs(curr_obs, idx)
+    human_i = human.index_select(0, idx)
+    negative_i = negative.index_select(0, idx)
+    margins = (float(slope) * distance.index_select(0, idx)).to(dtype=human.dtype)
+    loss = _hinge(obs, human_i, negative_i, margins)
+    metrics = {
+        "intervention_rank_active": 1.0,
+        "intervention_rank_pairs": float(idx.numel()),
+        "intervention_rank_margin_mean": float(margins.mean().detach().item()),
+        "intervention_rank_distance_mean": float(
+            distance.index_select(0, idx).mean().detach().item()
+        ),
+        "intervention_rank_loss": float(loss.detach().item()),
+    }
+    if local_steps:
+        local_loss = human.new_zeros(())
+        probes = 0
+        for step in local_steps:
+            frac = float(step)
+            if not 0.0 < frac <= 1.0:
+                raise ValueError("local_steps entries must be in (0, 1]")
+            probe = negative_i + frac * (human_i - negative_i)
+            local_loss = local_loss + _hinge(obs, probe, negative_i, margins * frac)
+            probes += 1
+        if probes:
+            local_loss = local_loss / probes
+            loss = loss + float(local_weight) * local_loss
+            metrics["intervention_rank_local_loss"] = float(local_loss.detach().item())
+            metrics["intervention_rank_local_probes"] = float(probes)
+    return loss, metrics
 
 
 def actor_pairwise_preference_loss(

@@ -62,6 +62,14 @@ def get_model(cfg: DictConfig, torch_dtype=torch.bfloat16):
             action_clip_min=cfg.get("action_clip_min", DEFAULT_ACTION_CLIP_MIN),
             action_clip_max=cfg.get("action_clip_max", DEFAULT_ACTION_CLIP_MAX),
             critic_use_layer_norm=cfg.get("critic_use_layer_norm", False),
+            critic_num_qs=cfg.get("critic_num_qs", 2),
+            critic_num_min_qs=cfg.get("critic_num_min_qs", 2),
+            gripper_edit_scale=cfg.get("gripper_edit_scale", None),
+            gripper_absolute_output=cfg.get("gripper_absolute_output", False),
+            gripper_output_scale=cfg.get("gripper_output_scale", 1.0),
+            action_clip_gripper_min=cfg.get("action_clip_gripper_min", None),
+            action_clip_gripper_max=cfg.get("action_clip_gripper_max", None),
+            action_clip_gradient_mode=cfg.get("action_clip_gradient_mode", "hard"),
         )
     elif iql_config is not None:
         model = IQLMLPPolicy(

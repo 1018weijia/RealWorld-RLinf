@@ -57,8 +57,16 @@ server:
   # OpenPI model space, matching the Stage 2 actor's own output space.
   replay_action_space: normalized
 
-  # Evaluate without training or writing replay.
+  # Evaluate without training or writing replay. Distinct from the in-training
+  # eval episode below: this flag is a whole-run mode.
   eval_only: False
+
+  # After every N completed training episodes, the next episode is deterministic
+  # (mode=eval, no UTD). 0 disables. Those rows still enter replay when
+  # store_eval_episodes is true, so the critic sees the actions it actually
+  # ranks highest.
+  eval_interval_episodes: 5
+  store_eval_episodes: True
 
   save_dir: "../results/cobot_rlt_stage2_ws/checkpoints"
   save_interval_episodes: 10
@@ -110,9 +118,16 @@ algorithm:
   loss_type: rlt_td3
   loss_agg_func: "token-mean"
 
-  # remote-franka EXPO actor: pure -min(Q1, Q2), without VLA/human BC.
+  # remote-franka EXPO actor: pure -Q, without VLA/human BC. Actor Q is the
+  # ensemble mean; execution and TD backup are separate knobs.
   q_weight: 1.0
   bc_weight: 0.0
+  rl_algo_act: expo
+  rl_algo_td_backup: expo_decoupled
+  actor_q_aggregation: mean
+  target_update_on_actor_step: True
+  td_target_clip_min: -1.0
+  td_target_clip_max: null
 
   reference_dropout_prob: 0.0
   actor_update_action_noise: True
@@ -135,10 +150,23 @@ algorithm:
     critic_weight: 0.1
     actor_weight: 0.1
     rank_margin: 0.1
+    rank_slope: 0.2
     actor_beta: 0.1
     rewind_exit_terminal_reward: -1.0
     rewind_credit_terminal_reward: -1.0
     rewind_credit_prefix_reward: 0.1
+
+  # Human takeovers constrain Q, not the actor. Local probes sit on the
+  # a_neg → a_human chord so the gap is not satisfied only at the endpoints.
+  intervention_rank:
+    enable: True
+    weight: 0.2
+    slope: 0.3
+    min_distance: 0.0
+    vs_actor: True
+    vs_reference: False
+    local_steps: [0.2, 0.4, 0.6, 0.8]
+    local_weight: 1.0
 
   bootstrap_type: standard
   gamma: 0.99
@@ -273,15 +301,28 @@ actor:
     num_action_chunks: ${embodiment.chunk_length}
     ref_num_action_chunks: ${embodiment.ref_chunk_length}
     actor_noise_sigma: 0.2
-    residual_scale: 0.2
+    residual_scale: 0.4
     action_selection_mode: expo
     expo_num_base_samples: 4
     expo_num_edit_samples: 4
 
-    # remote-franka reference head geometry.
+    # remote-franka reference head geometry. Ensemble 10/2 is required for
+    # expo_decoupled (two disjoint conservative subsets).
     mlp_hidden_dim: 256
     mlp_num_hidden_layers: 3
     critic_use_layer_norm: True
+    critic_num_qs: 10
+    critic_num_min_qs: 2
+
+    # Gripper sits on ±0.98 in normalized space; an additive residual can only
+    # push it out of [-1, 1]. Absolute tanh + a tighter clip + inward grads
+    # keep that coordinate trainable.
+    gripper_edit_scale: 2.0
+    gripper_absolute_output: True
+    gripper_output_scale: 1.0
+    action_clip_gripper_min: -1.0
+    action_clip_gripper_max: 1.0
+    action_clip_gradient_mode: inward
 
     # Residual bounds in OpenPI normalized space. Quantile normalization maps
     # q01/q99 (not the extremes) to -1/+1, so a valid action can sit outside

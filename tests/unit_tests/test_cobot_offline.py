@@ -211,6 +211,18 @@ def test_native_offline_train_resume_and_online_update(
         mlp_hidden_dim=32,
         actor_noise_sigma=cfg.actor.model.actor_noise_sigma,
         residual_scale=cfg.actor.model.residual_scale,
+        critic_num_qs=int(cfg.actor.model.get("critic_num_qs", 2)),
+        critic_num_min_qs=int(cfg.actor.model.get("critic_num_min_qs", 2)),
+        gripper_absolute_output=bool(
+            cfg.actor.model.get("gripper_absolute_output", False)
+        ),
+        gripper_edit_scale=cfg.actor.model.get("gripper_edit_scale"),
+        gripper_output_scale=float(cfg.actor.model.get("gripper_output_scale", 1.0)),
+        action_clip_gripper_min=cfg.actor.model.get("action_clip_gripper_min"),
+        action_clip_gripper_max=cfg.actor.model.get("action_clip_gripper_max"),
+        action_clip_gradient_mode=str(
+            cfg.actor.model.get("action_clip_gradient_mode", "hard")
+        ),
     )
 
     def make():

@@ -45,6 +45,7 @@ from __future__ import annotations
 import copy
 import logging
 from dataclasses import dataclass
+from typing import Any
 
 import torch
 
@@ -66,6 +67,13 @@ from rlinf.utils.metric_utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _optional_float(value: Any) -> float | None:
+    """Parse a config number, treating empty / null as unset."""
+    if value is None or value == "":
+        return None
+    return float(value)
 
 
 @dataclass(frozen=True)
@@ -266,7 +274,43 @@ class RLTLossCore(RLTHostHooks):
         }
         return bc_weight, q_weight, metrics
 
+    def _rl_algo_td_backup(self) -> str:
+        raw = str(self.cfg.algorithm.get("rl_algo_td_backup") or "td3").lower()
+        if raw in ("expo_double", "decoupled"):
+            return "expo_decoupled"
+        if raw not in ("td3", "expo", "expo_decoupled"):
+            raise ValueError(
+                "algorithm.rl_algo_td_backup must be td3, expo or expo_decoupled, "
+                f"got {raw!r}"
+            )
+        return raw
+
+    def _validate_td_backup_ensemble(self) -> None:
+        """Refuse ``expo_decoupled`` when the critic cannot split two subsets."""
+        backup = self._rl_algo_td_backup()
+        num_qs = int(self.cfg.actor.model.get("critic_num_qs", 2))
+        num_min = int(self.cfg.actor.model.get("critic_num_min_qs", 2))
+        if backup == "expo_decoupled" and num_qs < 2 * num_min:
+            raise ValueError(
+                "expo_decoupled needs critic_num_qs >= 2 * critic_num_min_qs "
+                f"(got {num_qs} < 2*{num_min})"
+            )
+
     def _next_actions_for_critic_target(self, next_obs):
+        backup = self._rl_algo_td_backup()
+        if backup in ("expo", "expo_decoupled"):
+            target = self.target_model
+            edits = self.cfg.algorithm.get("expo_backup_num_edit_samples")
+            original = target.expo_num_edit_samples
+            if edits is not None:
+                target.expo_num_edit_samples = int(edits)
+            try:
+                candidates, _ = target.build_expo_candidates(
+                    next_obs, exploration=False
+                )
+            finally:
+                target.expo_num_edit_samples = original
+            return candidates
         return self.model(
             forward_type=ForwardType.SAC,
             obs=next_obs,
@@ -298,12 +342,74 @@ class RLTLossCore(RLTHostHooks):
             action_mask=pair_batch["action_mask"],
             confidence=pair_batch["confidence"],
             margin=float(preference_cfg.get("rank_margin", 0.1)),
+            rank_slope=float(preference_cfg.get("rank_slope", 0.0)),
         )
         weight = float(preference_cfg.get("critic_weight", 0.0))
         metrics.update(preference_metrics)
         metrics["preference_critic_weight"] = weight
         metrics["preference_critic_active"] = 1.0
         return loss + weight * preference_loss
+
+    def _add_intervention_rank_loss(
+        self,
+        loss: torch.Tensor,
+        metrics: dict[str, float],
+        batch: dict[str, Any],
+    ) -> torch.Tensor:
+        rank_cfg = self.cfg.algorithm.get("intervention_rank", {}) or {}
+        if not bool(rank_cfg.get("enable", False)):
+            metrics["intervention_rank_active"] = 0.0
+            return loss
+        flags = batch.get("intervene_flags")
+        if flags is None:
+            metrics["intervention_rank_active"] = 0.0
+            return loss
+        vs_actor = bool(rank_cfg.get("vs_actor", True))
+        vs_reference = bool(rank_cfg.get("vs_reference", False))
+        if not (vs_actor or vs_reference):
+            metrics["intervention_rank_active"] = 0.0
+            return loss
+        steps = rank_cfg.get("local_steps", ()) or ()
+        if isinstance(steps, str):
+            steps = tuple(float(part) for part in steps.split(",") if part.strip())
+        else:
+            steps = tuple(float(part) for part in steps)
+        negatives: list[tuple[str, torch.Tensor]] = []
+        if vs_reference:
+            negatives.append(("reference", self._ref_chunk(batch["curr_obs"])))
+        if vs_actor:
+            with torch.no_grad():
+                actor_neg, _, _ = self.model(
+                    forward_type=ForwardType.SAC,
+                    obs=batch["curr_obs"],
+                    deterministic=True,
+                )
+            negatives.append(("actor", actor_neg))
+        weight = float(rank_cfg.get("weight", 0.0))
+        total = loss.new_zeros(())
+        active = 0.0
+        for name, negative in negatives:
+            rank_loss, rank_metrics = rlt_losses.critic_intervention_rank_loss(
+                model=self.model,
+                curr_obs=batch["curr_obs"],
+                human_action=batch["actions"],
+                negative_action=negative,
+                intervene_flags=flags,
+                slope=float(rank_cfg.get("slope", 0.3)),
+                min_distance=float(rank_cfg.get("min_distance", 0.0)),
+                local_steps=steps,
+                local_weight=float(rank_cfg.get("local_weight", 1.0)),
+            )
+            total = total + rank_loss
+            active = max(
+                active, float(rank_metrics.get("intervention_rank_active", 0.0))
+            )
+            for key, value in rank_metrics.items():
+                suffix = key.removeprefix("intervention_rank_")
+                metrics[f"intervention_rank_{name}_{suffix}"] = value
+        metrics["intervention_rank_active"] = active
+        metrics["intervention_rank_weight"] = weight
+        return loss + weight * total
 
     def _add_actor_preference_loss(
         self, loss: torch.Tensor, metrics: dict[str, float]
@@ -418,12 +524,24 @@ class RLTLossCore(RLTHostHooks):
             rewind_noise_clip=float(
                 self.cfg.algorithm.get("rewind_critic_action_noise_clip", 0.0)
             ),
+            td_backup=self._rl_algo_td_backup(),
+            critic_num_min_qs=int(self.cfg.actor.model.get("critic_num_min_qs", 2)),
+            expo_backup_num_edit_samples=self.cfg.algorithm.get(
+                "expo_backup_num_edit_samples"
+            ),
+            td_target_clip_min=_optional_float(
+                self.cfg.algorithm.get("td_target_clip_min")
+            ),
+            td_target_clip_max=_optional_float(
+                self.cfg.algorithm.get("td_target_clip_max")
+            ),
             **self._action_clip_bounds(),
         )
         td_errors = metrics.pop("_td_errors", None)
         if td_errors is not None:
             metrics.update(self._update_replay_priorities(batch, td_errors))
         critic_loss = self._add_critic_preference_loss(critic_loss, metrics)
+        critic_loss = self._add_intervention_rank_loss(critic_loss, metrics, batch)
         return critic_loss, metrics
 
     def forward_actor(self, batch):
@@ -442,6 +560,9 @@ class RLTLossCore(RLTHostHooks):
             bc_weight=bc_weight,
             reference_dropout_prob=reference_dropout_prob,
             use_crossq=use_crossq,
+            actor_q_aggregation=str(
+                self.cfg.algorithm.get("actor_q_aggregation", "min")
+            ),
         )
         metrics.update(weight_metrics)
         actor_loss = self._add_actor_preference_loss(actor_loss, metrics)

@@ -43,6 +43,7 @@ from rlinf.serving.rlt.preflight import (
     check_norm_stats,
     check_norm_stats_configured,
     check_stage1_checkpoint,
+    check_stage2_algorithm,
     check_task_prompt,
     report_reference_deviations,
     resolve_stage1_weights,
@@ -68,9 +69,16 @@ REFERENCE_HYPERPARAMETERS = {
     "critic_lr": 3e-4,
     "mlp_num_hidden_layers": 3,
     "critic_use_layer_norm": True,
-    "residual_scale": 0.2,
+    "residual_scale": 0.4,
     "action_clip_min": -1.4,
     "action_clip_max": 1.4,
+    "critic_num_qs": 10,
+    "critic_num_min_qs": 2,
+    "gripper_absolute_output": True,
+    "action_clip_gradient_mode": "inward",
+    "rl_algo_td_backup": "expo_decoupled",
+    "actor_q_aggregation": "mean",
+    "target_update_on_actor_step": True,
     "warmup_steps": 250,
     "utd_ratio": 5,
     "max_episode_chunks": 150,
@@ -96,6 +104,23 @@ def _effective_hyperparameters(cfg: DictConfig) -> dict[str, object]:
         "residual_scale": float(model_cfg.residual_scale),
         "action_clip_min": float(model_cfg.get("action_clip_min", -1.4)),
         "action_clip_max": float(model_cfg.get("action_clip_max", 1.4)),
+        "critic_num_qs": int(model_cfg.get("critic_num_qs", 2)),
+        "critic_num_min_qs": int(model_cfg.get("critic_num_min_qs", 2)),
+        "gripper_absolute_output": bool(
+            model_cfg.get("gripper_absolute_output", False)
+        ),
+        "action_clip_gradient_mode": str(
+            model_cfg.get("action_clip_gradient_mode", "hard")
+        ),
+        "rl_algo_td_backup": str(
+            cfg.algorithm.get("rl_algo_td_backup") or "td3"
+        ).lower(),
+        "actor_q_aggregation": str(
+            cfg.algorithm.get("actor_q_aggregation", "mean")
+        ).lower(),
+        "target_update_on_actor_step": bool(
+            cfg.algorithm.get("target_update_on_actor_step", True)
+        ),
         "warmup_steps": int(cfg.server.warmup_steps),
         "utd_ratio": int(cfg.server.utd_ratio),
         "max_episode_chunks": int(cfg.server.max_episode_chunks),
@@ -115,7 +140,7 @@ def run_preflight(cfg: DictConfig) -> None:
     Args:
         cfg: Full server config.
     """
-    validate_vla_only_config(cfg)
+    vla_only = validate_vla_only_config(cfg)
 
     # First: every later check reads embodiment numbers out of some config
     # section, and those sections are only trustworthy once they agree with
@@ -149,6 +174,8 @@ def run_preflight(cfg: DictConfig) -> None:
         embodiment.camera_keys,
         int(feature_cfg.openpi.num_images_in_input),
     )
+    if not vla_only:
+        check_stage2_algorithm(cfg)
 
     values = _effective_hyperparameters(cfg)
     logger.info("Effective Stage 2 hyperparameters:")
@@ -261,6 +288,8 @@ def build_policy(cfg: DictConfig) -> RLTStage2Policy:
         save_dir=cfg.server.get("save_dir"),
         save_interval_episodes=int(cfg.server.get("save_interval_episodes", 10)),
         eval_only=bool(cfg.server.eval_only),
+        store_eval_episodes=bool(cfg.server.get("store_eval_episodes", False)),
+        eval_interval_episodes=int(cfg.server.get("eval_interval_episodes", 0)),
         replay_action_space=str(cfg.server.replay_action_space),
     )
 

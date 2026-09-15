@@ -298,6 +298,53 @@ def check_camera_layout(camera_keys: tuple[str, ...], num_images: int) -> None:
     logger.info("Preflight: camera layout = %s", list(camera_keys))
 
 
+def check_stage2_algorithm(cfg: Any) -> None:
+    """Refuse Stage 2 algorithm combinations that cannot run.
+
+    ``expo_decoupled`` draws two disjoint conservative subsets, so the
+    ensemble must be at least ``2 * critic_num_min_qs`` heads. ``rl_algo_act``
+    is the documented twin of ``action_selection_mode`` and must agree when
+    both are set.
+
+    Args:
+        cfg: Full server config.
+
+    Raises:
+        PreflightError: The backup needs more heads than the critic has, or
+            the act/backup knobs disagree.
+    """
+    algorithm = cfg.algorithm
+    model = cfg.actor.model
+    backup = str(algorithm.get("rl_algo_td_backup") or "td3").lower()
+    if backup in ("expo_double", "decoupled"):
+        backup = "expo_decoupled"
+    if backup not in ("td3", "expo", "expo_decoupled"):
+        raise PreflightError(
+            "algorithm.rl_algo_td_backup must be td3, expo or expo_decoupled, "
+            f"got {backup!r}"
+        )
+    num_qs = int(model.get("critic_num_qs", 2))
+    num_min = int(model.get("critic_num_min_qs", 2))
+    if backup == "expo_decoupled" and num_qs < 2 * num_min:
+        raise PreflightError(
+            "expo_decoupled needs critic_num_qs >= 2 * critic_num_min_qs "
+            f"(got {num_qs} < 2*{num_min})"
+        )
+    act = str(algorithm.get("rl_algo_act") or "").lower()
+    mode = str(model.get("action_selection_mode", "expo")).lower()
+    if act:
+        expected = "expo" if act == "expo" else "original"
+        if act not in ("expo", "td3"):
+            raise PreflightError(
+                f"algorithm.rl_algo_act must be expo or td3, got {act!r}"
+            )
+        if mode != expected:
+            raise PreflightError(
+                f"algorithm.rl_algo_act={act!r} requires "
+                f"actor.model.action_selection_mode={expected!r}, got {mode!r}"
+            )
+
+
 def report_reference_deviations(
     values: dict[str, Any],
     reference: dict[str, Any],

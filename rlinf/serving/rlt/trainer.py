@@ -79,6 +79,14 @@ class RLTStage2Trainer(RLTLearnerCore):
         if self.target_update_type not in ("all", "q_head_only"):
             raise ValueError(f"{self.target_update_type=} is not supported")
         self.critic_actor_ratio = int(cfg.algorithm.get("critic_actor_ratio", 1))
+        # TD3 delayed target: Polyak-update only on the actor step, not after
+        # every critic-only update. The previous default (every critic step)
+        # moved the targets twice as often as the actor when
+        # critic_actor_ratio=2.
+        self.target_update_on_actor_step = bool(
+            cfg.algorithm.get("target_update_on_actor_step", True)
+        )
+        self._validate_td_backup_ensemble()
         self.tau = float(cfg.algorithm.tau)
         self.batch_size = int(cfg.actor.global_batch_size)
 
@@ -355,8 +363,14 @@ class RLTStage2Trainer(RLTLearnerCore):
                 }
             )
 
-        if self.update_step % int(self.cfg.algorithm.get("target_update_freq", 1)) == 0:
+        update_targets = train_actor or not self.target_update_on_actor_step
+        if (
+            update_targets
+            and self.update_step % int(self.cfg.algorithm.get("target_update_freq", 1))
+            == 0
+        ):
             self.soft_update_target_model()
+        metrics["target_updated"] = float(update_targets)
         return metrics
 
     def _sample_batch(self) -> dict[str, Any]:

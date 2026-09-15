@@ -142,6 +142,10 @@ class RLTStage2Policy:
         save_dir: Directory for periodic checkpoints, or ``None`` to disable.
         save_interval_episodes: Episodes between checkpoints.
         eval_only: Never train, never write replay; evaluate the loaded policy.
+        store_eval_episodes: When true, in-training eval episodes still write
+            replay (``eval_only`` stays a whole-run mute).
+        eval_interval_episodes: Schedule a deterministic eval episode after
+            every N completed training episodes. ``0`` disables.
         replay_action_space: ``"normalized"`` or ``"robot"``.
         metric_logger: Optional callable receiving each metrics dict.
     """
@@ -158,6 +162,8 @@ class RLTStage2Policy:
         save_dir: str | None = None,
         save_interval_episodes: int = 10,
         eval_only: bool = False,
+        store_eval_episodes: bool = False,
+        eval_interval_episodes: int = 0,
         replay_action_space: str = ACTION_SPACE_NORMALIZED,
         metric_logger=None,
     ) -> None:
@@ -173,6 +179,11 @@ class RLTStage2Policy:
         self.save_dir = save_dir
         self.save_interval_episodes = max(1, int(save_interval_episodes))
         self.eval_only = bool(eval_only)
+        self.store_eval_episodes = bool(store_eval_episodes)
+        self.eval_interval_episodes = max(0, int(eval_interval_episodes))
+        self._eval_pending = False
+        self._eval_episode_active = False
+        self._total_eval_episodes = 0
         self.vla_only = bool(metadata.vla_only)
         if self.vla_only and not self.eval_only:
             raise ValueError("VLA-only serving requires eval_only=True")
@@ -270,6 +281,8 @@ class RLTStage2Policy:
         self._pending.clear()
         self._episode.reset()
         self._chunk_id = 0
+        self._eval_pending = False
+        self._eval_episode_active = False
         # Advance the episode as well. Chunk ids restart at 1, so reusing the
         # episode id would re-issue (session, episode, chunk) triples that are
         # already committed; the learner's dedup set would then drop the new
@@ -281,15 +294,18 @@ class RLTStage2Policy:
     def _act(self, request: ActRequest) -> dict[str, Any]:
         # Reuse the reference-only path, but never turn evaluation into warmup
         # collection or allow a random/untrained critic to select an action.
+        self._maybe_begin_eval_episode()
         warmup = self.in_warmup or self.vla_only
         rlt_obs = self.inference.encode(request.observation)
         selection = self.inference.select_action(
             rlt_obs,
             warmup=warmup,
-            deterministic=self.eval_only,
+            deterministic=self.eval_only or self._eval_episode_active,
             exploration_noise_sigma=request.exploration_noise_sigma,
         )
-        mode = "eval" if self.vla_only else selection.mode
+        mode = (
+            "eval" if (self.vla_only or self._eval_episode_active) else selection.mode
+        )
 
         self._chunk_id += 1
         identity = ChunkIdentity(
@@ -360,6 +376,14 @@ class RLTStage2Policy:
                 "ok": True,
                 "stored": False,
                 "reason": "eval_only",
+                "transition_id": request.transition_id,
+                **self._status(),
+            }
+        if pending.mode == "eval" and not self.store_eval_episodes:
+            return {
+                "ok": True,
+                "stored": False,
+                "reason": "eval_episode",
                 "transition_id": request.transition_id,
                 **self._status(),
             }
@@ -455,11 +479,11 @@ class RLTStage2Policy:
         """Apply an operator rewind decision to already-stored replay rows."""
         chunks = request.chunks_rewound if mode == "exit" else request.bad_chunks
         prefix_reward = getattr(request, "prefix_reward", 0.0)
-        if self.eval_only:
+        if self.eval_only or self._eval_episode_active:
             return {
                 "ok": True,
                 "applied": False,
-                "reason": "eval_only",
+                "reason": "eval_only" if self.eval_only else "eval_episode",
                 **self._status(),
             }
         if request.terminal_reward == 0.0:
@@ -519,7 +543,8 @@ class RLTStage2Policy:
 
         metrics: dict[str, float] = {}
         updates = 0
-        if not self.eval_only:
+        was_eval_episode = self._eval_episode_active
+        if not self.eval_only and not was_eval_episode:
             updates = self._episode.train_chunks * self.utd_ratio
             if updates > 0:
                 metrics = self.trainer.train(updates)
@@ -531,6 +556,26 @@ class RLTStage2Policy:
                 )
 
         self._total_episodes += 1
+        if was_eval_episode:
+            self._total_eval_episodes += 1
+            self._eval_episode_active = False
+            logger.info(
+                "Finished EVAL episode %d (replay write follows store_eval_episodes)",
+                self._total_eval_episodes,
+            )
+        elif (
+            self.eval_interval_episodes > 0
+            and not self.eval_only
+            and not self.in_warmup
+            and self._total_episodes % self.eval_interval_episodes == 0
+        ):
+            self._eval_pending = True
+            logger.info(
+                "episode_end: scheduled EVAL next (eval_interval_episodes=%d, "
+                "train_episodes=%d)",
+                self.eval_interval_episodes,
+                self._total_episodes,
+            )
         episode_metrics = {
             "env/episode_reward": self._episode.reward,
             "env/episode_chunks": float(self._episode.chunks),
@@ -538,7 +583,17 @@ class RLTStage2Policy:
             "env/episode_interventions": float(self._episode.interventions),
             "env/episode_success": float(bool(stats.get("success", False))),
             "rlt/updates_this_episode": float(updates),
+            "env/is_eval_episode": float(was_eval_episode),
         }
+        if was_eval_episode:
+            episode_metrics.update(
+                {
+                    "eval/episode_reward": self._episode.reward,
+                    "eval/episode_chunks": float(self._episode.chunks),
+                    "eval/episode_success": float(bool(stats.get("success", False))),
+                    "eval/total_eval_episodes": float(self._total_eval_episodes),
+                }
+            )
         if self.metric_logger is not None:
             self.metric_logger({**episode_metrics, **metrics})
 
@@ -601,7 +656,28 @@ class RLTStage2Policy:
             "max_episode_chunks": self.max_episode_chunks,
             "pending": len(self._pending),
             "eval_only": self.eval_only,
+            "eval_interval_episodes": self.eval_interval_episodes,
+            "eval_pending": self._eval_pending,
+            "is_eval_episode": self.eval_only or self._eval_episode_active,
+            "store_eval_episodes": self.store_eval_episodes,
+            "total_eval_episodes": self._total_eval_episodes,
             "episode_id": self._episode_id,
             "session_id": self._session_id,
             "chunk_id": self._chunk_id,
         }
+
+    def _maybe_begin_eval_episode(self) -> None:
+        """Activate a pending eval episode on the first post-warmup act."""
+        if (
+            self.eval_only
+            or self._eval_episode_active
+            or not self._eval_pending
+            or self.in_warmup
+        ):
+            return
+        self._eval_episode_active = True
+        self._eval_pending = False
+        logger.info(
+            "Beginning EVAL episode %d (deterministic, no UTD)",
+            self._total_eval_episodes + 1,
+        )

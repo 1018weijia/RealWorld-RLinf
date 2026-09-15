@@ -39,6 +39,7 @@ from rlinf.serving.rlt.preflight import (
     PreflightError,
     check_camera_layout,
     check_norm_stats_configured,
+    check_stage2_algorithm,
     check_task_prompt,
     read_rlt_prefix_seq_len,
     resolve_stage1_weights,
@@ -486,6 +487,46 @@ def test_eval_only_never_writes_replay_or_trains():
     assert trainer.train_calls == []
 
 
+def test_eval_episode_writes_replay_without_updates():
+    policy, trainer, inference = build_policy(
+        warmup_steps=0,
+        eval_interval_episodes=1,
+        store_eval_episodes=True,
+    )
+    commit(policy, act(policy)["transition_id"])
+    end = policy.infer({REQUEST_KEY: REQUEST_EPISODE_END, "stats": {}})
+    assert end["eval_pending"] is True
+    assert trainer.train_calls == [3]
+
+    response = act(policy)
+    assert response["mode"] == "eval"
+    assert response["is_eval_episode"] is True
+    stored = commit(policy, response["transition_id"])
+    assert stored["stored"] is True
+    assert len(trainer.transitions) == 2
+    end_eval = policy.infer(
+        {REQUEST_KEY: REQUEST_EPISODE_END, "stats": {"success": True}}
+    )
+    assert end_eval["updates_run"] == 0
+    assert trainer.train_calls == [3]
+    assert end_eval["total_eval_episodes"] == 1
+    assert inference.select_calls[-1]["deterministic"] is True
+
+
+def test_eval_episode_skips_replay_when_store_disabled():
+    policy, trainer, _ = build_policy(
+        warmup_steps=0,
+        eval_interval_episodes=1,
+        store_eval_episodes=False,
+    )
+    commit(policy, act(policy)["transition_id"])
+    policy.infer({REQUEST_KEY: REQUEST_EPISODE_END, "stats": {}})
+    stored = commit(policy, act(policy)["transition_id"])
+    assert stored["stored"] is False
+    assert stored["reason"] == "eval_episode"
+    assert len(trainer.transitions) == 1
+
+
 def test_checkpoints_land_on_the_configured_episode_interval(tmp_path):
     policy, trainer, _ = build_policy(
         warmup_steps=0, save_dir=str(tmp_path), save_interval_episodes=2
@@ -610,6 +651,25 @@ def test_preflight_rejects_placeholder_prompts_and_camera_mismatch():
         check_camera_layout(CAMERA_KEYS, 2)
     with pytest.raises(PreflightError, match="Duplicate"):
         check_camera_layout(("image", "image", "side_image"), 3)
+
+
+def test_preflight_rejects_expo_decoupled_on_twin_q():
+    cfg = OmegaConf.create(
+        {
+            "algorithm": {"rl_algo_td_backup": "expo_decoupled", "rl_algo_act": "expo"},
+            "actor": {
+                "model": {
+                    "action_selection_mode": "expo",
+                    "critic_num_qs": 2,
+                    "critic_num_min_qs": 2,
+                }
+            },
+        }
+    )
+    with pytest.raises(PreflightError, match="2 \\* critic_num_min_qs"):
+        check_stage2_algorithm(cfg)
+    cfg.actor.model.critic_num_qs = 10
+    check_stage2_algorithm(cfg)
 
 
 # --------------------------------------------------------------- client loop
