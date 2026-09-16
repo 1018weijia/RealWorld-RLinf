@@ -10,6 +10,7 @@
 > **修复更新：2026-09-11**，对应提交 `6694f646`、`cea7a95b`、`a367c566`、`76854a49`，以及其后未单独提交的 P1-11 ROS import 清理和 actor preference loss。
 > **对照更新：2026-09-14**，对照远端 `exp/config.yaml`、`exp/stage2_server_shuo_rlinf.sh`、`exp/stage2_client_shuo_sync.sh`。客户端不要同步；服务端能迁的按 0.5 节 A–E 做完。
 > **盘点：2026-09-15**，当前结论、已落地改动、未决问题和残留冗余见 **第 0.6 节**。第 0.2–0.5 节保留审查当时的条目，其中 0.5 的 1–8 条已按落地结果改状态。
+> **USB 在线：2026-09-16**，云机 resume Cal-QL 后常驻 `8016`；跨机合同与空等见 **第 0.7 节**。客户端逐步操作见 `examples/embodiment/xrobot-stage2-robot-quickstart.md` 的「USB 客户端」。
 
 ## 0. 修复状态（2026-09-11 更新）
 
@@ -309,7 +310,7 @@ Ray 真机路径弃用，改为单进程 WS。八种请求、`transition_id` pen
 | 等客户端 | **F 滑窗** | 协议没有 mid-chunk 观测字段。 |
 | 不迁 | **Ray `cobot_rlt_stage2_td3_mlp.yaml`** | 仍走 `RLTTD3LossMixin`，读 `algorithm.expo.enable` / `actor_agg_q`，不走 `RLTLearnerCore` 的 backup。真机不要用这条。 |
 | 分叉留下 | **PER 默认开** | 不要为了对齐关掉。 |
-| 未接线 | **在线混离线 / Cal-QL** | `RLTOfflineTrainer` 有代码，WS YAML 没挂 `offline_sample_ratio`。 |
+| 未接线 | **在线混离线 / Cal-QL** | USB `start_xrobot_stage2.sh usb_plug train` 已挂 `offline_sample_ratio=0.1`；Cobot WS YAML 仍没挂。 |
 | 未做 | **两边固定 batch 的 loss 数值对照** | 第 12 节完成条件。要对着 `rlt-openpi` 取数，还没做。 |
 
 `rewind_preference.rewind_*_reward` 三个键从来不是服务端 loss：客户端 rewind 请求自己带 terminal/prefix reward。不是未实现，是死键。
@@ -332,6 +333,27 @@ Ray 真机路径弃用，改为单进程 WS。八种请求、`transition_id` pen
 | `rlinf/serving/rlt/cobot_offline_data.py` | 离线 Cobot LeRobot | 不在 WS 热路径；以后再改名 |
 
 本轮**没有**再删这些死键，避免和 Ray 配置的 diff 搅在一起。真机路径以 WS YAML 的活旋钮为准。
+
+### 0.7 2026-09-16 USB 云机常驻与客户端
+
+USB 不走套环启动器，也不走 Cobot launcher（后者会把 chunk 打成 30、residual 打成 0.3）。
+
+已完成的路径：
+
+1. 本机非重叠 50 步 convert + Cal-QL 4 万步，buffer 在 `offline_rl_buffers/xrobot_usb_plug/`，WandB project `xrobot-usb-offline`。
+2. 资产拷到云机 `/mnt/data/lfwj/realworldRL`（Stage 1 `full_weights.pt`、USB `norm_stats.json`、`offline_step_40000`）。不要拷 LeRobot 全集。
+3. 跨机合同曾拒收：buffer 里写死了源机 `model_path` / `norm_stats_path` / `weights_mtime_ns`。处理：改这三处本机字段（先核 `weights_size` 和 `norm_sha256`），或拉忽略路径/mtime 的新代码。
+4. 云机 `STAGE2_RESUME_DIR=.../offline_step_40000` + `usb_plug train`，听 `0.0.0.0:8016`。`warmup 250 rows` 只是打印；`offline_total_updates>0` 时第一回合就是 residual。
+5. 在线训练要等机器人 `episode_end`。server 空等几小时没有问题。SSH `34133` 和 WS `8016` 不是同一口，打不通就在机器人侧 `-L 8016:127.0.0.1:8016`。
+
+客户端（机器人，GPU 已 ready 之后）：
+
+1. 需要时先打隧道，然后 `RLT_UPSTREAM_URI=ws://<GPU或127.0.0.1>:8016`，`RLT_TASK_PROMPT="Bimanual usb pick and insert"`。
+2. 先 probe（不设 `RLT_EE_ALLOW_MOTION`），DesktopClient 模型地址 `127.0.0.1:33057`，确认没有 `ProtocolError`。
+3. 再开 V2 适配器，再 `--stop` 后带 `RLT_EE_ALLOW_MOTION=true` 重拉 bridge，最后开一个没用过的 V2 session。
+4. V2：`s` 接管，`f` 成功。每轮必须收尾，否则 server 不训练。
+
+操作文档：`examples/embodiment/xrobot-stage2-gpu-quickstart.md` 第 10 节；`examples/embodiment/xrobot-stage2-robot-quickstart.md` 「USB 客户端」。
 
 ## 1. 目标
 

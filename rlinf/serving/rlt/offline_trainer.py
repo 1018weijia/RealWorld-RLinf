@@ -27,7 +27,12 @@ import torch.nn.functional as F
 
 from rlinf.algorithms.rlt.learner import _optional_float
 from rlinf.algorithms.rlt.losses import compute_rlt_critic_loss
-from rlinf.serving.rlt.cobot_offline_data import OfflineBuffer, atomic_save, contract
+from rlinf.serving.rlt.cobot_offline_data import (
+    OfflineBuffer,
+    atomic_save,
+    contract,
+    contract_mismatch,
+)
 from rlinf.serving.rlt.trainer import RLTStage2Trainer
 
 
@@ -78,9 +83,11 @@ class RLTOfflineTrainer(RLTStage2Trainer):
                 adjusted["actor_model"][key] = expected["actor_model"][key]
         else:
             adjusted = actual
-        if adjusted != expected:
+        mismatch = contract_mismatch(expected, adjusted)
+        if mismatch:
             raise ValueError(
-                "Offline buffer differs from current task/Stage1/norm stats/Stage2 configuration"
+                "Offline buffer differs from current task/Stage1/norm stats/"
+                f"Stage2 configuration: {mismatch}"
             )
         if actual != expected:
             # Keep the source contract and arrays untouched. Checkpoint copies

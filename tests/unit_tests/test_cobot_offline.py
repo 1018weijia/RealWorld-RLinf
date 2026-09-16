@@ -30,7 +30,9 @@ from rlinf.serving.rlt.cobot_offline_data import (
     OfflineBuffer,
     concatenate,
     contract,
+    contract_mismatch,
     convert_episode,
+    portable_contract,
 )
 from rlinf.serving.rlt.offline_trainer import (
     RLTOfflineTrainer,
@@ -322,3 +324,46 @@ def test_native_offline_train_resume_and_online_update(
         fresh.offline_mode = True
         with pytest.raises(ValueError, match="differs"):
             fresh.attach_offline_buffer(bad, allow_actor_reconfiguration=True)
+    relocated = copy.deepcopy(payload)
+    relocated["contract"]["feature_model"]["model_path"] = "/relocated/ckpt"
+    relocated["contract"]["feature_model"]["openpi_data"]["norm_stats_path"] = (
+        "/relocated/stats.json"
+    )
+    relocated["contract"]["weights_mtime_ns"] = 1
+    moved = make()
+    moved.offline_mode = True
+    moved.attach_offline_buffer(
+        relocated, allow_actor_reconfiguration=reconfigure
+    )
+    assert moved.offline_buffer.payload["contract"] == contract(cfg)
+    size_mismatch = copy.deepcopy(relocated)
+    size_mismatch["contract"]["weights_size"] = 0
+    blocked = make()
+    blocked.offline_mode = True
+    with pytest.raises(ValueError, match="weights_size"):
+        blocked.attach_offline_buffer(
+            size_mismatch, allow_actor_reconfiguration=reconfigure
+        )
+
+
+def test_portable_contract_ignores_host_local_fields():
+    left = {
+        "task": "Bimanual usb pick and insert",
+        "weights_size": 16400120808,
+        "weights_mtime_ns": 111,
+        "norm_sha256": "abc",
+        "gamma": 0.99,
+        "feature_model": {
+            "model_path": "/host/a/global_step_20000",
+            "openpi_data": {"norm_stats_path": "/host/a/norm_stats.json", "repo_id": "x"},
+        },
+        "actor_model": {"residual_scale": 0.4},
+    }
+    right = copy.deepcopy(left)
+    right["weights_mtime_ns"] = 222
+    right["feature_model"]["model_path"] = "/host/b/global_step_20000"
+    right["feature_model"]["openpi_data"]["norm_stats_path"] = "/host/b/norm_stats.json"
+    assert portable_contract(left) != left
+    assert contract_mismatch(left, right) == []
+    right["weights_size"] = 1
+    assert contract_mismatch(left, right) == ["weights_size"]

@@ -157,45 +157,92 @@ STAGE2_RESUME_DIR=/data/gxy/realworldRL/offline_rl_buffers/xrobot_usb_plug/pretr
 
 转换输出默认 `/data/gxy/realworldRL/offline_rl_buffers/xrobot_usb_plug/offline_buffer.pt`。Cal-QL 日志在同目录 `pretrain_*`。WandB project 是 `xrobot-usb-offline`（需要 `.private-xrobot-stage2/wandb_api_key`）。数据集没有 `episode_success` 时全部当成功。round-trip 失败或 `demo_reachable_fraction` 过低先停，不要只看 BC loss。不要用 GPU 6（Stage 1 还在跑）。
 
-## 10. USB 在线联调（Cal-QL 之后）
+## 10. USB 在线：常驻 server → 等客户端
 
-套环仍用上面第 3 节的 `xrobot_ee_rlt_stage2_ws_server`（端口 **8000**、prompt `put ring on the rod`）。USB 用独立启动器和端口 **8016**，prompt 必须是 `Bimanual usb pick and insert`。
+套环仍用第 3 节（端口 **8000**、`put ring on the rod`）。USB 用 `start_xrobot_stage2.sh`、端口 **8016**、prompt `Bimanual usb pick and insert`。不要用 Cobot 启动器（会把 chunk 打成 30、residual 打成 0.3）。
 
-Cal-QL 已经写进 `offline_total_updates`，resume 后**不会**再采 250 行 warmup，第一回合就是 residual actor。第 8 节「与 Stage 1 逐元素相同」只适用于零初始化 residual，**这次对不上是正常的**。
+Cal-QL 已经写进 `offline_total_updates`，resume 后**不会**再采 250 行 warmup。日志里的 `warmup 250 rows` 只是配置打印。第一回合就是 residual actor。第 8 节「必须与 Stage 1 逐元素相同」这次**对不上是正常的**。
 
-GPU 侧（先 `nvidia-smi` 选空闲卡，避开 GPU 6）：
+在线训练只在机器人发来 `episode_end` 之后才走。server 起来后可以空等几小时，没有客户端就不会迭代。
+
+### 10.1 云机资产与合同
+
+跨机拷贝（rsync / ModelScope）之后，`offline_step_40000/offline_buffer.pt` 里仍可能写着源机的 `model_path`、`norm_stats_path`、`weights_mtime_ns`。旧代码会报：
+
+```text
+ValueError: Offline buffer differs from current task/Stage1/norm stats/Stage2 configuration
+```
+
+新代码只核 task、actor、gamma、norm sha256、weights size，忽略路径和 mtime。若远端还是旧代码，先把合同改成本机路径（size 和 sha256 对不上就停，不要硬改）：
 
 ```bash
-cd /data/gxy/realworldRL/RLinf
+cd /mnt/data/lfwj/realworldRL/RLinf
+source .venv/bin/activate
+python3 - <<'PY'
+from pathlib import Path
+import hashlib, shutil, torch
+
+resume = Path("/mnt/data/lfwj/realworldRL/offline_rl_buffers/xrobot_usb_plug/offline_step_40000")
+model_path = Path("/mnt/data/lfwj/realworldRL/checkpoints/usb_stage1/global_step_20000")
+stats = Path("/mnt/data/lfwj/realworldRL/assets/xrobot/usb_plug/norm_stats.json")
+weights = model_path / "actor/model_state_dict/full_weights.pt"
+buf = resume / "offline_buffer.pt"
+digest = hashlib.sha256(stats.read_bytes()).hexdigest()
+payload = torch.load(buf, map_location="cpu", weights_only=False)
+c = payload["contract"]
+assert c["weights_size"] == weights.stat().st_size
+assert c["norm_sha256"] == digest
+c["feature_model"]["model_path"] = str(model_path)
+c["feature_model"]["openpi_data"]["norm_stats_path"] = str(stats)
+c["weights_mtime_ns"] = weights.stat().st_mtime_ns
+bak = buf.with_suffix(".pt.bak")
+if not bak.exists():
+    shutil.copy2(buf, bak)
+tmp = buf.with_suffix(".pt.tmp")
+torch.save(payload, tmp)
+tmp.replace(buf)
+print("rewrote", buf)
+PY
+```
+
+What this does: 1. 核对 Stage 1 文件大小和 norm hash 2. 把三处本机字段改成云机路径 3. 留 `.bak` 再覆盖。
+
+`paths.env` 指向同一套文件：
+
+```bash
+XROBOT_USB_STAGE1_CHECKPOINT=/mnt/data/lfwj/realworldRL/checkpoints/usb_stage1/global_step_20000
+XROBOT_USB_NORM_STATS=/mnt/data/lfwj/realworldRL/assets/xrobot/usb_plug/norm_stats.json
+XROBOT_OFFLINE_BUFFER_ROOT=/mnt/data/lfwj/realworldRL/offline_rl_buffers
+XROBOT_USB_OFFLINE_BUFFER=/mnt/data/lfwj/realworldRL/offline_rl_buffers/xrobot_usb_plug/offline_step_40000/offline_buffer.pt
+```
+
+### 10.2 常驻 train
+
+放进 tmux，先 `nvidia-smi` 选空闲卡：
+
+```bash
+cd /mnt/data/lfwj/realworldRL/RLinf
 source .venv/bin/activate
 
-STAGE2_RESUME_DIR=/data/gxy/realworldRL/offline_rl_buffers/xrobot_usb_plug/pretrain_20260915_101150/checkpoints/offline_step_40000 \
-  CUDA_VISIBLE_DEVICES=? \
+STAGE2_RESUME_DIR=/mnt/data/lfwj/realworldRL/offline_rl_buffers/xrobot_usb_plug/offline_step_40000 \
   bash examples/embodiment/start_xrobot_stage2.sh usb_plug train
 ```
 
-等到这行再让机器人连：
+本机 Cal-QL 目录若还在 `pretrain_*/checkpoints/offline_step_40000`，把 `STAGE2_RESUME_DIR` 指过去即可。等到：
 
 ```text
-RLT Stage 2 server ready on 0.0.0.0:8016
 Resuming Stage 2 state from .../offline_step_40000
+RLT Stage 2 server ready on 0.0.0.0:8016 (warmup 250 rows, utd 5)
+RLinf websocket policy server listening on 0.0.0.0:8016
 ```
 
-机器人侧顺序不变（先 probe，再 V2 适配器，再允许动作），但上游和任务必须改成 USB：
+空等时不要杀进程、不要再启一份（端口会撞）、不要让 SSH 把进程带走。
+
+云机 SSH 口和 WebSocket 口不是同一个。SSH 若是 `34133`，机器人往往打不到 `8016`。在机器人或跳板上先建隧道：
 
 ```bash
-RLT_UPSTREAM_URI=ws://<GPU_IP>:8016 \
-  RLT_TASK_PROMPT="Bimanual usb pick and insert" \
-  bash toolkits/inference/run_xrobot_rlt_ee_bridge.sh
+ssh -p 34133 -N -L 8016:127.0.0.1:8016 root@<GPU_HOST>
 ```
 
-真机动作：
-
-```bash
-RLT_EE_ALLOW_MOTION=true \
-  RLT_UPSTREAM_URI=ws://<GPU_IP>:8016 \
-  RLT_TASK_PROMPT="Bimanual usb pick and insert" \
-  bash toolkits/inference/run_xrobot_rlt_ee_bridge.sh
-```
-
-DesktopClient 模型地址仍是 `127.0.0.1:33057`。V2 按键与套环相同：`s` 是接管，`f` 是成功。先 probe 一轮确认没有 `ProtocolError`，再放动作；第一、二条看夹爪和动作是否还像插 USB。
+然后 bridge 连 `ws://127.0.0.1:8016`。客户端逐步操作见
+[xrobot-stage2-robot-quickstart.md](xrobot-stage2-robot-quickstart.md) 的「USB 客户端」。

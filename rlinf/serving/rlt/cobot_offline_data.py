@@ -245,6 +245,46 @@ def contract(cfg) -> dict:
     }
 
 
+def portable_contract(identity: dict) -> dict:
+    """Drop host-local fields so a copied checkpoint can resume on another machine.
+
+    Absolute Stage 1 / norm paths and ``mtime`` change after rsync or ModelScope.
+    Feature identity is the weight size, norm hash, task, and model hyperparameters.
+    """
+    import copy
+
+    portable = copy.deepcopy(identity)
+    portable.pop("weights_mtime_ns", None)
+    feature = portable.get("feature_model")
+    if isinstance(feature, dict):
+        feature.pop("model_path", None)
+        openpi_data = feature.get("openpi_data")
+        if isinstance(openpi_data, dict):
+            openpi_data.pop("norm_stats_path", None)
+    return portable
+
+
+def contract_mismatch(expected: dict, actual: dict) -> list[str]:
+    """Return dotted keys that differ after stripping host-local fields."""
+    left, right = portable_contract(expected), portable_contract(actual)
+    mismatches = []
+
+    def walk(prefix: str, a, b) -> None:
+        if type(a) is not type(b) or a != b and not isinstance(a, dict):
+            mismatches.append(prefix or "<root>")
+            return
+        if isinstance(a, dict):
+            for key in sorted(set(a) | set(b)):
+                name = f"{prefix}.{key}" if prefix else str(key)
+                if key not in a or key not in b:
+                    mismatches.append(name)
+                else:
+                    walk(name, a[key], b[key])
+
+    walk("", left, right)
+    return mismatches
+
+
 class CobotLeRobotV3:
     """Read named dual-arm joints and per-episode video offsets from v3 shards."""
 
