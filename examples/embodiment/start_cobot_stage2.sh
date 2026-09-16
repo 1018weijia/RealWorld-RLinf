@@ -29,10 +29,10 @@ export WANDB_CONFIG_DIR="$private/wandb/$task/config"
 export WANDB_CACHE_DIR="$private/wandb/$task/cache"
 export WANDB_DIR="$private/wandb/$task/runs"
 export WANDB_PROJECT="cobot-stage2-$task"
-export WANDB_MODE=online WANDB_BASE_URL=https://api.wandb.ai
+export WANDB_MODE="${RLT_WANDB_MODE:-online}" WANDB_BASE_URL=https://api.wandb.ai
 export PYTHONPATH="$root${PYTHONPATH:+:$PYTHONPATH}"
 export MUJOCO_GL=egl CUBLAS_WORKSPACE_CONFIG=:4096:8
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-6}"
 umask 077
 mkdir -p "$WANDB_CONFIG_DIR" "$WANDB_CACHE_DIR" "$WANDB_DIR"
 out="${RLT_RUN_DIR:-$root/results/cobot_stage2_${task}/$(date +%Y%m%d_%H%M%S)}"
@@ -74,10 +74,9 @@ if [[ "$mode" == "audit" || "$mode" == "convert" || "$mode" == "offline" ]]; the
         "+offline.allow_actor_reconfiguration=${RLT_COBOT_ALLOW_ACTOR_RECONFIGURATION:-false}"
         "+offline.validation_every=${VALIDATION_EVERY:-500}" "+offline.save_every=${SAVE_EVERY:-5000}")
 fi
-# Training and serving must instantiate the same actor. Conversion keeps the
-# original feature contract; fresh training can explicitly reuse that cache.
-if [[ "$mode" == "offline" || "$mode" == "train" || "$mode" == "eval" || "$mode" == "eval-stage1" || "$mode" == "preflight" ]]; then
-    args+=("actor.model.actor_noise_sigma=${RLT_COBOT_ACTOR_NOISE_SIGMA:-0.1}"
+# Conversion/training/serving use the identical motion and noise contract.
+if [[ "$mode" != "eval-stage1" ]]; then
+    args+=("actor.model.actor_noise_sigma=${RLT_COBOT_ACTOR_NOISE_SIGMA:-0.025}"
         "actor.model.residual_scale=${RLT_COBOT_RESIDUAL_SCALE:-0.3}")
 fi
 if [[ "$mode" == "train" || "$mode" == "eval" ]]; then
@@ -93,7 +92,7 @@ if [[ "$mode" == "train" || "$mode" == "eval" ]]; then
 fi
 cd "$root"
 exec "$root/.venv/bin/python" "examples/embodiment/$entry" \
-    --config-path "$root/examples/embodiment/config" --config-name cobot_rlt_stage2_ws_server \
+    --config-path "$root/examples/embodiment/config" --config-name cobot_joint_motion_v2 \
     "server.host=${RLT_SERVER_BIND:-0.0.0.0}" "server.port=${RLT_SERVER_PORT:-$port}" \
     "server.task_prompt=$prompt" "rlt_feature_model.openpi_data.default_prompt=$prompt" \
     "rlt_feature_model.model_path=$checkpoint" "rlt_feature_model.openpi_data.norm_stats_path=$stats" \

@@ -1,0 +1,30 @@
+# Opt-in Cobot joint trajectory version, based on the validated 50/30 TD3 path.
+defaults:
+  - cobot_rlt_stage2_ws_server
+  - _self_
+
+server:
+  robot_type: cobot_magic
+  action_schema: cobot-joint14-motion-v2
+  check_reference_hyperparameters: False
+
+algorithm:
+  # Preserve actually executed HIL/rewind actions in critic regression. Franka's
+  # independent normalized per-step augmentation violates this motion contract.
+  intervention_critic_action_noise_sigma: 0.0
+  intervention_critic_action_noise_clip: 0.0
+  rewind_critic_action_noise_sigma: 0.0
+  rewind_critic_action_noise_clip: 0.0
+
+actor:
+  model:
+    actor_noise_sigma: 0.025
+    joint_motion:
+      version: cobot-joint-motion-v2
+      control_hz: 30
+      base_limit_fraction: 0.8
+      residual_knots: 6
+      # Left J1..J6, then right J1..J6. Grippers keep Stage1 targets.
+      residual_rad: [0.04, 0.04, 0.04, 0.03, 0.03, 0.02, 0.04, 0.04, 0.04, 0.03, 0.03, 0.02]
+      velocity_rad_s: [0.6, 0.6, 0.6, 0.8, 0.8, 0.8, 0.6, 0.6, 0.6, 0.8, 0.8, 0.8]
+      acceleration_rad_s2: [3, 3, 3, 4, 4, 4, 3, 3, 3, 4, 4, 4]

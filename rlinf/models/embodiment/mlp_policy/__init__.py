@@ -41,7 +41,21 @@ def get_model(cfg: DictConfig, torch_dtype=torch.bfloat16):
             fixed_std=cfg.get("fixed_std", 0.002),
         )
     elif cfg.model_type == "rlt_td3_mlp_policy":
-        model = RLTTD3MLPPolicy(
+        policy_class = RLTTD3MLPPolicy
+        extra = {}
+        if cfg.get("joint_motion") is not None:
+            from omegaconf import OmegaConf
+
+            from rlinf.models.embodiment.mlp_policy.cobot_joint_policy import (
+                CobotJointTD3Policy,
+            )
+
+            policy_class = CobotJointTD3Policy
+            extra["joint_motion"] = OmegaConf.to_container(
+                cfg.joint_motion, resolve=True
+            )
+        model = policy_class(
+            **extra,
             z_dim=cfg.z_dim,
             proprio_dim=cfg.proprio_dim,
             action_dim=cfg.action_dim,

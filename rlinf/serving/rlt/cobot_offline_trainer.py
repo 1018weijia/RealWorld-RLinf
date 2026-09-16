@@ -138,15 +138,23 @@ class CobotOfflineTrainer(RLTStage2Trainer):
         if count < 1 or random_count < 1:
             raise ValueError("Cal-QL requires policy and local-random proposals")
         with torch.no_grad():
-            policy = torch.stack(
-                [
-                    model.actor(
-                        state, ref, deterministic=False, apply_action_noise=True
-                    )
-                    for _ in range(count)
-                ],
-                dim=1,
-            )
+            if getattr(model, "joint_motion", None) is not None:
+                policy = model.actor(
+                    state.repeat_interleave(count, dim=0),
+                    ref.repeat_interleave(count, dim=0),
+                    deterministic=False,
+                    apply_action_noise=True,
+                ).reshape(len(ref), count, -1)
+            else:
+                policy = torch.stack(
+                    [
+                        model.actor(
+                            state, ref, deterministic=False, apply_action_noise=True
+                        )
+                        for _ in range(count)
+                    ],
+                    dim=1,
+                )
             noise = (
                 torch.rand(len(ref), random_count, ref.shape[-1], device=self.device)
                 * 2
@@ -156,6 +164,8 @@ class CobotOfflineTrainer(RLTStage2Trainer):
                 ref[:, None]
                 + noise * float(self.offline_options.get("random_scale", 0.2))
             ).clamp(model.action_clip_min, model.action_clip_max)
+            if getattr(model, "joint_motion", None) is not None:
+                random = model.local_random_candidates(obs, random_count, reference=ref)
             other = torch.cat([model._get_ref_candidates(obs), random], dim=1)
 
         def q(actions):
@@ -233,6 +243,10 @@ class CobotOfflineTrainer(RLTStage2Trainer):
             reference - model.actor.edit_scale,
         )
         target = target.clamp(model.action_clip_min, model.action_clip_max)
+        if getattr(model, "joint_motion", None) is not None:
+            target = model.demo_target(
+                data["curr_obs"], data["actions"], reference=reference
+            ).detach()
         success = data["success"].float().reshape(-1)
         bc = (
             F.mse_loss(prediction, target, reduction="none").mean(-1) * success
@@ -253,6 +267,22 @@ class CobotOfflineTrainer(RLTStage2Trainer):
         loss = bc_weight * bc + q_weight * q_loss
         if not torch.isfinite(loss):
             raise FloatingPointError("Non-finite actor loss")
+        reachable = (
+            ((data["actions"] - reference).abs() <= model.actor.edit_scale)
+            .all(-1)
+            .float()
+            .mean()
+        )
+        if getattr(model, "joint_motion", None) is not None:
+            from rlinf.models.embodiment.mlp_policy.cobot_joint_motion import ARM
+
+            motion = model.joint_motion
+            scale, _, _ = motion.context(state)
+            delta = (
+                (data["actions"] - reference).reshape(-1, motion.chunk_len, 14)
+                * scale[:, None]
+            )[:, :, ARM]
+            reachable = (delta.abs() <= motion.residual_rad).float().mean()
         return (
             loss,
             torch.zeros((), device=self.device),
@@ -262,12 +292,7 @@ class CobotOfflineTrainer(RLTStage2Trainer):
                 "bc_weight": bc_weight,
                 "q_weight": q_weight,
                 "success_fraction": float(success.mean()),
-                "demo_reachable_fraction": float(
-                    ((data["actions"] - reference).abs() <= model.actor.edit_scale)
-                    .all(-1)
-                    .float()
-                    .mean()
-                ),
+                "demo_reachable_fraction": float(reachable),
             },
         )
 
@@ -285,7 +310,7 @@ class CobotOfflineTrainer(RLTStage2Trainer):
             self.model._get_ref_chunk(batch["curr_obs"]),
         )
         action = self.model.actor.mean(state, ref)
-        return {
+        metrics = {
             "validation/td_loss": float(td),
             "validation/action_mse": float(F.mse_loss(action, batch["actions"])),
             "validation/q_data": float(
@@ -293,6 +318,33 @@ class CobotOfflineTrainer(RLTStage2Trainer):
             ),
             "validation/mc_return": float(batch["mc_returns"].mean()),
         }
+        motion = getattr(self.model, "joint_motion", None)
+        if motion is not None:
+            from rlinf.models.embodiment.mlp_policy.cobot_joint_motion import ARM
+
+            scale, offset, anchor = motion.context(state)
+            physical = (
+                action.reshape(-1, motion.chunk_len, 14) * scale[:, None]
+                + offset[:, None]
+            )
+            velocity, acceleration = motion.differences(
+                physical[:, :, ARM], anchor[:, ARM]
+            )
+            baseline = motion.physical(ref, state)
+            metrics.update(
+                {
+                    "validation/max_velocity_rad_s": float(
+                        velocity.abs().max() * motion.hz
+                    ),
+                    "validation/max_acceleration_rad_s2": float(
+                        acceleration.abs().max() * motion.hz**2
+                    ),
+                    "validation/max_residual_rad": float(
+                        (physical[:, :, ARM] - baseline[:, :, ARM]).abs().max()
+                    ),
+                }
+            )
+        return metrics
 
     def save(self, save_dir: str) -> None:
         destination = Path(save_dir)

@@ -28,6 +28,8 @@ the wrist cameras used to be dropped (they were published as
 
 from __future__ import annotations
 
+import copy
+import hashlib
 import logging
 from dataclasses import dataclass, field
 from typing import Any
@@ -126,8 +128,7 @@ class RLTObservationRepacker:
             )
         if state.size != self.proprio_dim:
             raise ValueError(
-                f"Observation state dim {state.size} != configured proprio_dim "
-                f"{self.proprio_dim}"
+                f"Observation state dim {state.size} != configured proprio_dim {self.proprio_dim}"
             )
         if not np.isfinite(state).all():
             raise ValueError("Observation state contains non-finite values")
@@ -141,8 +142,7 @@ class RLTObservationRepacker:
             for name, image in zip(self.camera_layout.required_keys, [main, *wrists]):
                 if tuple(image.shape[:2]) != expected:
                     raise ValueError(
-                        f"Camera {name!r} has size {image.shape[:2]}, expected "
-                        f"{expected}"
+                        f"Camera {name!r} has size {image.shape[:2]}, expected {expected}"
                     )
 
         prompt = observation.get("prompt") or self.default_prompt
@@ -213,6 +213,7 @@ class RLTStage2Inference:
         self.action_dim = int(action_dim)
         self.num_ref_candidates = max(1, int(num_ref_candidates))
         self.device = device
+        self._cached_boundary = None
 
     # ------------------------------------------------------------- Stage 1
 
@@ -238,6 +239,25 @@ class RLTStage2Inference:
         model._require_rlt()
 
         env_obs = self.repacker.to_env_obs(observation)
+        joint_motion = getattr(self.policy_model, "joint_motion", None)
+        boundary_key = None
+        if joint_motion is not None:
+            anchor = np.asarray(observation.get("previous_command"), dtype=np.float32)
+            if anchor.shape != (14,) or not np.isfinite(anchor).all():
+                raise ValueError(
+                    "Cobot motion v2 requires finite previous_command joint14"
+                )
+            digest = hashlib.sha256()
+            for key in ("states", "main_images", "wrist_images"):
+                digest.update(np.ascontiguousarray(env_obs[key]).tobytes())
+            digest.update(anchor.tobytes())
+            digest.update(str(env_obs["task_descriptions"]).encode())
+            boundary_key = digest.digest()
+            if (
+                self._cached_boundary is not None
+                and self._cached_boundary[0] == boundary_key
+            ):
+                return copy.deepcopy(self._cached_boundary[1])
         repacked = {
             "observation/image": env_obs["main_images"],
             "observation/wrist_image": env_obs["wrist_images"],
@@ -263,7 +283,7 @@ class RLTStage2Inference:
         candidates = [actions[..., : self.action_dim] for actions in model_actions]
 
         proprio = torch.as_tensor(env_obs["states"])
-        return {
+        result = {
             "z_rl": z_rl,
             "proprio": proprio.to(device=z_rl.device, dtype=torch.float32),
             "ref_chunk": candidates[0].to(device=z_rl.device, dtype=torch.float32),
@@ -274,6 +294,29 @@ class RLTStage2Inference:
             "_model_actions": model_actions[0],
             "_openpi_state": openpi_obs.state,
         }
+        if joint_motion is not None:
+            anchor = np.asarray(observation.get("previous_command"), dtype=np.float32)
+            if anchor.shape != (14,) or not np.isfinite(anchor).all():
+                raise ValueError(
+                    "Cobot motion v2 requires finite previous_command joint14"
+                )
+            scale, offset = self._affine_to_robot(result)
+            if not (
+                np.allclose(scale, scale[:1], atol=1e-6)
+                and np.allclose(offset, offset[:1], atol=1e-6)
+            ):
+                raise ValueError(
+                    "Cobot action affine transform must be constant over the chunk"
+                )
+            result["motion_context"] = torch.as_tensor(
+                np.concatenate((scale[0], offset[0], anchor))[None],
+                device=self.device,
+                dtype=torch.float32,
+            )
+            # transition.next_obs and the following act use identical sampled
+            # references as well as identical RGB/state/previous-command inputs.
+            self._cached_boundary = (boundary_key, copy.deepcopy(result))
+        return result
 
     @staticmethod
     def strip_private(rlt_obs: dict[str, Any]) -> dict[str, torch.Tensor]:
@@ -315,6 +358,9 @@ class RLTStage2Inference:
 
         if warmup:
             selected = reference
+            if getattr(self.policy_model, "joint_motion", None) is not None:
+                selected = self.policy_model._get_ref_chunk(obs)
+                reference = selected
             mode = "warmup"
             expo_info: dict[str, Any] = {"expo_active": False}
         else:
@@ -373,12 +419,11 @@ class RLTStage2Inference:
                 action, base = policy.select_expo_action(
                     obs, exploration=not deterministic
                 )
-                candidates, _ = policy.build_expo_candidates(
-                    obs, exploration=not deterministic
-                )
                 info = {
                     "expo_active": True,
-                    "expo_num_candidates": int(candidates.shape[1]),
+                    "expo_num_candidates": int(
+                        policy.expo_num_base_samples + policy.expo_num_edit_samples
+                    ),
                     "expo_num_base_samples": int(policy.expo_num_base_samples),
                     "expo_num_edit_samples": int(policy.expo_num_edit_samples),
                 }
@@ -416,6 +461,16 @@ class RLTStage2Inference:
         Returns:
             ``[chunk_len, action_dim]`` float32 array in robot units.
         """
+        if "motion_context" in rlt_obs:
+            context = rlt_obs["motion_context"].detach().float().cpu().numpy()[0]
+            normalized = (
+                normalized_chunk.detach()
+                .float()
+                .cpu()
+                .numpy()
+                .reshape(self.chunk_len, self.action_dim)
+            )
+            return np.ascontiguousarray(normalized * context[:14] + context[14:28])
         model_actions = rlt_obs["_model_actions"]
         openpi_state = rlt_obs["_openpi_state"]
         edited = model_actions.clone()
@@ -480,7 +535,11 @@ class RLTStage2Inference:
         )
         offset = self.to_robot_space(zeros, rlt_obs)
         scale = self.to_robot_space(zeros + 1.0, rlt_obs) - offset
-        if np.any(np.abs(scale) < 1e-8):
+        if (
+            not np.isfinite(scale).all()
+            or not np.isfinite(offset).all()
+            or np.any(np.abs(scale) < 1e-8)
+        ):
             raise RuntimeError(
                 "OpenPI output pipeline has a zero-slope action dimension; "
                 "cannot recover normalized actions from robot-space actions."

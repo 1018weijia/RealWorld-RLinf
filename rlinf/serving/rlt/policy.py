@@ -194,7 +194,14 @@ class RLTStage2Policy:
     @property
     def metadata(self) -> dict[str, Any]:
         """Handshake payload for :class:`RLinfWebsocketPolicyServer`."""
-        return self._metadata.to_payload()
+        result = self._metadata.to_payload()
+        motion = getattr(
+            getattr(self.inference, "policy_model", None), "joint_motion", None
+        )
+        if motion is not None:
+            result["joint_motion"] = motion.config
+            result["edit_scale"] = 0.0
+        return result
 
     @property
     def in_warmup(self) -> bool:
@@ -269,6 +276,8 @@ class RLTStage2Policy:
     def reset(self) -> None:
         """Drop pending chunks and episode counters without touching replay."""
         logger.info("Resetting server state, dropping %d pending", len(self._pending))
+        if hasattr(self.inference, "_cached_boundary"):
+            self.inference._cached_boundary = None
         self._pending.clear()
         self._episode.reset()
         self._chunk_id = 0
@@ -329,6 +338,24 @@ class RLTStage2Policy:
     # ---------------------------------------------------------- transition
 
     def _store_transition(self, request: TransitionRequest) -> dict[str, Any]:
+        if (
+            getattr(getattr(self.inference, "policy_model", None), "joint_motion", None)
+            is not None
+        ):
+            if (
+                request.action_chunk_space != ACTION_SPACE_ROBOT
+                or request.action_chunk is None
+            ):
+                raise ProtocolError(
+                    "Cobot motion v2 requires explicit executed robot-space actions"
+                )
+            anchor = np.asarray(request.next_observation.get("previous_command"))
+            if anchor.shape != (14,) or not np.allclose(
+                anchor, request.action_chunk[-1], rtol=0, atol=1e-5
+            ):
+                raise ProtocolError(
+                    "Next observation previous_command differs from actual last executed target"
+                )
         pending = self._pending.pop(request.transition_id, None)
         if pending is None:
             # Either a resend after the response was lost, or a client bug.
@@ -545,6 +572,8 @@ class RLTStage2Policy:
             self.metric_logger({**episode_metrics, **metrics})
 
         saved = self._maybe_save()
+        if hasattr(self.inference, "_cached_boundary"):
+            self.inference._cached_boundary = None
         self._episode.reset()
         self._episode_id += 1
         self._chunk_id = 0

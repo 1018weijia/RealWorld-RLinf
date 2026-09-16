@@ -170,6 +170,8 @@ def train(cfg: DictConfig) -> None:
         cfg.actor.model.ref_num_action_chunks,
         cfg.actor.model.action_dim,
     )
+    if getattr(model, "joint_motion", None) is not None:
+        logger.info("Cobot physical motion contract: %s", model.joint_motion.config)
     Path(cfg.server.save_dir).parent.mkdir(parents=True, exist_ok=True)
     OmegaConf.save(
         cfg, Path(cfg.server.save_dir).parent / "effective_config.yaml", resolve=True

@@ -97,8 +97,10 @@ def test_task_launcher_argv_and_private_key(tmp_path, task, prompt, port, model,
     assert "actor.model.num_action_chunks=30" in args
     assert "rlt_feature_model.num_action_chunks=50" in args
     assert "test-private-key" not in result.stdout
-    assert "actor.model.actor_noise_sigma=0.1" in args
-    assert "actor.model.residual_scale=0.3" in args
+    assert "cobot_joint_motion_v2" in args
+    if mode != "eval-stage1":
+        assert "actor.model.actor_noise_sigma=0.1" in args
+        assert "actor.model.residual_scale=0.3" in args
     if mode == "offline":
         assert "+offline.allow_actor_reconfiguration=false" in args
         assert not any(

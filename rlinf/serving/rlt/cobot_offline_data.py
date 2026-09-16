@@ -225,6 +225,9 @@ def convert_episode(data: CobotLeRobotV3, row: dict, inference, gamma: float) ->
     normalized = []
     for position, index in enumerate(endpoints):
         observation = {"state": state[index], "prompt": data.prompt}
+        # Recorded previous targets are the causal command boundary. Do not
+        # replace recorded actions or observations with projected trajectories.
+        observation["previous_command"] = actions[index - 1] if index else state[index]
         observation.update(
             {target: videos[name].pop(index) for name, target in CAMERAS.items()}
         )
@@ -323,12 +326,21 @@ class OfflineBuffer:
                     dim,
                 ),
             }
+            if model.get("joint_motion"):
+                shapes["motion_context"] = (self.size, 42)
             for key, shape in shapes.items():
                 value = self.rows[group][key]
                 if tuple(value.shape) != shape or not torch.isfinite(value).all():
                     raise ValueError(
                         f"Invalid offline field {group}.{key}: expected finite {shape}"
                     )
+            if (
+                model.get("joint_motion")
+                and (self.rows[group]["motion_context"][:, :14].abs() < 1e-8).any()
+            ):
+                raise ValueError(
+                    "Offline motion_context contains a zero physical action scale"
+                )
         if (
             self.rows["dones"].dtype != torch.bool
             or self.rows["success"].dtype != torch.bool

@@ -142,6 +142,11 @@ def run_preflight(cfg: DictConfig) -> None:
         logger.info("  %-24s %s", key, values[key])
     if bool(cfg.server.get("check_reference_hyperparameters", True)):
         report_reference_deviations(values, REFERENCE_HYPERPARAMETERS)
+    if cfg.actor.model.get("joint_motion") is not None:
+        logger.info(
+            "Cobot physical motion contract: %s",
+            OmegaConf.to_container(cfg.actor.model.joint_motion),
+        )
 
 
 def build_policy(cfg: DictConfig) -> RLTStage2Policy:
