@@ -144,6 +144,7 @@ class FakeTrainer:
         self.rewind_events: list = []
         self.train_calls: list[int] = []
         self.saves: list[str] = []
+        self.failure_penalties: list[dict] = []
 
     def _chunk_shape(self):
         return CHUNK_LEN, ACTION_DIM
@@ -152,6 +153,21 @@ class FakeTrainer:
         self.transitions.append(kwargs)
         self.replay_buffer.total_samples += 1
         return True, 1 if kwargs["done"] else 0
+
+    def apply_failure_penalty(self, *, reward, episode_id, session_id, env_id=0):
+        self.failure_penalties.append(
+            {
+                "reward": float(reward),
+                "episode_id": int(episode_id),
+                "session_id": int(session_id),
+                "env_id": int(env_id),
+            }
+        )
+        if self.transitions:
+            rewards = np.array(self.transitions[-1]["rewards"], dtype=np.float32)
+            rewards[-1] = float(reward)
+            self.transitions[-1]["rewards"] = rewards
+        return True
 
     def _ingest_rewind_events(self, events):
         self.rewind_events.extend(events)
@@ -492,6 +508,67 @@ def test_update_budget_counts_only_policy_driven_chunks():
     assert trainer.train_calls == [9]
     assert response["updates_run"] == 9
     assert response["episode_chunks"] == 0, "counters reset for the next episode"
+
+
+def test_failed_episode_gets_server_failure_penalty():
+    policy, trainer, _ = build_policy(warmup_steps=0, failure_reward=-1.0)
+    commit(policy, act(policy)["transition_id"])
+    commit(policy, act(policy)["transition_id"], done=True)
+
+    response = policy.infer(
+        {REQUEST_KEY: REQUEST_EPISODE_END, "stats": {"success": False}}
+    )
+
+    assert response["failure_penalty_applied"] is True
+    assert trainer.failure_penalties == [
+        {
+            "reward": -1.0,
+            "episode_id": 0,
+            "session_id": policy._session_id,
+            "env_id": 0,
+        }
+    ]
+    np.testing.assert_allclose(trainer.transitions[-1]["rewards"][-1], -1.0)
+    assert trainer.train_calls == [6]
+    assert response["metrics"]["env/failure_penalty"] == -1.0
+
+
+def test_timeout_episode_does_not_get_failure_penalty():
+    policy, trainer, _ = build_policy(warmup_steps=0, failure_reward=-1.0)
+    commit(policy, act(policy)["transition_id"])
+    response = policy.infer(
+        {REQUEST_KEY: REQUEST_EPISODE_END, "stats": {"success": False}}
+    )
+    assert response["failure_penalty_applied"] is False
+    assert trainer.failure_penalties == []
+    assert trainer.transitions[-1]["rewards"][-1] == 0.0
+
+
+def test_successful_or_aborted_episode_does_not_get_failure_penalty():
+    policy, trainer, _ = build_policy(warmup_steps=0, failure_reward=-1.0)
+    commit(policy, act(policy)["transition_id"], done=True)
+    success = policy.infer(
+        {REQUEST_KEY: REQUEST_EPISODE_END, "stats": {"success": True}}
+    )
+    assert success["failure_penalty_applied"] is False
+
+    commit(policy, act(policy)["transition_id"], done=True)
+    aborted = policy.infer(
+        {REQUEST_KEY: REQUEST_EPISODE_END, "stats": {"aborted": True}}
+    )
+    assert aborted["failure_penalty_applied"] is False
+    assert trainer.failure_penalties == []
+
+
+def test_zero_failure_reward_leaves_client_rewards_unchanged():
+    policy, trainer, _ = build_policy(warmup_steps=0)
+    commit(policy, act(policy)["transition_id"], done=True)
+    response = policy.infer(
+        {REQUEST_KEY: REQUEST_EPISODE_END, "stats": {"success": False}}
+    )
+    assert policy.failure_reward == 0.0
+    assert response["failure_penalty_applied"] is False
+    assert trainer.failure_penalties == []
 
 
 def test_eval_only_never_writes_replay_or_trains():

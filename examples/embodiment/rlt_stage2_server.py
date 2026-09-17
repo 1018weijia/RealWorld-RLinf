@@ -291,6 +291,7 @@ def build_policy(cfg: DictConfig) -> RLTStage2Policy:
         store_eval_episodes=bool(cfg.server.get("store_eval_episodes", False)),
         eval_interval_episodes=int(cfg.server.get("eval_interval_episodes", 0)),
         replay_action_space=str(cfg.server.replay_action_space),
+        failure_reward=float(cfg.server.get("failure_reward", 0.0)),
     )
 
 

@@ -16,11 +16,14 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 from omegaconf import OmegaConf
 
 from rlinf.algorithms.rlt import losses as rlt_losses
+from rlinf.algorithms.rlt.learner import RLTRewindCore
 from rlinf.algorithms.rlt.losses import (
     compute_rlt_critic_loss,
     critic_intervention_rank_loss,
@@ -324,3 +327,34 @@ def test_td_target_clip_min_records_fraction() -> None:
     assert metrics["td_target_clipped_frac"] == pytest.approx(1.0)
     assert metrics["target_q"] == pytest.approx(-1.0)
     assert metrics["td_target_unclipped"] < -1.0
+
+
+def test_apply_failure_penalty_writes_the_last_step() -> None:
+    class _Replay:
+        def __init__(self) -> None:
+            self.rewards = torch.zeros(1, 1, 4)
+            self._trajectory_index = {7: {"model_weights_id": 0}}
+            self.patched: tuple | None = None
+
+        def _load_trajectory(self, trajectory_id, weights_id):
+            del trajectory_id, weights_id
+            return SimpleNamespace(rewards=self.rewards)
+
+        def _flatten_trajectory(self, trajectory):
+            return {"rewards": trajectory.rewards.reshape(1, 4)}
+
+        def patch_trajectory_rows(self, trajectory_id, updates):
+            self.patched = (trajectory_id, updates)
+
+    core = object.__new__(RLTRewindCore)
+    core.replay_buffer = _Replay()
+    core._rewind_rows = {(1, 2, 0): [(7, 0, 3)]}
+    core._rlt_warn = lambda _message: None
+
+    assert core.apply_failure_penalty(reward=0.0, episode_id=1, session_id=2) is False
+    assert core.replay_buffer.patched is None
+    assert core.apply_failure_penalty(reward=-1.0, episode_id=9, session_id=2) is False
+    assert core.apply_failure_penalty(reward=-1.0, episode_id=1, session_id=2) is True
+    trajectory_id, updates = core.replay_buffer.patched
+    assert trajectory_id == 7
+    assert float(updates[0]["rewards"].reshape(-1)[-1]) == -1.0

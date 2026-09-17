@@ -1004,6 +1004,49 @@ class RLTRewindCore(RLTHostHooks):
     ) -> None:
         self.replay_buffer.patch_trajectory_rows(trajectory_id, updates)
 
+    def apply_failure_penalty(
+        self,
+        *,
+        reward: float,
+        episode_id: int,
+        session_id: int,
+        env_id: int = 0,
+    ) -> bool:
+        """Write ``reward`` onto the last step of the episode's last replay row.
+
+        The client already marks operator failure as a hard terminal
+        (``bootstrap_mask=0``) with a zero last-step reward. This fills that
+        reserved slot without a protocol change.
+
+        Args:
+            reward: Terminal value written to the last executed step.
+            episode_id: Episode whose last stored row is patched.
+            session_id: Session that produced the row.
+            env_id: Env index inside that session.
+
+        Returns:
+            True when a replay row was patched.
+        """
+        if reward == 0.0:
+            return False
+        key = self._row_key(int(episode_id), int(session_id), int(env_id))
+        rows = self._rewind_rows.get(key, [])
+        if not rows:
+            self._rlt_warn(f"Ignoring failure penalty without stored rows: {key}")
+            return False
+
+        trajectory_id, row, _ = rows[-1]
+        info = self.replay_buffer._trajectory_index[trajectory_id]
+        trajectory = self.replay_buffer._load_trajectory(
+            trajectory_id, info["model_weights_id"]
+        )
+        terminal_reward = self.replay_buffer._flatten_trajectory(trajectory)["rewards"][
+            row
+        ].clone()
+        terminal_reward.reshape(-1)[-1] = float(reward)
+        self._patch_rows(trajectory_id, {row: {"rewards": terminal_reward}})
+        return True
+
     def _patch_rewind_event(self, event: object) -> None:
         """Apply remote-franka credit only to real rows in one session."""
         key = self._row_key(

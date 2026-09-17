@@ -68,6 +68,11 @@ server:
   eval_interval_episodes: 5
   store_eval_episodes: True
 
+  # Written onto the last step of an operator-failed episode at episode_end.
+  # The client already cuts bootstrap; 0 keeps the historical no-penalty
+  # behaviour. Timeouts (bootstrap_mask=1) are not patched.
+  failure_reward: -1.0
+
   save_dir: "../results/cobot_rlt_stage2_ws/checkpoints"
   save_interval_episodes: 10
 

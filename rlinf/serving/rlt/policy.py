@@ -147,6 +147,9 @@ class RLTStage2Policy:
         eval_interval_episodes: Schedule a deterministic eval episode after
             every N completed training episodes. ``0`` disables.
         replay_action_space: ``"normalized"`` or ``"robot"``.
+        failure_reward: Sparse terminal written onto the last stored step
+            when the operator marks the episode failed. ``0`` leaves the
+            client reward unchanged. Timeouts are not patched.
         metric_logger: Optional callable receiving each metrics dict.
     """
 
@@ -165,6 +168,7 @@ class RLTStage2Policy:
         store_eval_episodes: bool = False,
         eval_interval_episodes: int = 0,
         replay_action_space: str = ACTION_SPACE_NORMALIZED,
+        failure_reward: float = 0.0,
         metric_logger=None,
     ) -> None:
         if replay_action_space not in (ACTION_SPACE_NORMALIZED, ACTION_SPACE_ROBOT):
@@ -188,6 +192,7 @@ class RLTStage2Policy:
         if self.vla_only and not self.eval_only:
             raise ValueError("VLA-only serving requires eval_only=True")
         self.replay_action_space = replay_action_space
+        self.failure_reward = float(failure_reward)
         self.metric_logger = metric_logger
 
         self._lock = threading.Lock()
@@ -199,6 +204,7 @@ class RLTStage2Policy:
         self._chunk_id = 0
         self._total_chunks = 0
         self._total_episodes = 0
+        self._last_stored_bootstrap_mask = 1.0
 
     @property
     def metadata(self) -> dict[str, Any]:
@@ -401,6 +407,8 @@ class RLTStage2Policy:
             identity=pending.identity,
             action_source=self._action_source(pending.mode, request.intervention),
         )
+        if added:
+            self._last_stored_bootstrap_mask = float(request.bootstrap_mask)
         return {
             "ok": True,
             "stored": bool(added),
@@ -544,6 +552,7 @@ class RLTStage2Policy:
         metrics: dict[str, float] = {}
         updates = 0
         was_eval_episode = self._eval_episode_active
+        failure_penalty_applied = self._maybe_apply_failure_penalty(stats)
         if not self.eval_only and not was_eval_episode:
             updates = self._episode.train_chunks * self.utd_ratio
             if updates > 0:
@@ -582,6 +591,9 @@ class RLTStage2Policy:
             "env/episode_train_chunks": float(self._episode.train_chunks),
             "env/episode_interventions": float(self._episode.interventions),
             "env/episode_success": float(bool(stats.get("success", False))),
+            "env/failure_penalty": (
+                float(self.failure_reward) if failure_penalty_applied else 0.0
+            ),
             "rlt/updates_this_episode": float(updates),
             "env/is_eval_episode": float(was_eval_episode),
         }
@@ -599,15 +611,56 @@ class RLTStage2Policy:
 
         saved = self._maybe_save()
         self._episode.reset()
+        self._last_stored_bootstrap_mask = 1.0
         self._episode_id += 1
         self._chunk_id = 0
         return {
             "ok": True,
             "updates_run": updates,
             "checkpoint_saved": saved,
+            "failure_penalty_applied": failure_penalty_applied,
             "metrics": {**episode_metrics, **metrics},
             **self._status(),
         }
+
+    def _maybe_apply_failure_penalty(self, stats: dict[str, Any]) -> bool:
+        """Patch a failed episode's last stored step before the UTD burst.
+
+        Operator failure already arrives as a hard terminal with a zero
+        last-step reward. Timeouts keep ``bootstrap_mask=1`` and are left
+        alone so they are not learned as failure.
+
+        Args:
+            stats: ``episode_end`` stats from the client.
+
+        Returns:
+            True when the server wrote ``failure_reward`` into replay.
+        """
+        apply = getattr(self.trainer, "apply_failure_penalty", None)
+        if (
+            apply is None
+            or self.failure_reward == 0.0
+            or self.eval_only
+            or bool(stats.get("success", False))
+            or bool(stats.get("aborted", False))
+            or self._last_stored_bootstrap_mask != 0.0
+        ):
+            return False
+        patched = bool(
+            apply(
+                reward=self.failure_reward,
+                episode_id=self._episode_id,
+                session_id=self._session_id,
+            )
+        )
+        if patched:
+            self._episode.reward += self.failure_reward
+            logger.info(
+                "Applied failure penalty %.3f to episode %d",
+                self.failure_reward,
+                self._episode_id,
+            )
+        return patched
 
     def _maybe_save(self) -> bool:
         if self.save_dir is None or self.eval_only:
@@ -661,6 +714,7 @@ class RLTStage2Policy:
             "is_eval_episode": self.eval_only or self._eval_episode_active,
             "store_eval_episodes": self.store_eval_episodes,
             "total_eval_episodes": self._total_eval_episodes,
+            "failure_reward": self.failure_reward,
             "episode_id": self._episode_id,
             "session_id": self._session_id,
             "chunk_id": self._chunk_id,
