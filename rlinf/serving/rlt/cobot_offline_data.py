@@ -362,6 +362,44 @@ class OfflineBuffer:
         if not len(pool):
             raise ValueError("Requested an empty offline partition")
         indices = pool[torch.randint(len(pool), (count,))]
+        return self.select(indices, device)
+
+    @torch.no_grad()
+    def cache_joint_references(
+        self, model, device: torch.device, batch_size: int = 256
+    ) -> None:
+        """Cache deterministic motion projections in memory, never in source replay.
+
+        They depend only on immutable observations and the checked motion contract,
+        not actor/critic weights. This avoids repeated 30-step GPU scans per update.
+        """
+        rows = dict(self.rows)
+        for group in ("curr_obs", "next_obs"):
+            original = self.payload["rows"][group]
+            refs, candidates = [], []
+            for start in range(0, self.size, batch_size):
+                obs = {
+                    k: v[start : start + batch_size].to(device)
+                    for k, v in original.items()
+                }
+                refs.append(model._get_ref_chunk(obs).cpu())
+                candidates.append(model._get_ref_candidates(obs).cpu())
+            rows[group] = {
+                **original,
+                "joint_projected_ref": torch.cat(refs),
+                "joint_projected_candidates": torch.cat(candidates),
+            }
+        self.rows = rows
+
+    def fixed_validation(self, count: int, device: torch.device, *, seed: int) -> dict:
+        """Choose held-out rows without replacement or changes to training RNG."""
+        pool = self.validation_indices
+        generator = torch.Generator().manual_seed(seed)
+        indices = pool[torch.randperm(len(pool), generator=generator)[:count]]
+        return self.select(indices, device)
+
+    def select(self, indices: torch.Tensor, device: torch.device) -> dict:
+        """Materialize immutable rows at explicit indices on the requested device."""
 
         def select(tree):
             return {

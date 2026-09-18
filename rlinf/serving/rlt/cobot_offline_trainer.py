@@ -30,9 +30,79 @@ from rlinf.serving.rlt.cobot_offline_data import OfflineBuffer, atomic_save, con
 from rlinf.serving.rlt.trainer import RLTStage2Trainer
 
 
-def conservative_gap(policy_q, other_q, data_q, returns, temperature: float = 1.0):
-    """Calibrate only policy proposals with behavior returns, then apply CQL."""
+def joint_loss_options(options: dict) -> dict:
+    """Resolve an opt-in loss recipe without changing legacy checkpoints."""
+    version = options.get("objective_version", "legacy")
+    if version == "legacy":
+        return {}
+    if version != "joint-loss-v3":
+        raise ValueError(f"Unknown offline objective {version}")
+    result = {
+        "objective_version": version,
+        "calql_alpha": 0.1,
+        "calql_calibration": "policy_only",
+        "bc_weight": 1.0,
+        "q_weight": 0.01,
+        "q_warmup_steps": 2000,
+        "q_ramp_steps": 2000,
+        "mc_warmup_steps": 0,
+        "q_aggregation": "min",
+        "gradient_every": 500,
+        "validation_seed": 918,
+        "online_bc_weight": 1.0,
+        "online_q_weight_max": 0.01,
+    }
+    result.update({key: options[key] for key in result if key in options})
+    for key, value in result.items():
+        if isinstance(value, (int, float)) and (not math.isfinite(value) or value < 0):
+            raise ValueError(f"offline.{key} must be finite and nonnegative")
+    if result["q_aggregation"] not in ("min", "mean"):
+        raise ValueError("offline.q_aggregation must be min or mean")
+    if result["calql_calibration"] not in ("policy_only", "reachable_family"):
+        raise ValueError(
+            "offline.calql_calibration must be policy_only or reachable_family"
+        )
+    if result["calql_alpha"] > 0.2:
+        raise ValueError("joint-loss-v3 requires fixed calql_alpha <= 0.2")
+    return result
+
+
+def joint_budget_bc(
+    model,
+    obs: dict,
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    success: torch.Tensor,
+) -> torch.Tensor:
+    """Fit successful feasible arm targets in units of each physical edit budget."""
+    from rlinf.models.embodiment.mlp_policy.cobot_joint_motion import ARM
+
+    motion = model.joint_motion
+    scale, _, _ = motion.context(model._state(obs))
+    error = (prediction - target).reshape(-1, motion.chunk_len, 14) * scale[:, None]
+    per_sample = (error[:, :, ARM] / motion.residual_rad).square().mean(dim=(1, 2))
+    mask = success.float().reshape(-1)
+    return (per_sample * mask).sum() / mask.sum().clamp_min(1)
+
+
+def conservative_gap(
+    policy_q,
+    other_q,
+    data_q,
+    returns,
+    temperature: float = 1.0,
+    *,
+    calibrate_other: bool = False,
+):
+    """Calibrate proposals inside the penalty, without constraining network Q.
+
+    calibrate_other is only for the joint actor's projected references and local
+    knot proposals: all belong to its executable policy family, not a separate
+    uniform-action distribution. Legacy random-action candidates stay unchanged.
+    """
     calibrated = torch.maximum(policy_q, returns[:, None, :])
+    if calibrate_other:
+        other_q = torch.maximum(other_q, returns[:, None, :])
     values = torch.cat([calibrated, other_q], dim=1)
     partition = temperature * (
         torch.logsumexp(values / temperature, dim=1) - math.log(values.shape[1])
@@ -54,6 +124,9 @@ class CobotOfflineTrainer(RLTStage2Trainer):
         self.offline_total_updates = 0
         self.offline_mode = False
         self.offline_options = dict(self.cfg.get("offline", {}) or {})
+        self.objective = joint_loss_options(self.offline_options)
+        if self.objective and getattr(self.model, "joint_motion", None) is None:
+            raise ValueError("joint-loss-v3 requires the Cobot joint motion actor")
         self.log_alpha = torch.nn.Parameter(torch.tensor(1.0, device=self.device))
         self.alpha_optimizer = torch.optim.Adam(
             [self.log_alpha], lr=float(self.cfg.actor.critic_optim.lr)
@@ -88,6 +161,10 @@ class CobotOfflineTrainer(RLTStage2Trainer):
             payload["conversion_contract"] = payload.get("conversion_contract", actual)
             payload["contract"] = expected
         self.offline_buffer = OfflineBuffer(payload)
+        if self.objective and bool(
+            self.offline_options.get("cache_joint_references", True)
+        ):
+            self.offline_buffer.cache_joint_references(self.model, self.device)
 
     def _sample_batch(self):
         if self.offline_buffer is None:
@@ -176,12 +253,21 @@ class CobotOfflineTrainer(RLTStage2Trainer):
             ).reshape(len(ref), actions.shape[1], -1)
 
         data_q = model.q_head(state, batch["actions"])
-        gap = conservative_gap(q(policy), q(other), data_q, batch["mc_returns"])
+        gap = conservative_gap(
+            q(policy),
+            q(other),
+            data_q,
+            batch["mc_returns"],
+            calibrate_other=self.objective.get("calql_calibration")
+            == "reachable_family",
+        )
         return gap, data_q.mean()
 
     def forward_critic(self, batch):
         if "online" not in batch:
             return super().forward_critic(batch)
+        if self.offline_mode and self.objective:
+            return self._forward_joint_critic(batch["offline"])
         ratio = batch["ratio"]
         loss = torch.zeros((), device=self.device)
         metrics = {}
@@ -216,15 +302,149 @@ class CobotOfflineTrainer(RLTStage2Trainer):
             raise FloatingPointError("Non-finite critic loss")
         return loss, metrics
 
+    def _forward_joint_critic(self, data: dict):
+        options = self.objective
+        obs = data["curr_obs"]
+        q_data = self.model.q_head(self.model._state(obs), data["actions"])
+        mc = (
+            F.huber_loss(
+                q_data,
+                data["mc_returns"].expand_as(q_data),
+                delta=float(self.cfg.algorithm.critic_huber_delta),
+                reduction="none",
+            )
+            .sum(-1)
+            .mean()
+        )
+        mc_phase = self.offline_total_updates < int(options["mc_warmup_steps"])
+        metrics = {
+            "mc_loss": float(mc.detach()),
+            "mc_warmup": float(mc_phase),
+            "q_data": float(q_data.detach().mean()),
+            "calql_alpha": float(options["calql_alpha"]),
+        }
+        if mc_phase:
+            return mc, metrics
+        td = self._offline_td(data)
+        weight = min(
+            1.0,
+            (self.offline_total_updates - int(options["mc_warmup_steps"]) + 1)
+            / max(1, int(self.offline_options.get("warmup_steps", 1000))),
+        )
+        gap, _ = self._calql(data)
+        conservative = (
+            weight
+            * float(options["calql_alpha"])
+            * (gap - float(self.offline_options.get("target_gap", 0.05)))
+        )
+        loss = td + conservative
+        if not torch.isfinite(loss):
+            raise FloatingPointError("Non-finite joint critic loss")
+        metrics.update(
+            offline_td_loss=float(td.detach()),
+            calql_gap=float(gap.detach()),
+            calql_effective_alpha=weight * float(options["calql_alpha"]),
+            calql_loss=float(conservative.detach()),
+        )
+        return loss, metrics
+
+    def _joint_actor_terms(self, data: dict):
+        model = self.model
+        obs = data["curr_obs"]
+        state, reference = model._state(obs), model._get_ref_chunk(obs)
+        prediction = model.actor.mean(state, reference)
+        target = model.demo_target(obs, data["actions"], reference=reference).detach()
+        bc = joint_budget_bc(model, obs, prediction, target, data["success"])
+        parameters = list(model.q_head.parameters())
+        requires_grad = [p.requires_grad for p in parameters]
+        for p in parameters:
+            p.requires_grad_(False)
+        try:
+            values = model.q_head(state, prediction)
+            q_loss = -(
+                values.min(-1).values
+                if self.objective["q_aggregation"] == "min"
+                else values.mean(-1)
+            ).mean()
+        finally:
+            for p, required in zip(parameters, requires_grad):
+                p.requires_grad_(required)
+        return bc, q_loss
+
+    def _forward_joint_actor(self, data: dict):
+        options = self.objective
+        bc, q_loss = self._joint_actor_terms(data)
+        ramp = min(
+            1.0,
+            max(
+                0.0,
+                (self.offline_total_updates - int(options["q_warmup_steps"]))
+                / max(1, int(options["q_ramp_steps"])),
+            ),
+        )
+        bc_weight, q_weight = (
+            float(options["bc_weight"]),
+            float(options["q_weight"]) * ramp,
+        )
+        weighted_bc, weighted_q = bc_weight * bc, q_weight * q_loss
+        loss = weighted_bc + weighted_q
+        if not torch.isfinite(loss):
+            raise FloatingPointError("Non-finite joint actor loss")
+        metrics = {
+            "demo_bc": float(bc.detach()),
+            "q_loss": float(q_loss.detach()),
+            "bc_weight": bc_weight,
+            "q_weight": q_weight,
+            "weighted_bc": float(weighted_bc.detach()),
+            "weighted_q": float(weighted_q.detach()),
+            "success_fraction": float(data["success"].float().mean()),
+        }
+        every = int(options["gradient_every"])
+        if every and self.offline_total_updates % every == 0:
+            parameters = list(self.model.actor.parameters())
+
+            def norm(term):
+                gradients = torch.autograd.grad(
+                    term, parameters, retain_graph=True, allow_unused=True
+                )
+                return (
+                    sum(
+                        float(g.detach().square().sum())
+                        for g in gradients
+                        if g is not None
+                    )
+                    ** 0.5
+                )
+
+            bc_norm, q_norm = norm(weighted_bc), norm(weighted_q)
+            metrics.update(
+                bc_grad_norm=bc_norm,
+                q_grad_norm=q_norm,
+                q_to_bc_grad_ratio=q_norm / max(bc_norm, 1e-12),
+            )
+        return loss, torch.zeros((), device=self.device), metrics
+
     def forward_actor(self, batch):
         if "online" not in batch:
             return super().forward_actor(batch)
+        if self.offline_mode and self.objective:
+            return self._forward_joint_actor(batch["offline"])
         if not self.offline_mode:
             online, entropy, metrics = super().forward_actor(batch["online"])
             if batch["offline"] is None:
                 return online, entropy, metrics
-            # Match the online actor objective; no demonstration BC during online RL.
+            # Legacy uses only the online objective; v3 also retains a demo anchor.
             offline, _, _ = super().forward_actor(batch["offline"])
+            if self.objective:
+                bc, _ = self._joint_actor_terms(batch["offline"])
+                anchor = float(self.objective["online_bc_weight"]) * bc
+                metrics["offline_demo_bc"] = float(bc.detach())
+                metrics["offline_weighted_bc"] = float(anchor.detach())
+                return (
+                    (1 - batch["ratio"]) * online + batch["ratio"] * offline + anchor,
+                    entropy,
+                    metrics,
+                )
             return (
                 (1 - batch["ratio"]) * online + batch["ratio"] * offline,
                 entropy,
@@ -301,9 +521,34 @@ class CobotOfflineTrainer(RLTStage2Trainer):
         """Evaluate held-out episodes without advancing training or PER state."""
         if not len(self.offline_buffer.validation_indices):
             return {}
+        if self.objective:
+            devices = (
+                [
+                    self.device.index
+                    if self.device.index is not None
+                    else torch.cuda.current_device()
+                ]
+                if self.device.type == "cuda"
+                else []
+            )
+            # Validation never advances training noise or sampling RNGs.
+            with torch.random.fork_rng(devices=devices):
+                seed = int(self.objective["validation_seed"])
+                torch.random.default_generator.manual_seed(seed)
+                for device in devices:
+                    torch.cuda.default_generators[device].manual_seed(seed)
+                batch = self.offline_buffer.fixed_validation(
+                    self.batch_size,
+                    self.device,
+                    seed=int(self.objective["validation_seed"]),
+                )
+                return self._validate_batch(batch)
         batch = self.offline_buffer.sample(
             self.batch_size, self.device, validation=True
         )
+        return self._validate_batch(batch)
+
+    def _validate_batch(self, batch: dict) -> dict[str, float]:
         td = self._offline_td(batch)
         state, ref = (
             self.model._state(batch["curr_obs"]),
@@ -344,6 +589,38 @@ class CobotOfflineTrainer(RLTStage2Trainer):
                     ),
                 }
             )
+            if self.objective:
+                target = self.model.demo_target(
+                    batch["curr_obs"], batch["actions"], reference=ref
+                )
+                q_data = self.model.q_head(state, batch["actions"])
+                logits = self.model.actor.mlp(torch.cat((state, ref), dim=-1))
+                metrics.update(
+                    {
+                        "validation/budget_bc": float(
+                            joint_budget_bc(
+                                self.model,
+                                batch["curr_obs"],
+                                action,
+                                target,
+                                batch["success"],
+                            )
+                        ),
+                        "validation/q_actor": float(
+                            self.model.q_head(state, action).mean()
+                        ),
+                        "validation/q_base": float(
+                            self.model.q_head(state, ref).mean()
+                        ),
+                        "validation/q_mc_mae": float(
+                            (q_data - batch["mc_returns"]).abs().mean()
+                        ),
+                        "validation/knot_saturation": float(
+                            (logits.tanh().abs() > 0.99).float().mean()
+                        ),
+                        "validation/sample_count": float(len(action)),
+                    }
+                )
         return metrics
 
     def save(self, save_dir: str) -> None:
@@ -363,6 +640,7 @@ class CobotOfflineTrainer(RLTStage2Trainer):
                     "log_alpha": self.log_alpha.detach().cpu(),
                     "alpha_optimizer": self.alpha_optimizer.state_dict(),
                     "options": self.offline_options,
+                    "objective": self.objective,
                     "rng": torch.get_rng_state(),
                     "cuda_rng": torch.cuda.get_rng_state_all()
                     if torch.cuda.is_available()
@@ -386,6 +664,24 @@ class CobotOfflineTrainer(RLTStage2Trainer):
             self.offline_total_updates = int(state["offline_total_updates"])
             self.log_alpha.data.copy_(state["log_alpha"].to(self.device))
             self.alpha_optimizer.load_state_dict(state["alpha_optimizer"])
+            saved_objective = joint_loss_options(state.get("objective", {}))
+            if self.offline_mode and saved_objective != self.objective:
+                raise ValueError(
+                    "Offline resume loss recipe differs; start a fresh run"
+                )
+            if not self.offline_mode:
+                self.objective = saved_objective
+                if self.objective and not bool(self.cfg.server.get("eval_only", False)):
+                    if float(self.cfg.algorithm.q_weight) > float(
+                        self.objective["online_q_weight_max"]
+                    ):
+                        raise ValueError(
+                            "joint-loss-v3 online handoff requires algorithm.q_weight<=0.01"
+                        )
+                    if float(self.cfg.algorithm.get("offline_sample_ratio", 0.0)) <= 0:
+                        raise ValueError(
+                            "joint-loss-v3 online handoff requires offline replay for BC"
+                        )
             if self.offline_mode:
                 keys = (
                     "warmup_steps",

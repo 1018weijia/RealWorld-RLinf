@@ -113,11 +113,15 @@ class CobotJointTD3Policy(RLTTD3MLPPolicy):
         return torch.cat((super()._state(obs), context), dim=-1)
 
     def _get_ref_chunk(self, obs: dict[str, torch.Tensor]) -> torch.Tensor:
+        if "joint_projected_ref" in obs:
+            return obs["joint_projected_ref"]
         return self.joint_motion.project_reference(
             super()._get_ref_chunk(obs), self._state(obs)
         )
 
     def _get_ref_candidates(self, obs: dict[str, torch.Tensor]) -> torch.Tensor:
+        if "joint_projected_candidates" in obs:
+            return obs["joint_projected_candidates"]
         raw = super()._get_ref_candidates(obs)
         state = self._state(obs)[:, None].expand(-1, raw.shape[1], -1)
         return self.joint_motion.project_reference(

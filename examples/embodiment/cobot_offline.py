@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import copy
+import json
 import logging
 from pathlib import Path
 
@@ -198,6 +199,14 @@ def train(cfg: DictConfig) -> None:
     )
     metrics_logger = MetricLogger(cfg)
     try:
+        if trainer.objective:
+            initial = trainer.validate_offline()
+            metrics_logger.log(
+                {f"offline/{k}": v for k, v in initial.items()},
+                step=trainer.offline_total_updates,
+            )
+            logger.info("Initial fixed validation: %s", initial)
+        validation_path = Path(cfg.server.save_dir).parent / "validation.jsonl"
         for step in range(trainer.offline_total_updates + 1, total + 1):
             # Use offline counter for TD3 actor/target cadence, but preserve online counters at handoff.
             trainer.update_step = step - 1
@@ -211,7 +220,10 @@ def train(cfg: DictConfig) -> None:
                 or step % int(cfg.offline.get("validation_every", 500)) == 0
                 or step == total
             ):
-                metrics.update(trainer.validate_offline())
+                validation = trainer.validate_offline()
+                metrics.update(validation)
+                with validation_path.open("a") as output:
+                    output.write(json.dumps({"step": step, **validation}) + "\n")
             if step == 1 or step % 100 == 0 or step == total:
                 logger.info("Offline update %d/%d: %s", step, total, metrics)
             metrics_logger.log(

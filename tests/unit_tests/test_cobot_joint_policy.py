@@ -26,7 +26,12 @@ from omegaconf import OmegaConf
 from rlinf.models.embodiment.mlp_policy import get_model
 from rlinf.models.embodiment.mlp_policy.cobot_joint_motion import ARM
 from rlinf.serving.rlt.cobot_offline_data import FORMAT, contract
-from rlinf.serving.rlt.cobot_offline_trainer import CobotOfflineTrainer
+from rlinf.serving.rlt.cobot_offline_trainer import (
+    CobotOfflineTrainer,
+    conservative_gap,
+    joint_budget_bc,
+    joint_loss_options,
+)
 from rlinf.serving.rlt.protocol import ChunkIdentity
 
 
@@ -78,9 +83,21 @@ def assert_feasible(model, obs, normalized):
     assert velocity[:, -1].abs().max() < 1e-5
 
 
-def test_candidates_gradients_offline_online_resume(tmp_path):
+@pytest.mark.parametrize("objective_version", ["legacy", "joint-loss-v3"])
+def test_candidates_gradients_offline_online_resume(tmp_path, objective_version):
     torch.set_num_threads(1)
     cfg = configuration(tmp_path)
+    cfg.offline.update(
+        {
+            "objective_version": objective_version,
+            "q_warmup_steps": 1,
+            "q_ramp_steps": 1,
+            "mc_warmup_steps": 1,
+            "gradient_every": 1,
+        }
+    )
+    cfg.algorithm.q_weight = 0.01
+    cfg.algorithm.offline_sample_ratio = 0.5
     model = get_model(cfg.actor.model, torch.float32)
     obs = observation()
     for noise in (False, True):
@@ -114,6 +131,16 @@ def test_candidates_gradients_offline_online_resume(tmp_path):
     }
     trainer.offline_mode = True
     trainer.attach_offline_buffer(payload)
+    if objective_version == "joint-loss-v3":
+        cached = trainer.offline_buffer.rows["curr_obs"]
+        torch.testing.assert_close(
+            model._get_ref_chunk(cached), model._get_ref_chunk(obs)
+        )
+        torch.testing.assert_close(
+            model._get_ref_candidates(cached), model._get_ref_candidates(obs)
+        )
+        assert "joint_projected_ref" not in payload["rows"]["curr_obs"]
+        assert "joint_projected_candidates" not in payload["rows"]["next_obs"]
     before = [p.detach().clone() for p in model.actor.parameters()]
     for step in range(3):
         metrics = trainer.update_once(train_actor=True)
@@ -123,7 +150,14 @@ def test_candidates_gradients_offline_online_resume(tmp_path):
     assert_feasible(
         model, obs, model.actor.mean(model._state(obs), model._get_ref_chunk(obs))
     )
+    rng = torch.get_rng_state()
     validation = trainer.validate_offline()
+    if objective_version == "joint-loss-v3":
+        assert torch.equal(rng, torch.get_rng_state())
+        assert validation == trainer.validate_offline()
+        assert not trainer.alpha_optimizer.state
+        assert metrics["actor/q_weight"] == pytest.approx(0.01)
+        assert "actor/bc_grad_norm" in metrics
     assert validation["validation/max_acceleration_rad_s2"] <= 4.001
     directory = tmp_path / "checkpoint"
     trainer.save(str(directory))
@@ -158,6 +192,21 @@ def test_candidates_gradients_offline_online_resume(tmp_path):
     result = restored.train(1)
     assert all(np.isfinite(v) for v in result.values())
     assert restored.update_step == 1
+    if objective_version == "joint-loss-v3":
+        assert "actor/offline_demo_bc" in result
+        assert restored.objective == trainer.objective
+        offline_cfg = copy.deepcopy(cfg)
+        offline_cfg.offline.bc_weight = 0.5
+        changed_model = get_model(offline_cfg.actor.model, torch.float32)
+        changed_trainer = CobotOfflineTrainer(
+            offline_cfg,
+            model=changed_model,
+            target_model=copy.deepcopy(changed_model),
+            device=torch.device("cpu"),
+        )
+        changed_trainer.offline_mode = True
+        with pytest.raises(ValueError, match="loss recipe differs"):
+            changed_trainer.load(str(directory))
     assert_feasible(
         restored_model,
         obs,
@@ -173,3 +222,65 @@ def test_candidates_gradients_offline_online_resume(tmp_path):
     changed.joint_motion.residual_rad[0] = 0.05
     with pytest.raises(ValueError, match="limits differ"):
         get_model(changed, torch.float32).load_state_dict(model.state_dict())
+
+
+def test_fixed_conservative_weight_corrects_overestimated_data_q():
+    options = joint_loss_options({"objective_version": "joint-loss-v3"})
+    data = torch.full((1, 2), 10.0, requires_grad=True)
+    policy = torch.full((1, 4, 2), -1.0)
+    other = torch.full((1, 8, 2), -1.0)
+    td = (
+        torch.nn.functional.huber_loss(
+            data, torch.zeros_like(data), delta=0.5, reduction="none"
+        )
+        .sum(-1)
+        .mean()
+    )
+    gap = conservative_gap(policy, other, data, torch.full((1, 1), 0.1))
+    (td + options["calql_alpha"] * (gap - 0.05)).backward()
+    assert (data.grad > 0).all(), (
+        "Gradient descent must reduce already overestimated data Q"
+    )
+    with pytest.raises(ValueError, match="calql_alpha"):
+        joint_loss_options({"objective_version": "joint-loss-v3", "calql_alpha": 2.718})
+
+
+def test_family_calibration_stops_penalizing_low_q_without_clipping_network_values():
+    policy = torch.full((1, 4, 2), -2.0, requires_grad=True)
+    other = torch.full((1, 8, 2), -3.0, requires_grad=True)
+    data = torch.zeros(1, 2, requires_grad=True)
+    conservative_gap(
+        policy, other, data, torch.full((1, 1), 0.1), calibrate_other=True
+    ).backward()
+    assert policy.grad.abs().sum() == 0
+    assert other.grad.abs().sum() == 0
+    assert data.grad.sum() == -1
+    assert (policy == -2).all() and (other == -3).all()
+
+
+def test_budget_bc_uses_physical_units_success_mask_and_ignores_grippers(tmp_path):
+    cfg = configuration(tmp_path)
+    model = get_model(cfg.actor.model, torch.float32)
+    obs = observation(2)
+    scale = obs["motion_context"][:, :14]
+    target = torch.zeros(2, 30, 14)
+    prediction = target.clone()
+    prediction[:, :, ARM] = 0.5 * model.joint_motion.residual_rad / scale[:, None, ARM]
+    prediction[:, :, [6, 13]] = 100
+    prediction[1] *= 100
+    loss = joint_budget_bc(
+        model,
+        obs,
+        prediction.flatten(1),
+        target.flatten(1),
+        torch.tensor([True, False]),
+    )
+    assert loss == pytest.approx(0.25)
+    zero = joint_budget_bc(
+        model,
+        obs,
+        prediction.flatten(1),
+        target.flatten(1),
+        torch.tensor([False, False]),
+    )
+    assert zero == 0
