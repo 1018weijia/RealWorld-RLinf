@@ -73,8 +73,27 @@ env -u HISTORY_DRY_RUN MODEL_ADDRESS=127.0.0.1:33057 \
   ./collect/run_interactive_session_v2.sh --session-id v2_YYYYMMDD_NN
 ```
 
-V2：`s` 接管，`f` 成功。每轮必须 `f` / `q` 或手工 `failure` 收尾，否则 server 不训练。
+V2：`s` 接管，`f` 成功，`d` 失败（V2 需发 `session_failed`）。每轮必须收尾。
 前一两回合看夹爪和动作还像不像插 USB。
+
+`q` 中止仍会按已提交的 actor chunk 做 UTD。想少更新就少收尾。
+
+### 在线改探索噪声（下一 chunk 生效，不用重启 server）
+
+不要改 `actor.model.actor_noise_sigma` 再 resume，合同会对不上。用 per-act 覆盖：
+
+```bash
+docker exec desktop-robot_client-1 bash -lc \
+  'source /opt/xr/py_env/bin/activate && PYTHONPATH=/tmp python -m x2robot_rlt_ee.operator_cli status'
+docker exec desktop-robot_client-1 bash -lc \
+  'source /opt/xr/py_env/bin/activate && PYTHONPATH=/tmp python -m x2robot_rlt_ee.operator_cli sigma --sigma 0.05'
+docker exec desktop-robot_client-1 bash -lc \
+  'source /opt/xr/py_env/bin/activate && PYTHONPATH=/tmp python -m x2robot_rlt_ee.operator_cli sigma --sigma default'
+```
+
+`--sigma 0` 是确定性执行（仍是 residual，不是纯 Stage 1）。`mode=eval` 的自动评测局本来就关噪声。启动时也可设 `RLT_EXPLORATION_NOISE_SIGMA=0.05` 再拉 bridge。
+
+抖动对照：第一局收尾前 = Cal-QL+当前 sigma；`f`/`failure` 之后变抖 = 在线 −Q。eval 也抖 = residual 大了；只有 actor 抖 = 噪声 + EXPO。
 
 ## 1. 套环启动顺序
 
@@ -134,7 +153,8 @@ bash toolkits/inference/run_xrobot_rlt_ee_v2_adapter.sh --stop
 | `r` 第二次 | 停止倒放，投影到正向路径最近的成对样本，收敛后进 `PolicyPaused` | 校验回退健康后发 `rewind_exit`，chunk 数 = `ceil(回退时长 / 1.67秒)`，终止奖励 -1.0，带实测终态 |
 | `s` | 进入人工接管（必须在倒车停止后） | 无。人工段不进在线 replay |
 | `h` | 交还 policy，开新 policy phase | 无。policy 恢复后 RLT 循环自动接上 |
-| `f` | **成功**结束，生成 Traj_B（只在 `Policy` 状态有效） | 发 `success` + 实测终态，episode 结束，server 开始训练 |
+| `f` | **成功**结束，生成 Traj_B（只在 `Policy` 状态有效） | 发 `success` + 实测终态 |
+| `d` | **失败**结束（V2 需发 `session_failed`） | 发 `failure`，server 在最后一步写 `-1` |
 | `q` | 人工 abort，返回码 `2`，属正常不是故障 | 发 `abort`，丢弃未完成的 transition，**不给任何判定** |
 
 一次典型的接管：`r`（倒车）→ `r`（停在满意位置）→ `s`（接管）→ 人工做完 →
@@ -146,16 +166,24 @@ bash toolkits/inference/run_xrobot_rlt_ee_v2_adapter.sh --stop
 四路各至少 3 条新鲜数据，才宣布接管成功。任一路缺失会关掉 databridge 并保持
 policy 暂停 —— 这是防止"只有夹爪能动"被误判成接管成功。
 
-## 3. 失败必须手工发
+## 3. 失败：V2 发 `session_failed`，或手工 `failure`
 
-V2 没有"失败"事件，而 `q` 是不给判定的。**要记失败，先发 `failure`，再按 `q`：**
+`f` 仍是成功。失败请用 **`d`**（或你们指定的失败键），让 V2 往 `/take_over_data` 发：
+
+```json
+{"event_id": "...", "event": "session_failed", "detail": {"failure_end": <与 success_end 同结构的终态 sample>}}
+```
+
+adapter 会转成 RLT `failure`。**V2 collect 脚本要接这个事件**；只改 RLinf 不会让 `d` 生效。
+
+没接好之前仍可手工：
 
 ```bash
 docker exec desktop-robot_client-1 bash -lc \
   'source /opt/xr/py_env/bin/activate && PYTHONPATH=/tmp python -m x2robot_rlt_ee.operator_cli failure'
 ```
 
-同一条命令可用的 `command`：`failure`、`success`、`abort`、`rewind_credit`
+同一条命令可用的 `command`：`failure`、`success`、`abort`、`rewind_credit`、`sigma`、`status`
 （`--chunks N`，只改 replay 不动机械臂）、`status`。
 
 `status` 用来查当前有没有 pending chunk，联调时很有用：

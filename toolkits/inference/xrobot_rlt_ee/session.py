@@ -95,6 +95,7 @@ class RLTSession:
         self.committed_chunks = 0
         self.interventions = 0
         self.total_reward = 0.0
+        self.exploration_noise_sigma: float | None = None
 
     def _identity(self, chunk_id: int) -> dict[str, int]:
         return identity_payload(
@@ -108,13 +109,14 @@ class RLTSession:
         if self.pending is not None:
             raise RuntimeError("previous RLT chunk has not been committed or discarded")
         chunk_id = self.next_chunk_id
-        response = self._request(
-            {
-                REQUEST_KEY: REQUEST_ACT,
-                "observation": observation,
-                **self._identity(chunk_id),
-            }
-        )
+        payload = {
+            REQUEST_KEY: REQUEST_ACT,
+            "observation": observation,
+            **self._identity(chunk_id),
+        }
+        if self.exploration_noise_sigma is not None:
+            payload["exploration_noise_sigma"] = float(self.exploration_noise_sigma)
+        response = self._request(payload)
         output, executed = split_ee_actions(
             response.get("actions"),
             chunk_length=self.chunk_length,

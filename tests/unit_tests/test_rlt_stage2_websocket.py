@@ -140,6 +140,7 @@ class FakeTrainer:
         self.demo_buffer = None
         self.rewind_preference_buffer: list = []
         self.update_step = 0
+        self.offline_total_updates = 0
         self.transitions: list[dict] = []
         self.rewind_events: list = []
         self.train_calls: list[int] = []
@@ -490,6 +491,30 @@ def test_warmup_gates_the_stage2_head_on_replay_size():
     assert act(policy)["mode"] == "actor"
     assert [call["warmup"] for call in inference.select_calls] == [True, True, False]
     assert trainer.replay_buffer.total_samples == 2
+
+
+def test_calql_resume_stores_online_rows_before_utd():
+    policy, trainer, inference = build_policy(warmup_steps=2, utd_ratio=3)
+    trainer.offline_total_updates = 40000
+    assert policy.in_warmup is False
+    assert policy.in_replay_warmup is True
+
+    response = act(policy)
+    assert response["mode"] == "actor"
+    commit(policy, response["transition_id"])
+    ended = policy.infer({REQUEST_KEY: REQUEST_EPISODE_END, "stats": {}})
+    assert ended["updates_run"] == 0
+    assert ended["warmup_done"] is False
+    assert trainer.train_calls == []
+    assert trainer.replay_buffer.total_samples == 1
+    assert [call["warmup"] for call in inference.select_calls] == [False]
+
+    commit(policy, act(policy)["transition_id"])
+    assert policy.in_replay_warmup is False
+    trained = policy.infer({REQUEST_KEY: REQUEST_EPISODE_END, "stats": {}})
+    assert trained["updates_run"] == 3
+    assert trained["warmup_done"] is True
+    assert trainer.train_calls == [3]
 
 
 def test_update_budget_counts_only_policy_driven_chunks():

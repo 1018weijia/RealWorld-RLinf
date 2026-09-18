@@ -211,18 +211,33 @@ class RLTStage2Policy:
         """Handshake payload for :class:`RLinfWebsocketPolicyServer`."""
         return self._metadata.to_payload()
 
+    def _replay_below_warmup(self) -> bool:
+        return self.trainer.replay_buffer.total_samples < self.warmup_steps
+
     @property
     def in_warmup(self) -> bool:
-        """Whether the Stage 2 head is still gated off.
+        """Whether act should execute the Stage 1 reference only.
 
-        Warmup is measured in replay rows, not wall-clock or update count, so a
-        resumed run that already has data does not repeat it.
+        Cal-QL resume skips this gate so the residual stays on. Online UTD is
+        gated separately by :attr:`in_replay_warmup`.
         """
         if self.eval_only:
             return False
         if getattr(self.trainer, "offline_total_updates", 0) > 0:
             return False
-        return self.trainer.replay_buffer.total_samples < self.warmup_steps
+        return self._replay_below_warmup()
+
+    @property
+    def in_replay_warmup(self) -> bool:
+        """Whether online replay is still filling and UTD must wait.
+
+        Rows are stored on every committed chunk. Training waits until the
+        online buffer has ``warmup_steps`` rows so mixed offline/online
+        sampling is not empty. Cal-QL does not skip this gate.
+        """
+        if self.eval_only:
+            return False
+        return self._replay_below_warmup()
 
     # -------------------------------------------------------------- router
 
@@ -555,7 +570,15 @@ class RLTStage2Policy:
         failure_penalty_applied = self._maybe_apply_failure_penalty(stats)
         if not self.eval_only and not was_eval_episode:
             updates = self._episode.train_chunks * self.utd_ratio
-            if updates > 0:
+            if self.in_replay_warmup:
+                if updates > 0 or self._episode.chunks:
+                    logger.info(
+                        "episode_end: filling online replay (%d/%d rows), no updates",
+                        self.trainer.replay_buffer.total_samples,
+                        self.warmup_steps,
+                    )
+                updates = 0
+            elif updates > 0:
                 metrics = self.trainer.train(updates)
             elif self.in_warmup:
                 logger.info(
@@ -575,7 +598,7 @@ class RLTStage2Policy:
         elif (
             self.eval_interval_episodes > 0
             and not self.eval_only
-            and not self.in_warmup
+            and not self.in_replay_warmup
             and self._total_episodes % self.eval_interval_episodes == 0
         ):
             self._eval_pending = True
@@ -689,7 +712,7 @@ class RLTStage2Policy:
             ),
             "preference_buffer_size": len(self.trainer.rewind_preference_buffer),
             "warmup_steps": self.warmup_steps,
-            "warmup_done": not self.in_warmup,
+            "warmup_done": not self.in_replay_warmup,
             "total_chunks": self._total_chunks,
             "total_episodes": self._total_episodes,
             "total_updates": int(self.trainer.update_step),
@@ -727,6 +750,7 @@ class RLTStage2Policy:
             or self._eval_episode_active
             or not self._eval_pending
             or self.in_warmup
+            or self.in_replay_warmup
         ):
             return
         self._eval_episode_active = True

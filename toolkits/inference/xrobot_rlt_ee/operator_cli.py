@@ -34,6 +34,7 @@ COMMANDS = (
     "rewind_exit",
     "rewind_credit",
     "status",
+    "sigma",
 )
 
 
@@ -47,6 +48,11 @@ def main() -> int:
     parser.add_argument("--terminal-reward", type=float, default=0.0)
     parser.add_argument("--prefix-reward", type=float, default=0.1)
     parser.add_argument("--confidence", type=float, default=1.0)
+    parser.add_argument(
+        "--sigma",
+        default="default",
+        help="for command sigma: a number, or default to use the server value",
+    )
     args = parser.parse_args()
     payload = {
         "command": args.command,
@@ -55,6 +61,8 @@ def main() -> int:
         "prefix_reward": args.prefix_reward,
         "confidence": args.confidence,
     }
+    if args.command == "sigma":
+        payload["sigma"] = args.sigma
     with socket.create_connection((args.host, args.port), timeout=5.0) as connection:
         connection.sendall((json.dumps(payload) + "\n").encode("utf-8"))
         reply = connection.makefile("rb").readline(4096)

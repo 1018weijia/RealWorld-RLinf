@@ -51,6 +51,13 @@ _HEALTHY_ROLLBACK_OUTCOMES = {
 }
 
 
+def _terminal_ee14(detail: Any, sample_key: str, event_name: str) -> Any:
+    sample = detail.get(sample_key) if isinstance(detail, Mapping) else None
+    if not isinstance(sample, Mapping):
+        raise ValueError(f"{event_name} has no {sample_key} sample")
+    return state_from_v2_sample(sample)
+
+
 def _physical_rewind_completion(detail: Any) -> dict[str, Any]:
     """Validate a completed V2 physical rollback and extract its RLT receipt."""
     if not isinstance(detail, Mapping):
@@ -158,6 +165,7 @@ class V2EventAdapter:
             "policy_control_stopped",
             "rollback_control_stopped",
             "session_succeeded",
+            "session_failed",
             "session_aborted",
         }:
             pending_status = self._pending_status(event)
@@ -226,17 +234,22 @@ class V2EventAdapter:
                     }
                 )
         elif name == "session_succeeded":
-            detail = event.get("detail")
-            success_end = (
-                detail.get("success_end") if isinstance(detail, Mapping) else None
-            )
-            if not isinstance(success_end, Mapping):
-                raise ValueError("session_succeeded has no success_end sample")
-            terminal_state = state_from_v2_sample(success_end)
             result = self.control.request(
                 {
                     "command": "success",
-                    "terminal_state": terminal_state.tolist(),
+                    "terminal_state": _terminal_ee14(
+                        event.get("detail"), "success_end", "session_succeeded"
+                    ).tolist(),
+                    "v2_event_id": event_id,
+                }
+            )
+        elif name == "session_failed":
+            result = self.control.request(
+                {
+                    "command": "failure",
+                    "terminal_state": _terminal_ee14(
+                        event.get("detail"), "failure_end", "session_failed"
+                    ).tolist(),
                     "v2_event_id": event_id,
                 }
             )

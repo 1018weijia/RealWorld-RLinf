@@ -77,6 +77,7 @@ class DecisionInbox:
         self._value: QueuedDecision | None = None
         self._pending_started_wall_ns: int | None = None
         self._pending_transition_id: str | None = None
+        self._exploration_noise_sigma: float | None = None
 
     def submit(self, value: QueuedDecision) -> None:
         with self._lock:
@@ -136,6 +137,22 @@ class DecisionInbox:
             self._pending_started_wall_ns = None
             self._pending_transition_id = None
 
+    def set_exploration_noise_sigma(self, value: Any) -> float | None:
+        """Override actor noise on the next ``act``. ``None`` restores server default."""
+        if value is None or value == "" or str(value).strip().lower() == "default":
+            sigma: float | None = None
+        else:
+            sigma = float(value)
+            if sigma < 0.0:
+                raise BridgeError("exploration_noise_sigma must be >= 0")
+        with self._lock:
+            self._exploration_noise_sigma = sigma
+        return sigma
+
+    def exploration_noise_sigma(self) -> float | None:
+        with self._lock:
+            return self._exploration_noise_sigma
+
     def status(self) -> dict[str, Any]:
         with self._lock:
             return {
@@ -143,6 +160,7 @@ class DecisionInbox:
                 "pending_transition_id": self._pending_transition_id,
                 "pending_started_wall_ns": self._pending_started_wall_ns,
                 "decision_queued": self._value is not None,
+                "exploration_noise_sigma": self._exploration_noise_sigma,
             }
 
 
@@ -208,6 +226,7 @@ class RLTBridgeCore:
         )
         rlt_observation = observation_to_rlt(observation, task=self.task)
         self._last_rlt_observation = rlt_observation
+        self.session.exploration_noise_sigma = self.inbox.exploration_noise_sigma()
         if self.session.pending is not None:
             queued = self.inbox.pop()
             if queued.abort:
@@ -335,7 +354,13 @@ async def _operator_handler(
         decoded = json.loads(raw.decode("utf-8"))
         if not isinstance(decoded, Mapping):
             raise BridgeError("operator command must be a JSON object")
-        if str(decoded.get("command", "")).strip().lower() == "status":
+        command = str(decoded.get("command", "")).strip().lower()
+        if command == "status":
+            reply = {"ok": True, **inbox.status()}
+        elif command == "sigma":
+            inbox.set_exploration_noise_sigma(
+                decoded.get("sigma", decoded.get("value"))
+            )
             reply = {"ok": True, **inbox.status()}
         else:
             inbox.submit(parse_operator_command(decoded))
@@ -433,6 +458,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--connect-timeout", type=float, default=600.0)
     parser.add_argument("--recv-timeout", type=float, default=900.0)
     parser.add_argument(
+        "--exploration-noise-sigma",
+        type=float,
+        default=None,
+        help="per-act actor noise override; omit to use the server default",
+    )
+    parser.add_argument(
         "--probe-only",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -451,6 +482,8 @@ def parse_args() -> argparse.Namespace:
 
 async def _main_async(args: argparse.Namespace) -> None:
     inbox = DecisionInbox()
+    if args.exploration_noise_sigma is not None:
+        inbox.set_exploration_noise_sigma(args.exploration_noise_sigma)
     operator_server = await asyncio.start_server(
         lambda reader, writer: _operator_handler(reader, writer, inbox),
         args.operator_host,

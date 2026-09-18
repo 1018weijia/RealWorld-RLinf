@@ -10,6 +10,7 @@ LISTEN_PORT="${RLT_EE_BRIDGE_PORT:-33057}"
 OPERATOR_PORT="${RLT_EE_OPERATOR_PORT:-33058}"
 TASK_PROMPT="${RLT_TASK_PROMPT:-put ring on the rod}"
 ALLOW_MOTION="${RLT_EE_ALLOW_MOTION:-false}"
+EXPLORATION_SIGMA="${RLT_EXPLORATION_NOISE_SIGMA:-}"
 RUNTIME_DIR="/tmp/x2robot_rlt_ee"
 LOG_PATH="/tmp/x2robot_rlt_ee_bridge.log"
 
@@ -59,6 +60,12 @@ else
   echo "[rlt-ee] probe-only: upstream actions cannot reach DesktopClient"
 fi
 
+SIGMA_ARG=()
+if [[ -n "$EXPLORATION_SIGMA" ]]; then
+  SIGMA_ARG=(--exploration-noise-sigma "$EXPLORATION_SIGMA")
+fi
+sigma_cli="${SIGMA_ARG[*]}"
+
 docker exec -d \
   -e PYTHONPATH=/tmp \
   -e UPSTREAM_URI="$UPSTREAM_URI" \
@@ -66,13 +73,16 @@ docker exec -d \
   -e OPERATOR_PORT="$OPERATOR_PORT" \
   -e TASK_PROMPT="$TASK_PROMPT" \
   -e PROBE_ARG="$PROBE_ARG" \
+  -e SIGMA_CLI="$sigma_cli" \
   "$CONTAINER" bash -lc '
     source /opt/xr/py_env/bin/activate
+    # shellcheck disable=SC2086
     exec python -m x2robot_rlt_ee.bridge \
       --upstream-uri "$UPSTREAM_URI" \
       --listen-host 127.0.0.1 --listen-port "$LISTEN_PORT" \
       --operator-host 127.0.0.1 --operator-port "$OPERATOR_PORT" \
       --task "$TASK_PROMPT" --chunk-length 50 "$PROBE_ARG" \
+      $SIGMA_CLI \
       > /tmp/x2robot_rlt_ee_bridge.log 2>&1
   '
 

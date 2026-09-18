@@ -37,6 +37,7 @@ pytest.importorskip("msgpack_numpy")
 
 from toolkits.inference.xrobot_rlt_ee import codec
 from toolkits.inference.xrobot_rlt_ee.bridge import (
+    BridgeError,
     DecisionInbox,
     QueuedDecision,
     RLTBridgeCore,
@@ -152,6 +153,28 @@ class SessionTest(unittest.TestCase):
             (7, 9, 42),
         )
         self.assertAlmostEqual(float(transition["action_chunk"][0, 6]), 4.6, places=5)
+        self.assertNotIn("exploration_noise_sigma", requests[0])
+
+    def test_act_forwards_exploration_noise_override(self) -> None:
+        requests = []
+
+        def request(payload):
+            requests.append(payload)
+            if payload["rlt/request"] == "act":
+                return {
+                    "actions": np.zeros((2, 14), dtype=np.float32),
+                    "transition_id": "t0",
+                    "episode_id": 1,
+                    "session_id": 1,
+                    "env_id": 0,
+                    "chunk_id": 1,
+                }
+            return {"ok": True}
+
+        session = RLTSession(request, metadata(), task="task", chunk_length=2)
+        session.exploration_noise_sigma = 0.05
+        session.request_action({"state": np.zeros(14)})
+        self.assertEqual(requests[0]["exploration_noise_sigma"], 0.05)
 
     def test_wrong_action_schema_fails_closed(self) -> None:
         with self.assertRaises(ProtocolError):
@@ -270,6 +293,24 @@ class BridgeTerminalTest(unittest.TestCase):
         self.assertTrue(transition["info"]["physical_rewind_state_receipt"])
         self.assertEqual(upstream.requests[2]["rlt/request"], "rewind_exit_correction")
 
+    def test_inbox_sigma_is_forwarded_on_act(self) -> None:
+        upstream = FakeUpstream()
+        inbox = DecisionInbox()
+        inbox.set_exploration_noise_sigma(0.05)
+        core = RLTBridgeCore(
+            upstream,
+            task="task",
+            chunk_length=2,
+            probe_only=False,
+            inbox=inbox,
+        )
+        core.process_observation(desktop_observation())
+        self.assertEqual(upstream.requests[0]["exploration_noise_sigma"], 0.05)
+        inbox.set_exploration_noise_sigma("default")
+        self.assertIsNone(inbox.exploration_noise_sigma())
+        with self.assertRaises(BridgeError):
+            inbox.set_exploration_noise_sigma(-0.1)
+
 
 class FakeBridgeControl:
     def __init__(self, start_wall_ns: int, *, pending: bool = True) -> None:
@@ -355,6 +396,20 @@ class V2EventAdapterTest(unittest.TestCase):
             }
         )
         self.assertEqual(control.payloads[-1]["command"], "success")
+        self.assertEqual(len(control.payloads[-1]["terminal_state"]), 14)
+
+    def test_failure_carries_terminal_ee14(self) -> None:
+        sample = V2ReceiptTest._sample(0)
+        control = FakeBridgeControl(sample["t_wall_ns"])
+        adapter = V2EventAdapter(control, chunk_length=50, control_hz=30)
+        adapter.handle(
+            {
+                "event_id": "event-failure",
+                "event": "session_failed",
+                "detail": {"failure_end": sample},
+            }
+        )
+        self.assertEqual(control.payloads[-1]["command"], "failure")
         self.assertEqual(len(control.payloads[-1]["terminal_state"]), 14)
 
     def test_stale_terminal_is_ignored_and_current_abort_is_forwarded(self) -> None:

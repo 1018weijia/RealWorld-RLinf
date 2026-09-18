@@ -161,7 +161,7 @@ STAGE2_RESUME_DIR=/data/gxy/realworldRL/offline_rl_buffers/xrobot_usb_plug/pretr
 
 套环仍用第 3 节（端口 **8000**、`put ring on the rod`）。USB 用 `start_xrobot_stage2.sh`、端口 **8016**、prompt `Bimanual usb pick and insert`。不要用 Cobot 启动器（会把 chunk 打成 30、residual 打成 0.3）。
 
-Cal-QL 已经写进 `offline_total_updates`，resume 后**不会**再采 250 行 warmup。日志里的 `warmup 250 rows` 只是配置打印。第一回合就是 residual actor。第 8 节「必须与 Stage 1 逐元素相同」这次**对不上是正常的**。
+Cal-QL 已经写进 `offline_total_updates`，resume 后**仍执行 residual**（不再强制 Stage 1）。在线 replay 未满 `warmup_steps`（默认 250 行）时只存 chunk、不跑 UTD，避免 `offline_sample_ratio=0.1` 抽空在线 buffer。`warmup_done` 表示在线行数已够，不是“又回到纯 VLA”。第 8 节「必须与 Stage 1 逐元素相同」这次**对不上是正常的**。
 
 在线训练只在机器人发来 `episode_end` 之后才走。server 起来后可以空等几小时，没有客户端就不会迭代。
 
