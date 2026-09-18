@@ -11,7 +11,7 @@
 > **对照更新：2026-09-14**，对照远端 `exp/config.yaml`、`exp/stage2_server_shuo_rlinf.sh`、`exp/stage2_client_shuo_sync.sh`。客户端不要同步；服务端能迁的按 0.5 节 A–E 做完。
 > **盘点：2026-09-15**，当前结论、已落地改动、未决问题和残留冗余见 **第 0.6 节**。第 0.2–0.5 节保留审查当时的条目，其中 0.5 的 1–8 条已按落地结果改状态。
 > **USB 在线：2026-09-16**，云机 resume Cal-QL 后常驻 `8016`；跨机合同与空等见 **第 0.7 节**。客户端逐步操作见 `examples/embodiment/xrobot-stage2-robot-quickstart.md` 的「USB 客户端」。
-> **对齐与联调：2026-09-18**，对照 `rlt-openpi@origin/remote-franka`（`26378e2`）补打分键 `p`/`o`/`x` 与 `submit`，并修复接管导致的断连与接管回执丢失，见 **第 0.8 节**。
+> **对齐与联调：2026-09-18**，对照 `rlt-openpi@origin/remote-franka`（`26378e2`）补打分键 `p`/`o`/`x` 与 `submit`，并修复接管导致的断连与接管回执丢失，见 **第 0.8 节**。**客户端怎么拉代码、怎么操作、每个键什么含义，见第 0.9 节**（机器人侧的人只看那一节即可）。
 
 ## 0. 修复状态（2026-09-11 更新）
 
@@ -387,6 +387,138 @@ RLT 协议**不需要改**：`transition` 本来就带 `rewards` 数组，打分
 现象：接管后服务端与客户端断开，接管期间的动作到不了服务端。根因是 upstream 连接和 `RLTSession` 都是**按 DesktopClient 连接**创建的，`_serve_robot` 的 `finally` 无条件 `core.abort()` + `upstream.close()`。V2 在接管时关掉模型连接，于是整局被 `episode_end(aborted=True)` 判死，排队中的 intervention 回执一起丢掉，服务端还会打印 `dropping N pending transitions`。
 
 修法：新增 `BridgeRuntime` 持有进程级 upstream 和当前 episode；DesktopClient 断开只解绑 downstream，不 abort、不关 upstream，重连后继续同一局；只有 episode 自身已结束时才开新 session。协议异常仍然 abort 那一局，但保留 upstream。
+
+### 0.9 客户端操作（机器人侧，2026-09-18 起）
+
+本节面向在 X2Robot 机器上操作的人，照做即可，不需要读前面的算法部分。完整版在
+`examples/embodiment/xrobot-stage2-robot-quickstart.md`。
+
+#### 0.9.1 先拉代码
+
+新的打分键和接管修复都在机器人侧的 `toolkits/inference/xrobot_rlt_ee/`，**不拉代码不会生效**。
+
+```bash
+cd /home/xr/lfwj/RealWorld-RLinf
+git pull
+git log -1 --oneline        # 应为 4c8be6a9 或更新
+```
+
+如果这台机器解析不了 github（`ssh: Could not resolve hostname github.com`），让 GPU 侧的人用
+`git bundle` 传一份过来，不要去改机器人的 DNS：
+
+```bash
+# 在有代码的机器上
+git bundle create /tmp/rlt.bundle <机器人当前HEAD>..rlt-server-embodiment
+scp /tmp/rlt.bundle <robot>:/tmp/rlt.bundle
+# 在机器人上
+cd /home/xr/lfwj/RealWorld-RLinf
+git fetch /tmp/rlt.bundle rlt-server-embodiment && git merge --ff-only FETCH_HEAD
+```
+
+#### 0.9.2 启动顺序（三步，顺序不能换）
+
+GPU 侧先要有 `RLT Stage 2 server ready on 0.0.0.0:8016`。打不通 8016 就先开隧道
+（云机 SSH 口是 34133，和 WS 口不是一个），之后上游地址写 `ws://127.0.0.1:8016`：
+
+```bash
+ssh -p 34133 -N -L 8016:127.0.0.1:8016 root@<GPU_HOST>
+```
+
+```bash
+cd /home/xr/lfwj/RealWorld-RLinf
+
+# ① probe：机械臂不动，只验握手和形状，日志里不能有 ProtocolError
+RLT_UPSTREAM_URI=ws://127.0.0.1:8016 \
+  RLT_TASK_PROMPT="Bimanual usb pick and insert" \
+  RLT_EXPLORATION_NOISE_SIGMA=0.1 \
+  bash toolkits/inference/run_xrobot_rlt_ee_bridge.sh
+
+# ② V2 事件适配器，必须在开 V2 会话之前
+bash toolkits/inference/run_xrobot_rlt_ee_v2_adapter.sh
+
+# ③ 放开真实动作，再开一个没用过的 session id
+bash toolkits/inference/run_xrobot_rlt_ee_bridge.sh --stop
+RLT_EE_ALLOW_MOTION=true \
+  RLT_UPSTREAM_URI=ws://127.0.0.1:8016 \
+  RLT_TASK_PROMPT="Bimanual usb pick and insert" \
+  RLT_EXPLORATION_NOISE_SIGMA=0.1 \
+  bash toolkits/inference/run_xrobot_rlt_ee_bridge.sh
+
+cd /home/xr/lfwj
+env -u HISTORY_DRY_RUN MODEL_ADDRESS=127.0.0.1:33057 \
+  ./collect/run_interactive_session_v2.sh --session-id v2_YYYYMMDD_NN
+```
+
+三个固定值：prompt 必须一字不差 `Bimanual usb pick and insert`；DesktopClient 模型地址
+`127.0.0.1:33057`；`RLT_EXPLORATION_NOISE_SIGMA=0.1`（对齐 rlt-openpi 的 `ACTOR_NOISE_SIGMA`，
+**不要**去改服务端 YAML 的 0.2，改了离线合同就对不上、`offline_step_40000` 无法 resume）。
+
+#### 0.9.3 按键含义
+
+**注意 V2 和 Cobot 那套是反的：V2 里 `s` 是接管、`f` 是成功。**
+
+| 键 | 含义 | 回合是否结束 | RLT 侧动作 |
+|---|---|---|---|
+| `r` 第一次 | 暂停 policy，开始物理倒车 | 否 | 当前 chunk 按实测 `/end_pose` 重采样成 `[50,14]`，标 intervention 排队 |
+| `r` 第二次 | 停止倒放，收敛到 `PolicyPaused` | 否 | 校验回退健康后发 `rewind_exit`，终止奖励 −1.0，带实测终态 |
+| `s` | 进入人工接管（必须在倒车停止后） | 否 | 无。人工遥操那一段不进在线 replay |
+| `h` | 交还 policy，开新 policy phase | 否 | 无。policy 恢复后自动接上 |
+| `f` | **成功**结束 | 是 | 发 `success`，最后一步写 **+1** |
+| `d` | **失败**结束 | 是 | 发 `failure`，服务端在最后一步写 **−1** |
+| `p` | 打分：进展 | **否** | 发 `progress`，当前 chunk **+0.5** |
+| `o` | 打分：小进展，可连按 | **否** | 发 `small_progress`，当前 chunk 每次 **+0.1**，累加 |
+| `x` | 打分：退步 | **否** | 发 `regress`，当前 chunk **−0.5** |
+| `y` | 接管暂停时提交当前 chunk 并继续 | **否** | 发 `submit`，把接管回执立刻交给服务端 |
+| `q` | 人工 abort，返回码 2 属正常 | 是 | 发 `abort`，丢弃未完成 transition，**不给任何判定** |
+
+几条容易踩的：
+
+- `p` / `o` / `x` / `y` 需要 V2 按 0.9.4 的契约发事件才生效；在那之前用 `operator_cli` 手工发，效果完全一样。
+- 打分落在**当前这个 chunk** 上；两个 chunk 之间按的键会留在队列里，落到下一个提交的 chunk。
+- `s` / `f` 的终止奖励**优先于**累计打分，不是相加。
+- 倒车流程请等第二次 `r` 之后再 `y`，否则 `rewind_exit` 判定会落到下一个 chunk 上。
+- 每轮必须用 `f` / `d` / `q` 收尾，否则服务端不训练（训练只在 `episode_end` 发生）。
+- `q` 中止仍会按已提交的 actor chunk 跑 UTD。想少更新就少收尾。
+
+#### 0.9.4 V2 要发的事件契约
+
+发到 `/take_over_data`，adapter 会转成对应的 RLT operator 命令。`event_id` 必须唯一（按它去重）：
+
+```json
+{"event_id": "...", "event": "session_failed", "detail": {"failure_end": <与 success_end 同结构的终态 sample>}}
+{"event_id": "...", "event": "session_progress"}
+{"event_id": "...", "event": "session_small_progress"}
+{"event_id": "...", "event": "session_regress", "detail": {"reward": -0.25}}
+{"event_id": "...", "event": "session_submit"}
+```
+
+打分和 `submit` 的 `detail` 可省略；`detail.reward` 用来覆盖默认分值。打分事件**不要求**当前有
+pending chunk，两个 chunk 之间按的键会留在队列里。
+
+#### 0.9.5 手工命令（V2 没接好之前全部可用）
+
+```bash
+docker exec desktop-robot_client-1 bash -lc \
+  'source /opt/xr/py_env/bin/activate && PYTHONPATH=/tmp python -m x2robot_rlt_ee.operator_cli <命令>'
+```
+
+可用 `<命令>`：`success`、`failure`、`progress`、`small_progress`、`regress`、`submit`、
+`abort`、`rewind_exit`、`rewind_credit`、`sigma`、`status`。
+`rewind_*` 用 `--chunks N`（只改 replay 不动机械臂）；打分用 `--reward` 覆盖分值；
+`sigma --sigma 0.05` 在线改探索噪声（`--sigma default` 回到服务端的 0.2，`--sigma 0` 关噪声）。
+
+`status` 是联调时最有用的一条，会回 `pending`、`queued_score`、`exploration_noise_sigma`。
+
+#### 0.9.6 三个验收点
+
+1. `operator_cli status` 里 `exploration_noise_sigma` 是 `0.1`。
+2. 按一次 `progress`，`status` 的 `queued_score` 变成 0.5；等这个 chunk 提交后，服务端
+   `env/episode_reward` 增加而回合**没有**结束。
+3. 接管一次：bridge 日志出现 `RLT episode kept open`，服务端**不再**出现接管后的
+   `episode_end` + `dropping N pending transitions`。看到了说明 bridge 还是旧版本，回 0.9.1。
+
+在线 replay 未满 `warmup_steps`（250 行）之前，服务端只存不训，日志是
+`filling online replay (N/250 rows)`、`warmup_done=false`，这是正常的。
 
 ## 1. 目标
 
