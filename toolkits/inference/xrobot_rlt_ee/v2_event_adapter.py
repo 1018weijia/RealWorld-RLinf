@@ -51,6 +51,14 @@ _HEALTHY_ROLLBACK_OUTCOMES = {
 }
 
 
+# V2 scoring keys, mirroring the rlt-openpi remote-franka client p / o / x.
+_SCORE_EVENTS = {
+    "session_progress": "progress",
+    "session_small_progress": "small_progress",
+    "session_regress": "regress",
+}
+
+
 def _terminal_ee14(detail: Any, sample_key: str, event_name: str) -> Any:
     sample = detail.get(sample_key) if isinstance(detail, Mapping) else None
     if not isinstance(sample, Mapping):
@@ -197,6 +205,11 @@ class V2EventAdapter:
                     {
                         "command": "intervention",
                         "action_chunk": receipt.action_chunk.tolist(),
+                        # Last measured pose of the takeover. The normal commit
+                        # path uses the fresh observation and ignores this; it
+                        # is what lets an operator `submit` close the chunk
+                        # while the policy is still paused.
+                        "terminal_state": receipt.action_chunk[-1].tolist(),
                         "source_samples": receipt.source_samples,
                         "source_start_wall_ns": receipt.source_start_wall_ns,
                         "source_end_wall_ns": receipt.source_end_wall_ns,
@@ -255,6 +268,19 @@ class V2EventAdapter:
             )
         elif name == "session_aborted":
             result = self.control.request({"command": "abort", "v2_event_id": event_id})
+        elif name in _SCORE_EVENTS:
+            # Mid-episode operator score; the rollout continues. Deliberately
+            # not gated on a pending chunk: a press between two chunks waits in
+            # the inbox and lands on whichever chunk commits next.
+            payload = {"command": _SCORE_EVENTS[name], "v2_event_id": event_id}
+            detail = event.get("detail")
+            if isinstance(detail, Mapping) and detail.get("reward") is not None:
+                payload["reward"] = float(detail["reward"])
+            result = self.control.request(payload)
+        elif name == "session_submit":
+            result = self.control.request(
+                {"command": "submit", "v2_event_id": event_id}
+            )
         else:
             result = {"ok": True, "ignored": "unmapped_event", "event": name}
         self._seen.add(event_id)

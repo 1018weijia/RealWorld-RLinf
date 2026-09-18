@@ -493,6 +493,23 @@ def test_warmup_gates_the_stage2_head_on_replay_size():
     assert trainer.replay_buffer.total_samples == 2
 
 
+def test_mid_episode_score_is_stored_without_ending_the_episode():
+    policy, trainer, _ = build_policy(warmup_steps=0, utd_ratio=1)
+    rewards = np.zeros(CHUNK_LEN, dtype=np.float32)
+    rewards[-1] = 0.5
+
+    stored = commit(policy, act(policy)["transition_id"], rewards=rewards)
+
+    assert stored["stored"] is True
+    row = trainer.transitions[-1]
+    assert float(row["rewards"][-1]) == pytest.approx(0.5)
+    assert row["done"] is False
+    assert row["bootstrap_mask"] == 1.0
+    ended = policy.infer({REQUEST_KEY: REQUEST_EPISODE_END, "stats": {}})
+    assert ended["metrics"]["env/episode_reward"] == pytest.approx(0.5)
+    assert ended["failure_penalty_applied"] is False
+
+
 def test_calql_resume_stores_online_rows_before_utd():
     policy, trainer, inference = build_policy(warmup_steps=2, utd_ratio=3)
     trainer.offline_total_updates = 40000

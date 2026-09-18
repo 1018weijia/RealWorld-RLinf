@@ -11,6 +11,7 @@
 > **对照更新：2026-09-14**，对照远端 `exp/config.yaml`、`exp/stage2_server_shuo_rlinf.sh`、`exp/stage2_client_shuo_sync.sh`。客户端不要同步；服务端能迁的按 0.5 节 A–E 做完。
 > **盘点：2026-09-15**，当前结论、已落地改动、未决问题和残留冗余见 **第 0.6 节**。第 0.2–0.5 节保留审查当时的条目，其中 0.5 的 1–8 条已按落地结果改状态。
 > **USB 在线：2026-09-16**，云机 resume Cal-QL 后常驻 `8016`；跨机合同与空等见 **第 0.7 节**。客户端逐步操作见 `examples/embodiment/xrobot-stage2-robot-quickstart.md` 的「USB 客户端」。
+> **对齐与联调：2026-09-18**，对照 `rlt-openpi@origin/remote-franka`（`26378e2`）补打分键 `p`/`o`/`x` 与 `submit`，并修复接管导致的断连与接管回执丢失，见 **第 0.8 节**。
 
 ## 0. 修复状态（2026-09-11 更新）
 
@@ -354,6 +355,38 @@ USB 不走套环启动器，也不走 Cobot launcher（后者会把 chunk 打成
 4. V2：`s` 接管，`f` 成功。每轮必须收尾，否则 server 不训练。
 
 操作文档：`examples/embodiment/xrobot-stage2-gpu-quickstart.md` 第 10 节；`examples/embodiment/xrobot-stage2-robot-quickstart.md` 「USB 客户端」。
+
+### 0.8 2026-09-18 对齐审计：`rlt-openpi@origin/remote-franka`
+
+本地 `/data/gxy/realworldRL/rlt-openpi` 已 fetch 到 `origin/remote-franka`（`26378e2`，比 0.5 节当时的 `f80a804` 新 21 个提交，新增 `exp/stage1-2_shuo_ddp_rlinf.sh`、`exp/stage2-2_offline_shuo_rlinf.sh`）。对照 `exp/stage2_server_shuo_rlinf.sh`、`exp/stage2_client_shuo_sync.sh`、`exp/start_franka_control_rlt_sync.sh`、`exp/config.yaml`。
+
+#### 已一致
+
+`rl_algo_act=expo`、`rl_algo_td_backup=expo_decoupled`、`expo_num_base_samples=4`、`expo_num_edit_samples=4`、`edit_scale/residual_scale=0.4`（对齐 `exp/config.yaml:85`；脚本里的 `EDIT_SCALE=0.3` 是旧默认）、`gripper_edit_scale=2.0`、`actor_lr=3e-5`、`ACTOR_ACTION_CLIP_GRADIENT_MODE=inward`。
+
+#### 差异与处理
+
+| 项 | 他们 | 我们 | 处理 |
+|---|---|---|---|
+| `actor_noise_sigma` | 0.1（`stage2_server_shuo_rlinf.sh:250`） | YAML 0.2 | **不改 YAML**：改了会让 `offline_step_40000` 的在线 resume 合同不匹配（`actor_noise_sigma` 在 `contract().actor_model` 里，而 `allow_actor_reconfiguration` 只在 `offline_mode` 下可用）。改为客户端 per-act 覆盖 `RLT_EXPLORATION_NOISE_SIGMA=0.1`，已写进机器人速查。 |
+| `TARGET_NOISE_SIGMA` / `TARGET_NOISE_CLIP` | 0.007 / 0.014 | 无 | **未实现**。我们只有 `intervention_critic_action_noise_*` 和 `rewind_critic_action_noise_*`（各 0.002/0.005），主 TD backup 没有 target 平滑噪声。这两个键在 `algorithm.` 下、不进合同，可随时加。留作单独决策。 |
+| 失败奖励 | `f` = failure，reward **0** | `server.failure_reward: -1.0` | 有意分叉，保持 −1.0：我们要显式惩罚失败分支。 |
+| `MAX_ENTROPY_ACTOR` | 1（TanhNormal + 在线调 α） | 固定方差、α=0 | 有意不迁移，见 0.6 节。 |
+| 打分键 `p` / `o` / `x` | 有（0.5 / +0.1 累加 / −0.5，**不结束回合**） | 原先完全没有 | **本轮补上**，见下。 |
+
+#### 打分键与 submit（本轮实现）
+
+`exp/stage2_client_shuo_sync.sh` 的键位是 `s`=成功 1、`f`=失败 0、`p`=进展 0.5、`o`=小进展 +0.1（可累加）、`x`=退步 −0.5、`y`=接管暂停时提交当前 chunk 并继续。
+
+RLT 协议**不需要改**：`transition` 本来就带 `rewards` 数组，打分只是把 `rewards[-1]` 写成非零而保持 `done=False`、`bootstrap_mask=1`。实现落在客户端侧：`QueuedDecision.score`（累加）、`RLTSession.commit(score=...)`、`operator_cli` 的 `progress` / `small_progress` / `regress`，以及 adapter 的 `session_progress` / `session_small_progress` / `session_regress` 事件。终止判定优先于累计分。
+
+`y` 对应新增的 `submit` 命令：`DecisionInbox.pop_commit_now` + `RLTBridgeCore.flush_queued_submit`，在 policy 暂停、没有新观测时把当前 chunk 连同接管回执提交，**不**结束 episode。故意做成显式命令而不是“见到 intervention 就冲”，否则 `r` → `r` 的倒车流程会在 `rewind_exit` 判定到达前就把 chunk 提交掉。
+
+#### 接管断连（本轮修复）
+
+现象：接管后服务端与客户端断开，接管期间的动作到不了服务端。根因是 upstream 连接和 `RLTSession` 都是**按 DesktopClient 连接**创建的，`_serve_robot` 的 `finally` 无条件 `core.abort()` + `upstream.close()`。V2 在接管时关掉模型连接，于是整局被 `episode_end(aborted=True)` 判死，排队中的 intervention 回执一起丢掉，服务端还会打印 `dropping N pending transitions`。
+
+修法：新增 `BridgeRuntime` 持有进程级 upstream 和当前 episode；DesktopClient 断开只解绑 downstream，不 abort、不关 upstream，重连后继续同一局；只有 episode 自身已结束时才开新 session。协议异常仍然 abort 那一局，但保留 upstream。
 
 ## 1. 目标
 

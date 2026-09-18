@@ -60,11 +60,22 @@ class BridgeError(RuntimeError):
     """A request was rejected before an action could be sent to the robot."""
 
 
+SCORE_COMMANDS = {
+    # Mirrors the rlt-openpi remote-franka client keys p / o / x. All three are
+    # mid-episode: they score the chunk in flight and the rollout continues.
+    "progress": 0.5,
+    "small_progress": 0.1,
+    "regress": -0.5,
+}
+
+
 @dataclass(frozen=True)
 class QueuedDecision:
     decision: OperatorDecision | None = None
     intervention: bool = False
     abort: bool = False
+    commit_now: bool = False
+    score: float = 0.0
     executed_actions: Any | None = None
     terminal_state: Any | None = None
 
@@ -95,6 +106,10 @@ class DecisionInbox:
                 decision=value.decision or current.decision,
                 intervention=current.intervention or value.intervention,
                 abort=current.abort or value.abort,
+                commit_now=current.commit_now or value.commit_now,
+                # Scores stack: the operator can tap small_progress repeatedly
+                # before the chunk in flight is committed.
+                score=current.score + value.score,
                 executed_actions=(
                     value.executed_actions
                     if value.executed_actions is not None
@@ -123,6 +138,15 @@ class DecisionInbox:
                 )
             )
             if not is_terminal:
+                return None
+            self._value = None
+            return value
+
+    def pop_commit_now(self) -> QueuedDecision | None:
+        """Take the queue only when the operator asked to submit the chunk now."""
+        with self._lock:
+            value = self._value
+            if value is None or not value.commit_now:
                 return None
             self._value = None
             return value
@@ -160,6 +184,7 @@ class DecisionInbox:
                 "pending_transition_id": self._pending_transition_id,
                 "pending_started_wall_ns": self._pending_started_wall_ns,
                 "decision_queued": self._value is not None,
+                "queued_score": 0.0 if self._value is None else self._value.score,
                 "exploration_noise_sigma": self._exploration_noise_sigma,
             }
 
@@ -172,6 +197,14 @@ def parse_operator_command(payload: Mapping[str, Any]) -> QueuedDecision:
         )
     if command == "abort":
         return QueuedDecision(abort=True)
+    if command == "submit":
+        return QueuedDecision(commit_now=True)
+    if command in SCORE_COMMANDS:
+        reward = payload.get("reward")
+        score = SCORE_COMMANDS[command] if reward is None else float(reward)
+        if not np.isfinite(score):
+            raise BridgeError("score reward must be finite")
+        return QueuedDecision(score=score)
     if command in {"success", "failure", "rewind_exit", "rewind_credit"}:
         return QueuedDecision(
             decision=OperatorDecision(
@@ -185,9 +218,16 @@ def parse_operator_command(payload: Mapping[str, Any]) -> QueuedDecision:
             terminal_state=payload.get("terminal_state"),
         )
     raise BridgeError(
-        "command must be success, failure, intervention, abort, "
-        "rewind_exit, or rewind_credit"
+        "command must be success, failure, intervention, abort, submit, "
+        "progress, small_progress, regress, rewind_exit, or rewind_credit"
     )
+
+
+def _ee14_state(value: Any, what: str) -> np.ndarray:
+    state = np.asarray(value, dtype=np.float32).reshape(-1)
+    if state.shape != (ACTION_DIM,) or not np.isfinite(state).all():
+        raise BridgeError(f"{what} must be finite EE14")
+    return state
 
 
 class RLTBridgeCore:
@@ -255,21 +295,20 @@ class RLTBridgeCore:
                 and queued.terminal_state is not None
             )
             if has_rewind_state:
-                state = np.asarray(queued.terminal_state, dtype=np.float32).reshape(-1)
-                if state.shape != (ACTION_DIM,) or not np.isfinite(state).all():
-                    raise BridgeError(
-                        "physical rewind terminal_state must be finite EE14"
-                    )
                 next_observation = dict(rlt_observation)
-                next_observation["state"] = state
+                next_observation["state"] = _ee14_state(
+                    queued.terminal_state, "physical rewind terminal_state"
+                )
             self.session.commit(
                 next_observation,
                 queued.decision,
                 intervention=receipt_intervention,
+                score=queued.score,
                 info={
                     "transport": "x2robot-desktop-client",
                     "execution_receipt": receipt_actions is not None,
                     "physical_rewind_state_receipt": has_rewind_state,
+                    "operator_score": queued.score,
                 },
             )
             self.inbox.clear_pending()
@@ -310,20 +349,21 @@ class RLTBridgeCore:
         next_observation = dict(self._last_rlt_observation)
         has_terminal_state = queued.terminal_state is not None
         if has_terminal_state:
-            state = np.asarray(queued.terminal_state, dtype=np.float32).reshape(-1)
-            if state.shape != (ACTION_DIM,) or not np.isfinite(state).all():
-                raise BridgeError("terminal_state must be finite EE14")
-            next_observation["state"] = state
+            next_observation["state"] = _ee14_state(
+                queued.terminal_state, "terminal_state"
+            )
         assert queued.decision is not None
         self.session.commit(
             next_observation,
             queued.decision,
             intervention=queued.intervention,
+            score=queued.score,
             info={
                 "transport": "x2robot-v2-terminal-event",
                 "execution_receipt": queued.executed_actions is not None,
                 "terminal_state_receipt": has_terminal_state,
                 "terminal_images": "last_observation",
+                "operator_score": queued.score,
             },
         )
         self.inbox.clear_pending()
@@ -331,6 +371,50 @@ class RLTBridgeCore:
             success=queued.decision.kind == "success", aborted=False
         )
         self.closed = True
+        return True
+
+    def flush_queued_submit(self) -> bool:
+        """Commit the chunk in flight on operator request, keeping the episode open.
+
+        V2 pauses the policy for a takeover, so the next DesktopClient
+        observation can be minutes away. The receipt is already final once the
+        operator stops the policy, so ``submit`` hands it to the server now
+        instead of holding it until the policy resumes. Mirrors the ``y`` key of
+        the rlt-openpi remote-franka client.
+        """
+        if self.closed:
+            return False
+        queued = self.inbox.pop_commit_now()
+        if queued is None:
+            return False
+        if self.session.pending is None:
+            raise BridgeError("submit has no pending RLT chunk")
+        if self._last_rlt_observation is None:
+            raise BridgeError("submit has no cached observation")
+        if queued.executed_actions is not None:
+            self.session.set_executed_actions(queued.executed_actions)
+        if queued.intervention and queued.executed_actions is None:
+            raise BridgeError("submitted intervention has no actual EE14 receipt")
+        next_observation = dict(self._last_rlt_observation)
+        has_state = queued.terminal_state is not None
+        if has_state:
+            next_observation["state"] = _ee14_state(
+                queued.terminal_state, "submit terminal_state"
+            )
+        self.session.commit(
+            next_observation,
+            queued.decision,
+            intervention=queued.intervention,
+            score=queued.score,
+            info={
+                "transport": "x2robot-v2-operator-submit",
+                "execution_receipt": queued.executed_actions is not None,
+                "terminal_state_receipt": has_state,
+                "terminal_images": "last_observation",
+                "operator_score": queued.score,
+            },
+        )
+        self.inbox.clear_pending()
         return True
 
     def abort(self) -> None:
@@ -373,29 +457,75 @@ async def _operator_handler(
     await writer.wait_closed()
 
 
+class BridgeRuntime:
+    """Owns the upstream link and the live episode across DesktopClient reconnects.
+
+    V2 drops the DesktopClient socket when the operator takes over. Rebuilding
+    the session there would abort the episode and discard the takeover chunk
+    together with the receipt queued for it, so the upstream link and the RLT
+    session deliberately outlive a single downstream connection. A new session
+    starts only once the previous episode is closed.
+    """
+
+    def __init__(self, args: argparse.Namespace, inbox: DecisionInbox) -> None:
+        self._args = args
+        self._inbox = inbox
+        self._upstream: RLTWebSocketClient | None = None
+        self._core: RLTBridgeCore | None = None
+
+    def acquire(self) -> RLTBridgeCore:
+        """Return the live episode, connecting or starting one when needed."""
+        if self._upstream is None:
+            self._upstream = RLTWebSocketClient(
+                self._args.upstream_uri,
+                connect_timeout=self._args.connect_timeout,
+                recv_timeout=self._args.recv_timeout,
+            )
+            self._core = None
+        if self._core is None or self._core.closed:
+            self._core = RLTBridgeCore(
+                self._upstream,
+                task=self._args.task,
+                chunk_length=self._args.chunk_length,
+                probe_only=self._args.probe_only,
+                inbox=self._inbox,
+            )
+        return self._core
+
+    def invalidate(self) -> None:
+        """Drop the upstream link so the next connection reconnects."""
+        upstream, self._upstream, self._core = self._upstream, None, None
+        if upstream is not None:
+            try:
+                upstream.close()
+            except Exception:
+                LOG.exception("could not close the upstream RLT link")
+
+    def shutdown(self) -> None:
+        if self._core is not None and not self._core.closed:
+            try:
+                self._core.abort()
+            except Exception:
+                LOG.exception("could not abort the open RLT episode")
+        self.invalidate()
+
+
 async def _serve_robot(
     websocket: Any,
     *,
     args: argparse.Namespace,
-    inbox: DecisionInbox,
+    runtime: BridgeRuntime,
 ) -> None:
     peer = getattr(websocket, "remote_address", "unknown")
     LOG.info("DesktopClient connected from %s", peer)
-    upstream = await asyncio.to_thread(
-        RLTWebSocketClient,
-        args.upstream_uri,
-        connect_timeout=args.connect_timeout,
-        recv_timeout=args.recv_timeout,
-    )
-    core: RLTBridgeCore | None = None
     try:
-        core = RLTBridgeCore(
-            upstream,
-            task=args.task,
-            chunk_length=args.chunk_length,
-            probe_only=args.probe_only,
-            inbox=inbox,
-        )
+        core = await asyncio.to_thread(runtime.acquire)
+    except Exception as exc:
+        LOG.exception("could not reach the RLT server")
+        runtime.invalidate()
+        await websocket.close(code=1011, reason=str(exc)[:120])
+        return
+    try:
         await websocket.send(
             _legacy_packb(
                 {
@@ -419,6 +549,7 @@ async def _serve_robot(
                 if terminal:
                     await websocket.close(code=1000, reason="RLT episode ended")
                     return
+                await asyncio.to_thread(core.flush_queued_submit)
                 continue
             if not isinstance(raw, bytes):
                 raise BridgeError("DesktopClient request must be binary MessagePack")
@@ -433,17 +564,21 @@ async def _serve_robot(
                 return
             await websocket.send(_legacy_packb(actions, use_bin_type=True))
     except websockets.ConnectionClosed:
-        LOG.info("DesktopClient disconnected from %s", peer)
+        # A takeover drops this socket while the episode is still valid. Keep
+        # the upstream session so the queued receipt survives the reconnect.
+        LOG.info(
+            "DesktopClient disconnected from %s; RLT episode kept open (closed=%s)",
+            peer,
+            core.closed,
+        )
     except Exception as exc:
         LOG.exception("RLT bridge rejected request")
+        try:
+            await asyncio.to_thread(core.abort)
+        except Exception:
+            LOG.exception("could not abort the failed RLT episode")
+            runtime.invalidate()
         await websocket.close(code=1011, reason=str(exc)[:120])
-    finally:
-        if core is not None and not core.closed:
-            try:
-                await asyncio.to_thread(core.abort)
-            except Exception:
-                LOG.exception("could not abort incomplete RLT episode")
-        upstream.close()
 
 
 def parse_args() -> argparse.Namespace:
@@ -484,36 +619,40 @@ async def _main_async(args: argparse.Namespace) -> None:
     inbox = DecisionInbox()
     if args.exploration_noise_sigma is not None:
         inbox.set_exploration_noise_sigma(args.exploration_noise_sigma)
+    runtime = BridgeRuntime(args, inbox)
     operator_server = await asyncio.start_server(
         lambda reader, writer: _operator_handler(reader, writer, inbox),
         args.operator_host,
         args.operator_port,
     )
-    async with (
-        operator_server,
-        websockets.serve(
-            lambda websocket: _serve_robot(websocket, args=args, inbox=inbox),
-            args.listen_host,
-            args.listen_port,
-            compression=None,
-            max_size=None,
-            ping_interval=20.0,
-            ping_timeout=600.0,
-        ),
-    ):
-        LOG.info(
-            "bridge ready: downstream ws://%s:%d, upstream %s, probe_only=%s",
-            args.listen_host,
-            args.listen_port,
-            args.upstream_uri,
-            args.probe_only,
-        )
-        LOG.info(
-            "operator control ready on tcp://%s:%d",
-            args.operator_host,
-            args.operator_port,
-        )
-        await asyncio.Future()
+    try:
+        async with (
+            operator_server,
+            websockets.serve(
+                lambda websocket: _serve_robot(websocket, args=args, runtime=runtime),
+                args.listen_host,
+                args.listen_port,
+                compression=None,
+                max_size=None,
+                ping_interval=20.0,
+                ping_timeout=600.0,
+            ),
+        ):
+            LOG.info(
+                "bridge ready: downstream ws://%s:%d, upstream %s, probe_only=%s",
+                args.listen_host,
+                args.listen_port,
+                args.upstream_uri,
+                args.probe_only,
+            )
+            LOG.info(
+                "operator control ready on tcp://%s:%d",
+                args.operator_host,
+                args.operator_port,
+            )
+            await asyncio.Future()
+    finally:
+        await asyncio.to_thread(runtime.shutdown)
 
 
 def main() -> int:

@@ -35,12 +35,15 @@ except ImportError:
 # only ships on the robot, so skip rather than fail collection elsewhere.
 pytest.importorskip("msgpack_numpy")
 
+from toolkits.inference.xrobot_rlt_ee import bridge as bridge_module
 from toolkits.inference.xrobot_rlt_ee import codec
 from toolkits.inference.xrobot_rlt_ee.bridge import (
     BridgeError,
+    BridgeRuntime,
     DecisionInbox,
     QueuedDecision,
     RLTBridgeCore,
+    parse_operator_command,
 )
 from toolkits.inference.xrobot_rlt_ee.mapping import (
     execution_receipt,
@@ -220,6 +223,7 @@ class FakeUpstream:
     def __init__(self) -> None:
         self.metadata = metadata()
         self.requests = []
+        self.closed = False
 
     def request(self, payload):
         self.requests.append(payload)
@@ -232,6 +236,148 @@ class FakeUpstream:
                 "chunk_id": 5,
             }
         return {"ok": True}
+
+    def close(self):
+        self.closed = True
+
+
+def build_core() -> tuple[FakeUpstream, DecisionInbox, RLTBridgeCore]:
+    upstream = FakeUpstream()
+    inbox = DecisionInbox()
+    core = RLTBridgeCore(
+        upstream, task="task", chunk_length=2, probe_only=False, inbox=inbox
+    )
+    return upstream, inbox, core
+
+
+class OperatorScoreTest(unittest.TestCase):
+    """Mid-episode p / o / x scores, mirroring the rlt-openpi client keys."""
+
+    def test_defaults_match_the_reference_client(self) -> None:
+        self.assertAlmostEqual(
+            parse_operator_command({"command": "progress"}).score, 0.5
+        )
+        self.assertAlmostEqual(
+            parse_operator_command({"command": "small_progress"}).score, 0.1
+        )
+        self.assertAlmostEqual(
+            parse_operator_command({"command": "regress"}).score, -0.5
+        )
+        self.assertAlmostEqual(
+            parse_operator_command({"command": "regress", "reward": -0.25}).score,
+            -0.25,
+        )
+
+    def test_repeated_scores_stack_onto_the_chunk_in_flight(self) -> None:
+        upstream, inbox, core = build_core()
+        core.process_observation(desktop_observation())
+        for _ in range(3):
+            inbox.submit(parse_operator_command({"command": "small_progress"}))
+        self.assertAlmostEqual(inbox.status()["queued_score"], 0.3, places=6)
+
+        actions, terminal = core.process_observation(desktop_observation())
+
+        self.assertFalse(terminal)
+        self.assertIsNotNone(actions)
+        transition = upstream.requests[1]
+        self.assertEqual(transition["rlt/request"], "transition")
+        self.assertAlmostEqual(float(transition["rewards"][-1]), 0.3, places=6)
+        self.assertFalse(transition["done"])
+        self.assertEqual(transition["bootstrap_mask"], 1.0)
+        self.assertAlmostEqual(inbox.status()["queued_score"], 0.0)
+
+    def test_terminal_verdict_overrides_a_queued_score(self) -> None:
+        upstream, inbox, core = build_core()
+        core.process_observation(desktop_observation())
+        inbox.submit(parse_operator_command({"command": "progress"}))
+        inbox.submit(parse_operator_command({"command": "success"}))
+
+        self.assertTrue(core.finish_queued_terminal())
+
+        transition = upstream.requests[1]
+        self.assertAlmostEqual(float(transition["rewards"][-1]), 1.0)
+        self.assertTrue(transition["done"])
+
+
+class OperatorSubmitTest(unittest.TestCase):
+    def test_submit_sends_the_takeover_chunk_while_the_policy_is_paused(self) -> None:
+        upstream, inbox, core = build_core()
+        core.process_observation(desktop_observation())
+        receipt = np.arange(28, dtype=np.float32).reshape(2, 14)
+        inbox.submit(
+            parse_operator_command(
+                {"command": "intervention", "action_chunk": receipt.tolist()}
+            )
+        )
+        inbox.submit(parse_operator_command({"command": "submit"}))
+
+        self.assertTrue(core.flush_queued_submit())
+
+        self.assertFalse(core.closed, "the episode continues after a takeover")
+        self.assertIsNone(core.session.pending)
+        transition = upstream.requests[1]
+        self.assertEqual(transition["rlt/request"], "transition")
+        self.assertTrue(transition["intervention"])
+        self.assertFalse(transition["done"])
+        self.assertEqual(transition["info"]["transport"], "x2robot-v2-operator-submit")
+        self.assertFalse(core.flush_queued_submit())
+
+    def test_a_bare_intervention_is_not_flushed_without_submit(self) -> None:
+        upstream, inbox, core = build_core()
+        core.process_observation(desktop_observation())
+        inbox.submit(
+            parse_operator_command(
+                {
+                    "command": "intervention",
+                    "action_chunk": np.zeros((2, 14), dtype=np.float32).tolist(),
+                }
+            )
+        )
+
+        # The r-then-r rollback queues the rewind verdict after the receipt, so
+        # flushing on the receipt alone would commit the chunk too early.
+        self.assertFalse(core.flush_queued_submit())
+        self.assertEqual([item["rlt/request"] for item in upstream.requests], ["act"])
+
+
+class BridgeRuntimeTest(unittest.TestCase):
+    class _Args:
+        upstream_uri = "ws://server:8016"
+        connect_timeout = 1.0
+        recv_timeout = 1.0
+        task = "task"
+        chunk_length = 2
+        probe_only = False
+
+    def test_reconnect_reuses_the_open_episode_and_upstream(self) -> None:
+        created: list[FakeUpstream] = []
+
+        def fake_client(uri, *, connect_timeout, recv_timeout):
+            client = FakeUpstream()
+            created.append(client)
+            return client
+
+        original = bridge_module.RLTWebSocketClient
+        bridge_module.RLTWebSocketClient = fake_client
+        try:
+            runtime = BridgeRuntime(self._Args(), DecisionInbox())
+            first = runtime.acquire()
+            # A takeover drops the DesktopClient socket; reconnecting must not
+            # start a new episode or a new link to the GPU server.
+            self.assertIs(runtime.acquire(), first)
+            self.assertEqual(len(created), 1)
+
+            first.closed = True
+            second = runtime.acquire()
+            self.assertIsNot(second, first)
+            self.assertEqual(len(created), 1, "the upstream link is reused")
+
+            runtime.invalidate()
+            self.assertTrue(created[0].closed)
+            runtime.acquire()
+            self.assertEqual(len(created), 2)
+        finally:
+            bridge_module.RLTWebSocketClient = original
 
 
 class BridgeTerminalTest(unittest.TestCase):
@@ -397,6 +543,40 @@ class V2EventAdapterTest(unittest.TestCase):
         )
         self.assertEqual(control.payloads[-1]["command"], "success")
         self.assertEqual(len(control.payloads[-1]["terminal_state"]), 14)
+
+    def test_takeover_receipt_carries_its_final_measured_pose(self) -> None:
+        history = [V2ReceiptTest._sample(index) for index in range(10)]
+        control = FakeBridgeControl(history[3]["t_wall_ns"])
+        adapter = V2EventAdapter(control, chunk_length=50, control_hz=30)
+
+        adapter.handle(
+            {
+                "event_id": "event-stop",
+                "event": "policy_control_stopped",
+                "detail": {"frozen_history": history},
+            }
+        )
+
+        payload = control.payloads[-1]
+        self.assertEqual(payload["command"], "intervention")
+        self.assertEqual(payload["terminal_state"], payload["action_chunk"][-1])
+        self.assertEqual(len(payload["terminal_state"]), 14)
+
+    def test_score_events_forward_without_a_pending_chunk(self) -> None:
+        control = FakeBridgeControl(0, pending=False)
+        adapter = V2EventAdapter(control)
+
+        adapter.handle({"event_id": "p", "event": "session_progress"})
+        self.assertEqual(control.payloads[-1]["command"], "progress")
+        adapter.handle({"event_id": "o", "event": "session_small_progress"})
+        self.assertEqual(control.payloads[-1]["command"], "small_progress")
+        adapter.handle(
+            {"event_id": "x", "event": "session_regress", "detail": {"reward": -0.25}}
+        )
+        self.assertEqual(control.payloads[-1]["command"], "regress")
+        self.assertAlmostEqual(control.payloads[-1]["reward"], -0.25)
+        adapter.handle({"event_id": "y", "event": "session_submit"})
+        self.assertEqual(control.payloads[-1]["command"], "submit")
 
     def test_failure_carries_terminal_ee14(self) -> None:
         sample = V2ReceiptTest._sample(0)

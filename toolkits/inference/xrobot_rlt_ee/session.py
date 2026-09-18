@@ -161,6 +161,7 @@ class RLTSession:
         decision: OperatorDecision | None = None,
         *,
         intervention: bool = False,
+        score: float = 0.0,
         info: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         pending = self.pending
@@ -179,6 +180,10 @@ class RLTSession:
                 rewards[-1] = float(decision.terminal_reward)
             done = True
             bootstrap_mask = 0.0
+        elif score:
+            # Mid-episode operator score (progress / regress). The episode keeps
+            # running, so the chunk stays bootstrappable.
+            rewards[-1] = float(score)
         payload = {
             REQUEST_KEY: REQUEST_TRANSITION,
             "transition_id": pending.transition_id,

@@ -238,6 +238,9 @@ RLinf websocket policy server listening on 0.0.0.0:8016
 
 空等时不要杀进程、不要再启一份（端口会撞）、不要让 SSH 把进程带走。
 
+机器人侧接管时会断开 DesktopClient 连接，bridge 不再因此结束 episode，所以服务端
+日志里**不应该**再出现接管后的 `episode_end` + `aborted`。看到了说明 bridge 是旧版本。
+
 云机 SSH 口和 WebSocket 口不是同一个。SSH 若是 `34133`，机器人往往打不到 `8016`。在机器人或跳板上先建隧道：
 
 ```bash

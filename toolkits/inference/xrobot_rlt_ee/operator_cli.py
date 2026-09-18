@@ -16,8 +16,13 @@
 
 ``V2EventAdapter`` already forwards takeover, physical rewind, success and
 abort automatically. This CLI covers the verdicts V2 does not emit -- most
-importantly ``failure``, which has no V2 event -- and gives a way to inspect
-the bridge from a shell.
+importantly ``failure`` -- and gives a way to inspect the bridge from a shell.
+
+``progress`` / ``small_progress`` / ``regress`` are the mid-episode scores of
+the rlt-openpi remote-franka client keys p / o / x: they land on the chunk in
+flight and the rollout continues. Repeated presses stack. ``submit`` closes the
+chunk in flight without waiting for the policy to resume, which is how a
+takeover receipt reaches the server while the operator still holds the arm.
 """
 
 from __future__ import annotations
@@ -29,6 +34,10 @@ import socket
 COMMANDS = (
     "success",
     "failure",
+    "progress",
+    "small_progress",
+    "regress",
+    "submit",
     "intervention",
     "abort",
     "rewind_exit",
@@ -53,6 +62,12 @@ def main() -> int:
         default="default",
         help="for command sigma: a number, or default to use the server value",
     )
+    parser.add_argument(
+        "--reward",
+        type=float,
+        default=None,
+        help="override the score of progress/small_progress/regress",
+    )
     args = parser.parse_args()
     payload = {
         "command": args.command,
@@ -63,6 +78,8 @@ def main() -> int:
     }
     if args.command == "sigma":
         payload["sigma"] = args.sigma
+    if args.reward is not None:
+        payload["reward"] = args.reward
     with socket.create_connection((args.host, args.port), timeout=5.0) as connection:
         connection.sendall((json.dumps(payload) + "\n").encode("utf-8"))
         reply = connection.makefile("rb").readline(4096)

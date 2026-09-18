@@ -43,8 +43,12 @@ ssh -p 34133 -N -L 8016:127.0.0.1:8016 root@<GPU_HOST>
 cd /home/xr/lfwj/RealWorld-RLinf
 RLT_UPSTREAM_URI=ws://<GPU_IP>:8016 \
   RLT_TASK_PROMPT="Bimanual usb pick and insert" \
+  RLT_EXPLORATION_NOISE_SIGMA=0.1 \
   bash toolkits/inference/run_xrobot_rlt_ee_bridge.sh
 ```
+
+`0.1` 对齐 rlt-openpi `stage2_server_shuo_rlinf.sh` 的 `ACTOR_NOISE_SIGMA`。
+服务端 YAML 保持 `0.2` 不动，否则离线合同对不上、`offline_step_40000` 无法 resume。
 
 X2Robot 模型地址填 `127.0.0.1:33057`，跑一轮。只验证握手和形状。日志里不能有
 `ProtocolError`：
@@ -66,6 +70,7 @@ bash toolkits/inference/run_xrobot_rlt_ee_bridge.sh --stop
 RLT_EE_ALLOW_MOTION=true \
   RLT_UPSTREAM_URI=ws://<GPU_IP>:8016 \
   RLT_TASK_PROMPT="Bimanual usb pick and insert" \
+  RLT_EXPLORATION_NOISE_SIGMA=0.1 \
   bash toolkits/inference/run_xrobot_rlt_ee_bridge.sh
 
 cd /home/xr/lfwj
@@ -77,6 +82,37 @@ V2：`s` 接管，`f` 成功，`d` 失败（V2 需发 `session_failed`）。每�
 前一两回合看夹爪和动作还像不像插 USB。
 
 `q` 中止仍会按已提交的 actor chunk 做 UTD。想少更新就少收尾。
+
+接管时 V2 断开模型连接**不再**判死这一局：bridge 保留到 GPU 的连接和当前
+chunk，重连后接着走。日志会打 `RLT episode kept open`。
+
+### 打分键 p / o / x（回合不结束）
+
+对齐 rlt-openpi `stage2_client_shuo_sync.sh`：`p` = +0.5、`o` = +0.1（可连按累加）、
+`x` = −0.5。分数落在**当前这个 chunk** 上，回合继续；`s` / `f` 的终止奖励优先于累计分。
+
+```bash
+docker exec desktop-robot_client-1 bash -lc \
+  'source /opt/xr/py_env/bin/activate && PYTHONPATH=/tmp python -m x2robot_rlt_ee.operator_cli progress'
+docker exec desktop-robot_client-1 bash -lc \
+  'source /opt/xr/py_env/bin/activate && PYTHONPATH=/tmp python -m x2robot_rlt_ee.operator_cli small_progress'
+docker exec desktop-robot_client-1 bash -lc \
+  'source /opt/xr/py_env/bin/activate && PYTHONPATH=/tmp python -m x2robot_rlt_ee.operator_cli regress --reward -0.25'
+```
+
+`operator_cli status` 里的 `queued_score` 是还没落盘的累计分。
+
+### submit：接管期间把动作交给服务端
+
+policy 暂停时 DesktopClient 不发观测，chunk 会一直挂着。`submit`（对应 rlt-openpi 的
+`y`）把当前 chunk 连同接管回执立刻提交，回合不结束：
+
+```bash
+docker exec desktop-robot_client-1 bash -lc \
+  'source /opt/xr/py_env/bin/activate && PYTHONPATH=/tmp python -m x2robot_rlt_ee.operator_cli submit'
+```
+
+倒车流程请等第二次 `r` 之后再 `submit`，否则 rewind 判定会落到下一个 chunk 上。
 
 ### 在线改探索噪声（下一 chunk 生效，不用重启 server）
 
@@ -91,7 +127,8 @@ docker exec desktop-robot_client-1 bash -lc \
   'source /opt/xr/py_env/bin/activate && PYTHONPATH=/tmp python -m x2robot_rlt_ee.operator_cli sigma --sigma default'
 ```
 
-`--sigma 0` 是确定性执行（仍是 residual，不是纯 Stage 1）。`mode=eval` 的自动评测局本来就关噪声。启动时也可设 `RLT_EXPLORATION_NOISE_SIGMA=0.05` 再拉 bridge。
+`--sigma 0` 是确定性执行（仍是 residual，不是纯 Stage 1）。`--sigma default` 回到服务端
+YAML 的 0.2。`mode=eval` 的自动评测局本来就关噪声。
 
 抖动对照：第一局收尾前 = Cal-QL+当前 sigma；`f`/`failure` 之后变抖 = 在线 −Q。eval 也抖 = residual 大了；只有 actor 抖 = 噪声 + EXPO。
 
@@ -155,7 +192,13 @@ bash toolkits/inference/run_xrobot_rlt_ee_v2_adapter.sh --stop
 | `h` | 交还 policy，开新 policy phase | 无。policy 恢复后 RLT 循环自动接上 |
 | `f` | **成功**结束，生成 Traj_B（只在 `Policy` 状态有效） | 发 `success` + 实测终态 |
 | `d` | **失败**结束（V2 需发 `session_failed`） | 发 `failure`，server 在最后一步写 `-1` |
+| `p` | 打分：进展（回合继续） | 发 `progress`，当前 chunk +0.5 |
+| `o` | 打分：小进展（可连按，回合继续） | 发 `small_progress`，当前 chunk 每次 +0.1，累加 |
+| `x` | 打分：退步（回合继续） | 发 `regress`，当前 chunk −0.5 |
+| `y` | 接管暂停时提交当前 chunk 并继续 | 发 `submit`，把接管回执立刻交给 server |
 | `q` | 人工 abort，返回码 `2`，属正常不是故障 | 发 `abort`，丢弃未完成的 transition，**不给任何判定** |
+
+`p` / `o` / `x` / `y` 需要 V2 按第 3 节的契约发事件；未接入前用 `operator_cli` 等效。
 
 一次典型的接管：`r`（倒车）→ `r`（停在满意位置）→ `s`（接管）→ 人工做完 →
 `h`（交还）→ 任务最终成功后 `f`。
@@ -166,25 +209,33 @@ bash toolkits/inference/run_xrobot_rlt_ee_v2_adapter.sh --stop
 四路各至少 3 条新鲜数据，才宣布接管成功。任一路缺失会关掉 databridge 并保持
 policy 暂停 —— 这是防止"只有夹爪能动"被误判成接管成功。
 
-## 3. 失败：V2 发 `session_failed`，或手工 `failure`
+## 3. 给 V2 的事件契约
 
-`f` 仍是成功。失败请用 **`d`**（或你们指定的失败键），让 V2 往 `/take_over_data` 发：
+`f` 仍是成功。失败和打分需要 V2 往 `/take_over_data` 发下面这些事件，adapter 会转成
+对应的 RLT operator 命令。**只改 RLinf 不会让新键生效**，V2 collect 脚本要接：
 
 ```json
 {"event_id": "...", "event": "session_failed", "detail": {"failure_end": <与 success_end 同结构的终态 sample>}}
+{"event_id": "...", "event": "session_progress"}
+{"event_id": "...", "event": "session_small_progress"}
+{"event_id": "...", "event": "session_regress", "detail": {"reward": -0.25}}
+{"event_id": "...", "event": "session_submit"}
 ```
 
-adapter 会转成 RLT `failure`。**V2 collect 脚本要接这个事件**；只改 RLinf 不会让 `d` 生效。
+`event_id` 必须唯一（adapter 按它去重）。打分和 `submit` 的 `detail` 可以省略；
+`detail.reward` 用来覆盖默认分值。打分事件**不要求**当前有 pending chunk：两个 chunk
+之间按的键会留在队列里，落到下一个提交的 chunk 上。
 
-没接好之前仍可手工：
+没接好之前全部可以手工发，效果一样：
 
 ```bash
 docker exec desktop-robot_client-1 bash -lc \
   'source /opt/xr/py_env/bin/activate && PYTHONPATH=/tmp python -m x2robot_rlt_ee.operator_cli failure'
 ```
 
-同一条命令可用的 `command`：`failure`、`success`、`abort`、`rewind_credit`、`sigma`、`status`
-（`--chunks N`，只改 replay 不动机械臂）、`status`。
+可用的 `command`：`success`、`failure`、`progress`、`small_progress`、`regress`、
+`submit`、`abort`、`rewind_exit`、`rewind_credit`、`sigma`、`status`
+（`rewind_*` 用 `--chunks N`，只改 replay 不动机械臂；打分用 `--reward` 覆盖分值）。
 
 `status` 用来查当前有没有 pending chunk，联调时很有用：
 
@@ -205,9 +256,11 @@ docker exec desktop-robot_client-1 bash -lc \
 
 ## 5. 两件要知道的事
 
-**人工段不进在线 replay。** 接管期间 policy 是暂停的，DesktopClient 不向 bridge 要
-chunk，所以你手动操作的那一段进的是 V2 的 bag 和 Traj_A/B（离线管线），不进 RLT
-的在线 replay。在线学到的是：策略自己跑的 chunk + 坏分支上的 -1。
+**人工遥操那一段不进在线 replay。** 接管期间 policy 是暂停的，DesktopClient 不向
+bridge 要 chunk，所以你手动操作的那一段进的是 V2 的 bag 和 Traj_A/B（离线管线）。
+进在线 replay 的是**被打断的那个 policy chunk**：它按实测 `/end_pose` 重采样后标
+intervention 提交。以前这条要等 policy 恢复才发得出去，现在按 `y` / `submit` 就能
+立刻交给 server。在线学到的是：策略自己跑的 chunk + 坏分支上的 -1 + 你打的分。
 
 **episode 一定要结束。** 训练只在 `episode_end` 发生。bridge 目前不读
 `max_episode_chunks`，不会自己封顶，所以每轮都得靠 `f` / `q` 或手工命令收尾。
